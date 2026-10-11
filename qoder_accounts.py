@@ -1933,19 +1933,20 @@ class Account(object):
         }
 
     def checkin(self):
-        """每日签到：先查状态，未签则领取。返回 {ok, msg, ...}。
+        """每日签到：先查直接 API（CN 路径），不可用则降级到活动领取系统。
 
-        不再按区域门控：接口不存在（国际版 404）按"本区域无此接口"跳过并给
-        出明确原因，而不是静默什么都不做（历史问题：看板点签到毫无反应）。
+        CN: /sash/api/v1/me/daily-check-in/... 直接签到
+        Intl: 该端点 404 不存在 → 降级到 campaign_checkin()（活动领取系统），
+              每日签到活动以 CLAIM_BENEFIT campaign 的形式出现（如
+              "每天领 100 Credits" act-20261009-909）。
         """
         ok, st = self.checkin_status()
         if not ok:
             if st.get("unavailable"):
-                return {"ok": True, "unavailable": True,
-                        "reason": st.get("reason"),
-                        "msg": "本区域未开放 /sash/api/v1/me/daily-check-in 接口"
-                               "（HTTP %s）：每日领取活动改由官方客户端承接"
-                               % st.get("http")}
+                # 国际版无 daily-check-in 端点 → 降级到活动领取系统
+                result = self.campaign_checkin()
+                result["via_campaign"] = True
+                return result
             return {"ok": False, "error": st.get("error") or str(st)}
         if st["today_checked_in"]:
             return {"ok": True, "already": True, "msg": "今日已签到",
