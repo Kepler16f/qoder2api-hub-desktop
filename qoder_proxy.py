@@ -81,7 +81,7 @@ from pathlib import Path
 # 上游是 1.2.x/1.3.x semver 号线，日期制天然不撞；桌面发行线是另一套号(1.0.x_R
 # tag)，「检查更新」按它对比本仓库 Releases。历史号（fork 旧 1.2.18-1.2.20、
 # 2026.10.07、2026.10.08）不改写，对应关系见 README 版本线说明。
-VERSION = "2026.10.12.1_re"
+VERSION = "2026.10.12.2_re"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -4308,6 +4308,18 @@ def _is_paid_wall(detail):
     return '"code":"112"' in d or '"code": "112"' in d or "pricingUrl" in d
 
 
+def _is_daily_quota_exceeded(detail):
+    """上游 110 日限额信封（HTTP 403 + "Billing daily count exceeded"）。
+
+    2026-10-11 实测：国内版账号当日用量超限（67 万 token/请求的大会话触发）。
+    计费层限制——刷 token 无效、换号有效（其他号未超限时）；次日自动重置。
+    """
+    d = str(detail or "")
+    return '"code":"110"' in d or '"code": "110"' in d \
+        or "Billing daily count exceeded" in d \
+        or "daily count exceeded" in d.lower()
+
+
 # 上游"超上下文上限"错误标记（DeepSeek 等模型 400 provider_error 内嵌）
 _CONTEXT_OVERFLOW_MARKERS = (
     "maximum context length", "reduce the length of the message",
@@ -4388,6 +4400,13 @@ def friendly_upstream_error(code, detail):
                 "加压重试仍超限。请压缩/清理会话历史，或换更大窗口的模型。"
                 "上游详情：%s" % (code_i, detail[:250]),
                 "context_overflow")
+    # 2.6) 上游日限额（110：当日计费用量超限；次日自动重置）
+    if code_i == 403 and _is_daily_quota_exceeded(detail):
+        return ("账号当日用量已达上限 (HTTP 403/110)：Billing daily count "
+                "exceeded，与 token 无关。网关已自动冷却该账号至明天 10:00；"
+                "其他账号（未超限的）会自动接替。如全部账号超限，需等次日"
+                "重置或减少单日请求量。上游详情：%s" % detail[:200],
+                "daily_quota_exceeded")
     # 3) 上游付费墙（112：该**模型**对 Free 计划收费；与 credits 余额无关）
     if code_i == 403 and _is_paid_wall(detail):
         return ("该模型对 Free 计划收费 (HTTP 403/112)：与账号剩余额度无关"
@@ -4821,6 +4840,30 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
                         % (account.uid[:8], model, qw), level="WARN", tag="chat")
                     last_queued = exc
                     last_queued_wait = qw
+                    last_error = exc
+                    continue
+                if exc.code == 403 and _is_daily_quota_exceeded(detail):
+                    # 110 日限额：**账号级**——当日计费用量超限（大 token 会话
+                    # 触发），刷 token 无效、次日自动重置。长冷却（到明天
+                    # 10:00 UTC+8 的签到刷新窗口）、换号继续（其他号未超限
+                    # 时仍可服务）
+                    if session_key and POOL:
+                        POOL.affinity.unbind(session_key)
+                    # 计算到明天 10:00（UTC+8）的冷却时间
+                    import datetime as _dt
+                    now = _dt.datetime.now()
+                    tomorrow_10 = (now + _dt.timedelta(days=1)).replace(
+                        hour=10, minute=0, second=0, microsecond=0)
+                    if tomorrow_10 <= now:
+                        tomorrow_10 += _dt.timedelta(days=1)
+                    cd_secs = int((tomorrow_10 - now).total_seconds())
+                    account.note_error(
+                        "daily quota exceeded (HTTP 403/110): billing daily "
+                        "count limit, resets next day", cooldown=cd_secs,
+                        single_account=(total <= 1))
+                    log("account %s daily quota exceeded (110) - cooling "
+                        "until tomorrow 10:00 (%ds), rotating"
+                        % (account.uid[:8], cd_secs), level="WARN", tag="chat")
                     last_error = exc
                     continue
                 if exc.code == 403 and _is_paid_wall(detail):
