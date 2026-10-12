@@ -56,9 +56,13 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status, UPSTREAM_OPENER)
 
 
-# 每账号活跃 SSE 流计数：并发分散的依据——open_upstream 成功建流后 +1，
-# record_usage（请求结束的必经路径）后 -1。看板/调用方无需感知。
-_stream_count = collections.Counter()
+# 每账号活跃 SSE 流跟踪（并发分散依据）：时间戳 + TTL 自动过期。
+# 之前的 Counter 方案有泄漏 bug——流失败（403/10605/DNS）时 record_usage
+# 不会被调用，计数不递减 → 所有账号被标记"忙" → "no usable account"。
+# 改为时间戳：open_upstream 成功建流时打时间戳，record_usage 清除；
+# 超过 STREAM_TTL（300s = 最长流时间）自动视为不忙——即使清除被遗漏。
+_stream_active = {}          # uid -> 建流时间戳
+STREAM_TTL = 300             # 秒：超过此时间的"活跃流"视为过期
 
 
 def _flush_dns_cache():
@@ -77,7 +81,7 @@ from pathlib import Path
 # 上游是 1.2.x/1.3.x semver 号线，日期制天然不撞；桌面发行线是另一套号(1.0.x_R
 # tag)，「检查更新」按它对比本仓库 Releases。历史号（fork 旧 1.2.18-1.2.20、
 # 2026.10.07、2026.10.08）不改写，对应关系见 README 版本线说明。
-VERSION = "2026.10.10.13_re"
+VERSION = "2026.10.10.14_re"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -483,7 +487,7 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
     acc = POOL.get(account) if (account and POOL) else None
     if acc:
         # 本账号的 SSE 流结束——递减活跃流计数（并发分散依据）
-        _stream_count[acc.uid] = max(0, _stream_count[acc.uid] - 1)
+        _stream_active.pop(acc.uid, None)   # 流结束：清除活跃标记
         # 本账号刚消耗额度：让 /accounts 的下一次轮询尽快回读 quota
         acc.credits_dirty = True
     if not fields:
@@ -4621,7 +4625,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
     # 并发分散：跳过已有活跃 SSE 流的账号（除非全忙/单号池），
     # 避免两个并行任务挤同一个上游连接通道
     if POOL and len(POOL.accounts) > 1:
-        busy = {uid for uid, n in _stream_count.items() if n > 0}
+        busy = {uid for uid, ts in _stream_active.items()
+                if time.time() - ts < STREAM_TTL}
         if busy and busy != {a.uid for a in POOL.accounts
                              if a.realm == realm and a.enabled}:
             tried |= busy       # 把忙的账号加进 exclude，pick 自动跳过
@@ -4676,7 +4681,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
                                              data=encoded.encode("utf-8"),
                                              method="POST", headers=headers)
                 resp = UPSTREAM_OPENER.open(req, timeout=600)
-                _stream_count[account.uid] += 1   # 标记活跃流（并发分散依据）
+                _stream_active[account.uid] = time.time()  # 标记活跃流（TTL 自动过期）
                 break
             except urllib.error.HTTPError as exc:
                 try:
