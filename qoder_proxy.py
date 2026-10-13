@@ -106,7 +106,7 @@ from pathlib import Path
 # 上游是 1.2.x/1.3.x semver 号线，日期制天然不撞；桌面发行线是另一套号(1.0.x_R
 # tag)，「检查更新」按它对比本仓库 Releases。历史号（fork 旧 1.2.18-1.2.20、
 # 2026.10.07、2026.10.08）不改写，对应关系见 README 版本线说明。
-VERSION = "2026.10.12.5_re"
+VERSION = "2026.10.12.6_re"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -5086,7 +5086,13 @@ def sse_with_heartbeat(source, send, interval=None, idle_limit=None):
         try:
             item = box.get(timeout=interval)
         except _queue.Empty:
-            send(b": ping\n\n")               # SSE 注释：客户端忽略
+            # 心跳改为**空 delta 数据事件**（不再是 `: ping` 注释）：SSE 注释
+            # 虽然规范允许，但很多客户端（Node fetch/undici、Zcode 等）不把
+            # 它算作"收到数据"，空闲超时照样掐断——表现为 xhigh 长首字期间
+            # 客户端反复重连。空 delta 是合法的 OpenAI chunk，客户端会正常
+            # 解析（无操作）并重置超时计时器。
+            send(b'data: {"id":"keepalive","object":"chat.completion.chunk",'
+                 b'"choices":[{"index":0,"delta":{},"finish_reason":null}]}\n\n')
             waited += interval
             if waited >= idle_limit:
                 raise TimeoutError(
