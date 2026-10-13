@@ -106,7 +106,7 @@ from pathlib import Path
 # 上游是 1.2.x/1.3.x semver 号线，日期制天然不撞；桌面发行线是另一套号(1.0.x_R
 # tag)，「检查更新」按它对比本仓库 Releases。历史号（fork 旧 1.2.18-1.2.20、
 # 2026.10.07、2026.10.08）不改写，对应关系见 README 版本线说明。
-VERSION = "2026.10.12.6_re"
+VERSION = "2026.10.12.7_re"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -4183,7 +4183,7 @@ class RateLimited(Exception):
             "upstream rate limit: %s" % (self.detail[:200] or "429"))
 
 
-# 账号级错误短冷却的“等待续上”上限：单账号池在传输/瞬时故障后只有
+# 账号级错误短冷却的"等待续上"上限：单账号池在传输/瞬时故障后只有
 # 3s（多账号 15s）冷却，此时**等待**比报 429 更正确——429 只留给真正的
 # 上游频控（model_cooldowns，由上游 HTTP 429 设置）。
 ERROR_COOLDOWN_WAIT_MAX = 10.0
@@ -4681,7 +4681,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
                 "sessions %s" % (len(skip), sorted(u[:8] for u in skip)),
                 tag="chat")
 
-    # 额外 +2 次迭代预算：只供“短错误冷却等待续上”使用（正常轮换仍由
+    # 额外 +2 次迭代预算：只供"短错误冷却等待续上"使用（正常轮换仍由
     # tried 集合自然终止）。
     for _ in range(total + 2):
         account = POOL.pick_for_session(realm=realm, session_key=session_key,
@@ -5039,7 +5039,7 @@ def sse_with_heartbeat(source, send, interval=None, idle_limit=None):
 
     背景：`xhigh` 长上下文请求的上游首字延迟可达 40–71 秒（实测日志），
     这段时间网关对客户端一言不发；客户端/中间代理一旦空闲超时就会断开并
-    重连（表现为“一直重连”）。SSE 规范允许以 `:` 开头的注释行，客户端会
+    重连（表现为"一直重连"）。SSE 规范允许以 `:` 开头的注释行，客户端会
     忽略，因此用它做保活。
 
     source     : 上游数据迭代器（iter_inner_sse 的输出，产出 bytes）
@@ -5047,7 +5047,7 @@ def sse_with_heartbeat(source, send, interval=None, idle_limit=None):
     interval   : 空闲多久发一次心跳（秒），默认 5（可用 QD_SSE_HEARTBEAT 覆盖）
     idle_limit : 单次等待上限（秒），默认 900；超过抛 TimeoutError
 
-    读线程把上游数据放入队列，主线程只在“队列空闲”时补心跳，保证顺序与
+    读线程把上游数据放入队列，主线程只在"队列空闲"时补心跳，保证顺序与
     错误传播（上游异常原样在主线程抛出）。
     """
     if interval is None:
@@ -6339,7 +6339,7 @@ class Handler(BaseHTTPRequestHandler):
 
         之前用 `Connection: close` + 裸写字节：客户端（连接池型 harness）
         会把该连接视为可复用，下一次请求落在已半关闭的连接上，表现为
-        “一直重连 / 连不上”。改为 chunked 后，流结束发 0 长度的终止块，
+        "一直重连 / 连不上"。改为 chunked 后，流结束发 0 长度的终止块，
         连接保持 keep-alive，可安全复用。
         """
         self.send_response(200)
@@ -6350,6 +6350,63 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self._chunked = True
+
+    _HEARTBEAT_CHUNK = (b'data: {"id":"keepalive","object":'
+                        b'"chat.completion.chunk","choices":[{"index":0,'
+                        b'"delta":{},"finish_reason":null}]}\n\n')
+
+    def _open_upstream_with_heartbeat(self, payload, session_key=None,
+                                      target_realm=None, usage_ctx=None,
+                                      heartbeat_interval=5.0):
+        """流式请求的**即时响应 + 连接期心跳**：先发 SSE 头，再连上游。
+
+        背景：open_upstream 对大请求（xhigh + 50 万 token）需 0–22 秒建连，
+        期间客户端一个字节都收不到 → 30 秒空闲超时掐断 → 重连循环。
+        此方法先发 200 + SSE 头（客户端立即看到响应），连接期间每 5 秒
+        发一个空 delta 心跳（客户端解析为无操作 chunk，重置超时），
+        上游就绪后返回 (resp, account, encoded)。
+
+        失败时：SSE 流里发一帧错误事件后结束流（不再返回非 200——头已发）。
+        返回 (resp, account, encoded) 或 (None, None, None)（错误已写入流）。
+        """
+        import queue as _q
+        box = _q.Queue()
+        ctx = {}
+
+        def _open():
+            try:
+                resp, acc, enc = open_upstream(
+                    payload, session_key=session_key,
+                    target_realm=target_realm, usage_ctx=usage_ctx)
+                box.put(("ok", resp, acc, enc))
+            except BaseException as exc:
+                box.put(("err", exc))
+
+        threading.Thread(target=_open, daemon=True,
+                         name="qd-preconnect").start()
+        while True:
+            try:
+                kind = box.get(timeout=heartbeat_interval)
+                break
+            except _q.Empty:
+                self._sse_write(self._HEARTBEAT_CHUNK)
+        if kind[0] == "ok":
+            return kind[1], kind[2], kind[3]
+        exc = kind[1]
+        # 错误帧：以 SSE data 事件投递（HTTP 头已发，无法再改状态码）
+        try:
+            code = exc.code if hasattr(exc, "code") else 502
+            detail = getattr(exc, "qoder_detail", "") or str(exc)[:200]
+            msg, etype = friendly_upstream_error(code, detail)
+            frame = json.dumps({"error": {"message": msg, "type": etype,
+                                          "code": code}},
+                               ensure_ascii=False)
+            self._sse_write(("data: %s\n\n" % frame).encode("utf-8"))
+            self._sse_write(b"data: [DONE]\n\n")
+        except Exception:
+            pass
+        self._sse_end()
+        return None, None, None
 
     def _sse_write(self, data):
         """按 chunked 编码写一段数据（data: bytes）。"""
@@ -6618,7 +6675,7 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/ping", "/healthz", "/livez", "/readyz"):
             # 极简探活端点：**不需要面板密码/API Key、不查账号池**。
             # 客户端/守护脚本常用 GET /ping 判活，之前返回 404 会被判成
-            # “网关不可用” → 反复重连。这里返回纯文本 pong。
+            # "网关不可用" → 反复重连。这里返回纯文本 pong。
             body = b"pong\n"
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -6956,7 +7013,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(raw, list):
                 return self._error(400, "api_keys must be a list",
                                    "invalid_request_error")
-            # 面板只画掩码 Key：空值表示“保留原值”，不是“清空”。
+            # 面板只画掩码 Key：空值表示"保留原值"，不是"清空"。
             existing = {entry.get("id"): entry for entry in configured_keys()}
             cleaned = []
             for index, item in enumerate(raw):
@@ -7740,9 +7797,18 @@ class Handler(BaseHTTPRequestHandler):
             blocked = self._model_precheck(chat_req.get("model"), req_realm)
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
-            upstream, account, _ = open_upstream(
-                chat_req, session_key=session_key, target_realm=req_realm,
-                usage_ctx=usage_ctx)
+            if want_stream:
+                # 流式：先发 SSE 头 + 连接期心跳（防客户端空闲超时掐断）
+                self._sse_begin()
+                upstream, account, _ = self._open_upstream_with_heartbeat(
+                    chat_req, session_key=session_key,
+                    target_realm=req_realm, usage_ctx=usage_ctx)
+                if upstream is None:
+                    return  # 错误已作为 SSE 帧写入流中
+            else:
+                upstream, account, _ = open_upstream(
+                    chat_req, session_key=session_key,
+                    target_realm=req_realm, usage_ctx=usage_ctx)
         except RateLimited as exc:
             t = time.time() - t_start
             record_error(model, 429, exc.detail[:200],
@@ -7771,7 +7837,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(502, "upstream unreachable: %s" % exc)
         with upstream:
             if want_stream:
-                self._sse_begin()
+                # SSE 头已在 _open_upstream_with_heartbeat 里发过（含连接期心跳）
                 first_ms = None
                 # 流内信封重试：上游可能 HTTP200 建流后在信封里投 418
                 # （access log 记 200 + 业务错 418 即此形态）。只要还没向
@@ -7815,7 +7881,7 @@ class Handler(BaseHTTPRequestHandler):
                         except UpstreamStatus as exc:
                             _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
                             # 控制帧（response.created 等）先于数据，不能算
-                            # “已输出”；以上游数据行计数判断能否重开。
+                            # "已输出"；以上游数据行计数判断能否重开。
                             if should_retry_envelope(exc, False, attempts) \
                                     and consumed.get("n", 0) == 0:
                                 attempts += 1
