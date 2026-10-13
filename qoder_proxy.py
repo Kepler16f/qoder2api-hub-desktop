@@ -106,7 +106,7 @@ from pathlib import Path
 # 上游是 1.2.x/1.3.x semver 号线，日期制天然不撞；桌面发行线是另一套号(1.0.x_R
 # tag)，「检查更新」按它对比本仓库 Releases。历史号（fork 旧 1.2.18-1.2.20、
 # 2026.10.07、2026.10.08）不改写，对应关系见 README 版本线说明。
-VERSION = "2026.10.12.4_re"
+VERSION = "2026.10.12.5_re"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -4423,12 +4423,12 @@ def friendly_upstream_error(code, detail):
                 "加压重试仍超限。请压缩/清理会话历史，或换更大窗口的模型。"
                 "上游详情：%s" % (code_i, detail[:250]),
                 "context_overflow")
-    # 2.6) 上游日限额（110：当日计费用量超限；次日自动重置）
+    # 2.6) 上游日限额（110：当日计费用量超限；短冷却后自动重试）
     if code_i == 403 and _is_daily_quota_exceeded(detail):
         return ("账号当日用量已达上限 (HTTP 403/110)：Billing daily count "
-                "exceeded，与 token 无关。网关已自动冷却该账号至明天 10:00；"
-                "其他账号（未超限的）会自动接替。如全部账号超限，需等次日"
-                "重置或减少单日请求量。上游详情：%s" % detail[:200],
+                "exceeded，与 token 无关。网关已短冷却该账号 60 秒后自动"
+                "重试（实测有时 1 分钟即恢复）；其他账号会自动接替。如"
+                "持续超限，需减少单日请求量。上游详情：%s" % detail[:200],
                 "daily_quota_exceeded")
     # 3) 上游付费墙（112：该**模型**对 Free 计划收费；与 credits 余额无关）
     if code_i == 403 and _is_paid_wall(detail):
@@ -4872,27 +4872,19 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
                     last_error = exc
                     continue
                 if exc.code == 403 and _is_daily_quota_exceeded(detail):
-                    # 110 日限额：**账号级**——当日计费用量超限（大 token 会话
-                    # 触发），刷 token 无效、次日自动重置。长冷却（到明天
-                    # 10:00 UTC+8 的签到刷新窗口）、换号继续（其他号未超限
-                    # 时仍可服务）
+                    # 110 日限额：**账号级**——当日计费用量超限。用户实测
+                    # 有时 1 分钟后就恢复（上游计数器/窗口抖动），短冷却
+                    # 60 秒后自动重试；持续超限则反复短冷却（不锁死账号），
+                    # 换号继续（其他号未超限时仍可服务）
                     if session_key and POOL:
                         POOL.affinity.unbind(session_key)
-                    # 计算到明天 10:00（UTC+8）的冷却时间
-                    import datetime as _dt
-                    now = _dt.datetime.now()
-                    tomorrow_10 = (now + _dt.timedelta(days=1)).replace(
-                        hour=10, minute=0, second=0, microsecond=0)
-                    if tomorrow_10 <= now:
-                        tomorrow_10 += _dt.timedelta(days=1)
-                    cd_secs = int((tomorrow_10 - now).total_seconds())
                     account.note_error(
                         "daily quota exceeded (HTTP 403/110): billing daily "
-                        "count limit, resets next day", cooldown=cd_secs,
+                        "count limit, short cooldown", cooldown=60,
                         single_account=(total <= 1))
-                    log("account %s daily quota exceeded (110) - cooling "
-                        "until tomorrow 10:00 (%ds), rotating"
-                        % (account.uid[:8], cd_secs), level="WARN", tag="chat")
+                    log("account %s daily quota exceeded (110) - short "
+                        "cooldown 60s, rotating"
+                        % account.uid[:8], level="WARN", tag="chat")
                     last_error = exc
                     continue
                 if exc.code == 403 and _is_paid_wall(detail):
