@@ -106,7 +106,7 @@ from pathlib import Path
 # 上游是 1.2.x/1.3.x semver 号线，日期制天然不撞；桌面发行线是另一套号(1.0.x_R
 # tag)，「检查更新」按它对比本仓库 Releases。历史号（fork 旧 1.2.18-1.2.20、
 # 2026.10.07、2026.10.08）不改写，对应关系见 README 版本线说明。
-VERSION = "2026.10.12.7_re"
+VERSION = "2026.10.12.8_re"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -6398,6 +6398,9 @@ class Handler(BaseHTTPRequestHandler):
             code = exc.code if hasattr(exc, "code") else 502
             detail = getattr(exc, "qoder_detail", "") or str(exc)[:200]
             msg, etype = friendly_upstream_error(code, detail)
+            log("pre-connect upstream error on '%s': HTTP %s %s"
+                % (payload.get("model", "?"), code, detail[:120]),
+                level="WARN", tag="chat")
             frame = json.dumps({"error": {"message": msg, "type": etype,
                                           "code": code}},
                                ensure_ascii=False)
