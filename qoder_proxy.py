@@ -56,13 +56,38 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status, UPSTREAM_OPENER)
 
 
-# 每账号活跃 SSE 流跟踪（并发分散依据）：时间戳 + TTL 自动过期。
-# 之前的 Counter 方案有泄漏 bug——流失败（403/10605/DNS）时 record_usage
-# 不会被调用，计数不递减 → 所有账号被标记"忙" → "no usable account"。
-# 改为时间戳：open_upstream 成功建流时打时间戳，record_usage 清除；
-# 超过 STREAM_TTL（300s = 最长流时间）自动视为不忙——即使清除被遗漏。
-_stream_active = {}          # uid -> 建流时间戳
-STREAM_TTL = 300             # 秒：超过此时间的"活跃流"视为过期
+# 每账号"最近建流时间+所属会话"（并发分散依据）：open_upstream 成功建流时
+# 记录，永不清除、靠 60 秒窗口自然过期。
+# 为何不用计数：Counter 方案有泄漏 bug（流失败时不递减 → 全号被标忙）。
+# 为何不"流结束即清除"：两个会话的请求常常**交替到达**（一个流结束后另一个
+# 才开始，时间不重叠），只跳"当前活跃流"不触发 → 两会话仍挤同一账号。
+# 为何要带 session_key：只跳过**别的会话**最近用过的账号——若把自己几秒前
+# 用过的号也跳掉，每轮都换号，会话亲和失效、上游 prompt 缓存全作废（大
+# 会话代价极高）。同会话继续用同一号，不同会话才互相错开。
+_stream_last_used = {}       # uid -> (最近建流时间戳, session_key)
+STREAM_SPREAD_WINDOW = 60    # 秒：此窗口内被**其他会话**用过的账号优先跳过
+STREAM_STALE_TTL = 300       # 秒：清理字典条目的上限（内存回收，非逻辑依赖）
+
+
+def _spread_skip_accounts(realm, session_key, now, all_same_realm,
+                          window=None):
+    """并发分散：返回本次请求应跳过的账号集合。
+
+    跳过"最近 window 秒内被**其他会话**建过流"的账号（本会话自己用过的不跳，
+    保住会话亲和与上游 prompt 缓存——大会话换号的缓存作废代价极高）。
+    若跳过集会吃掉本区全部可用号，则返回空集（退回正常轮转，保证有号可用）。
+    session_key 为 None（超长会话释放亲和/亲和关闭）时，所有其他会话的记录都
+    算"别人用过"——不把 None==None 当作同一会话。
+    """
+    if not all_same_realm or len(all_same_realm) <= 1:
+        return set()
+    w = STREAM_SPREAD_WINDOW if window is None else window
+    recent = {uid for uid, (ts, sk) in _stream_last_used.items()
+              if now - ts < w and uid in all_same_realm
+              and not (session_key and sk == session_key)}
+    if recent >= all_same_realm:
+        return set()
+    return recent
 
 
 def _flush_dns_cache():
@@ -81,7 +106,7 @@ from pathlib import Path
 # 上游是 1.2.x/1.3.x semver 号线，日期制天然不撞；桌面发行线是另一套号(1.0.x_R
 # tag)，「检查更新」按它对比本仓库 Releases。历史号（fork 旧 1.2.18-1.2.20、
 # 2026.10.07、2026.10.08）不改写，对应关系见 README 版本线说明。
-VERSION = "2026.10.12.2_re"
+VERSION = "2026.10.12.3_re"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -486,8 +511,6 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
     fields = _extract_usage(usage)
     acc = POOL.get(account) if (account and POOL) else None
     if acc:
-        # 本账号的 SSE 流结束——递减活跃流计数（并发分散依据）
-        _stream_active.pop(acc.uid, None)   # 流结束：清除活跃标记
         # 本账号刚消耗额度：让 /accounts 的下一次轮询尽快回读 quota
         acc.credits_dirty = True
     if not fields:
@@ -4641,16 +4664,22 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
     queue_wait_spent = 0        # 10605 原地等待累计（秒），上限 QUEUE_WAIT_TOTAL_MAX
     overflow_retried = False    # 上游超限后的加压重建重试（只做一次）
 
-    # 并发分散：跳过已有活跃 SSE 流的账号（除非全忙/单号池），
-    # 避免两个并行任务挤同一个上游连接通道
+    # 并发分散：跳过其他会话最近用过的账号（见 _spread_skip_accounts）。
     if POOL and len(POOL.accounts) > 1:
-        busy = {uid for uid, ts in _stream_active.items()
-                if time.time() - ts < STREAM_TTL}
-        if busy and busy != {a.uid for a in POOL.accounts
-                             if a.realm == realm and a.enabled}:
-            tried |= busy       # 把忙的账号加进 exclude，pick 自动跳过
-            log("concurrency spread: skipping %d busy account(s) %s"
-                % (len(busy), [u[:8] for u in busy]), tag="chat")
+        now = time.time()
+        # 顺带回收陈旧条目（纯内存卫生，逻辑不依赖）
+        for uid in [u for u, (ts, _sk) in _stream_last_used.items()
+                    if now - ts > STREAM_STALE_TTL]:
+            _stream_last_used.pop(uid, None)
+        skip = _spread_skip_accounts(
+            realm, session_key, now,
+            {a.uid for a in POOL.accounts
+             if a.realm == realm and a.enabled})
+        if skip:
+            tried |= skip
+            log("concurrency spread: skipping %d account(s) used by other "
+                "sessions %s" % (len(skip), sorted(u[:8] for u in skip)),
+                tag="chat")
 
     # 额外 +2 次迭代预算：只供“短错误冷却等待续上”使用（正常轮换仍由
     # tried 集合自然终止）。
@@ -4700,7 +4729,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
                                              data=encoded.encode("utf-8"),
                                              method="POST", headers=headers)
                 resp = UPSTREAM_OPENER.open(req, timeout=600)
-                _stream_active[account.uid] = time.time()  # 标记活跃流（TTL 自动过期）
+                _stream_last_used[account.uid] = (time.time(), session_key)
                 break
             except urllib.error.HTTPError as exc:
                 try:
