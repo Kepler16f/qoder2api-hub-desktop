@@ -56,6 +56,45 @@ def total_of(path):
         return None
 
 
+def _ensure_suite_line(name, log):
+    """runner 兜底（拿铁建议）：套件没自己打 SUITE: 行时，由 runner 补一条**显式标注**的，
+    这样「跑的是哪份套件」永远有证据，且不需要动任何人的文件。
+
+    注意只兜「套件身份」（SUITE md5）—— 自动可得、不含领域知识；
+    「守护哪些被测文件」（FILE: 行）需要领域知识，代填有填错的风险（声明错比不声明更糟），
+    留给各 owner 在下一次触碰该套件时补。
+    """
+    try:
+        with open(log, encoding="utf-8", errors="replace") as fh:
+            body = fh.read()
+    except OSError as exc:
+        # 保险自己的失败也要留痕（拿铁指出的真模式）：原来这里是 return None，
+        # 于是「零触发」与「坏了」在输出上完全一样 —— 正是我们反复在修的
+        # 「不把『不知道』渲染成『没发生』」。
+        return ("SUITE: %s md5=<unavailable> "
+                "(runner fallback FAILED: cannot read log: %s)" % (name, exc))
+    # 判据收紧（拿铁指出的边界）：只含 "SUITE:" 不够 —— 套件若 import 了别的套件
+    # （如 _test_legacy.py import 主套件），日志里会有**别人**的 SUITE 行，兜底就漏了。
+    if ("SUITE: %s" % name) in body:
+        return None
+    import hashlib
+    path = os.path.join(HERE, name)
+    try:
+        raw = open(path, "rb").read()
+    except OSError as exc:
+        return "SUITE: %s md5=<unavailable> (runner fallback FAILED: cannot read suite: %s)" % (name, exc)
+    line = "SUITE: %s md5=%s (runner-computed; suite did not declare)" % (
+        name, hashlib.md5(raw).hexdigest())
+    # 同时追加进该套件的 log（拿铁的实测建议：logs: <dir> 这个提示让人以为「日志才是留存
+    # 证据」，只保存日志的人复查时会以为兜底没生效）。
+    try:
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write("\n" + line + "\n")
+    except OSError as exc:
+        return line + "  [log append FAILED: %s]" % exc
+    return line
+
+
 def run_one(name, logdir, env):
     log = os.path.join(logdir, name + ".log")
     with open(log, "wb") as fh:
@@ -68,7 +107,20 @@ def main(argv):
     if len(argv) > 1 and argv[1] in ("-h", "--help"):
         print(__doc__)
         return 0
-    pattern = argv[1] if len(argv) > 1 else ""
+    # 兼容两种调用：python tests/run_all.py dashboard（位置参数=过滤模式）
+    # 与 --jobs 4 --logs suite-logs（CI：日志落可见目录、限制并发）。
+    # wb 同款接口——CI 步骤与本地命令一条心。
+    import argparse
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("pattern", nargs="?", default="")
+    ap.add_argument("--jobs", type=int, default=0)
+    ap.add_argument("--logs", default="")
+    known, _rest = ap.parse_known_args(argv[1:])
+    pattern = known.pattern
+    jobs = known.jobs or JOBS
+    logdir = known.logs or tempfile.mkdtemp(prefix="qd-suites-")
+    if known.logs:
+        os.makedirs(known.logs, exist_ok=True)
     selected = suites(pattern)
     if not selected:
         print("  no suite matches %r in %s" % (pattern, HERE))
@@ -79,8 +131,7 @@ def main(argv):
     env["PYTHONIOENCODING"] = "utf-8"
     if not shutil.which("node"):
         env.pop("NODE_OK", None)
-    logdir = tempfile.mkdtemp(prefix="qd-suites-")
-    with _cf.ThreadPoolExecutor(max_workers=JOBS) as ex:
+    with _cf.ThreadPoolExecutor(max_workers=jobs) as ex:
         results = list(ex.map(lambda n: run_one(n, logdir, env), selected))
     failed = []
     grand = 0
@@ -93,6 +144,9 @@ def main(argv):
             grand += n
         print("  %-34s %-10s checks=%s" % (name, "PASS" if rc == 0 else "FAIL(rc=%d)" % rc,
                                             n if n is not None else "?"))
+        _fb = _ensure_suite_line(name, log)
+        if _fb:
+            print("      " + _fb)
         if rc != 0:
             failed.append((name, log))
     for name, log in failed:

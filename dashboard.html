@@ -20,14 +20,35 @@ html,body{overscroll-behavior:none;overscroll-behavior-x:none;overscroll-behavio
   --shadow-sm:0 1px 2px 0 rgba(15,23,42,.05);
   --shadow:0 1px 3px 0 rgba(15,23,42,.06),0 1px 2px -1px rgba(15,23,42,.04);
   --shadow-md:0 4px 6px -2px rgba(15,23,42,.06),0 2px 4px -2px rgba(15,23,42,.04);
+  --header-bg:rgba(255,255,255,.94);
+  /* 页面左右留白：header 与 main 共用同一个值，窄屏收窄、宽屏封顶（wb 同款）。
+     main{max-width} 收窄成 min() 后两侧是留白不是空白，可以放宽。 */
+  --page-pad:clamp(14px,1.4vw,28px);
+  color-scheme:light;
+}
+/* ===== 深色主题（wb 同款 token 集；浅色为默认，html[data-theme="dark"] 覆盖） ===== */
+[data-theme="dark"]{
+  --bg:#0b0f19; --panel:#111827; --panel2:#1e293b; --panel3:#334155;
+  --line:#1f293d; --line-hover:#334155;
+  --fg:#f1f5f9; --dim:#94a3b8; --dim-light:#64748b;
+  --accent:#3b82f6; --accent-hover:#60a5fa; --accent-soft:rgba(59,130,246,.15);
+  --accent2:#22c55e; --accent2-soft:rgba(34,197,94,.15);
+  --warn:#f59e0b; --warn-soft:rgba(245,158,11,.15);
+  --think:#c084fc; --think-soft:rgba(192,132,252,.15);
+  --bad:#f87171; --bad-soft:rgba(248,113,113,.15);
+  --shadow-sm:0 1px 2px 0 rgba(0,0,0,.35);
+  --shadow:0 1px 3px 0 rgba(0,0,0,.45),0 1px 2px -1px rgba(0,0,0,.35);
+  --shadow-md:0 4px 6px -2px rgba(0,0,0,.55),0 2px 4px -2px rgba(0,0,0,.45);
+  --header-bg:rgba(11,15,25,.92);
+  color-scheme:dark;
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);
   font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue","PingFang SC","Microsoft YaHei",sans-serif;
   -webkit-font-smoothing:antialiased}
-header{padding:16px 24px;border-bottom:1px solid var(--line);display:flex;
+header{padding:16px var(--page-pad);border-bottom:1px solid var(--line);display:flex;
   align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;
-  position:sticky;top:0;background:rgba(255,255,255,.94);backdrop-filter:blur(10px);z-index:10;box-shadow:var(--shadow-sm)}
+  position:sticky;top:0;background:var(--header-bg);backdrop-filter:blur(10px);z-index:10;box-shadow:var(--shadow-sm)}
 h1{margin:0;font-size:17px;font-weight:700;letter-spacing:-.2px;color:var(--fg)}
 h1 span{color:var(--dim);font-weight:400;font-size:13px;margin-left:8px}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--accent2);
@@ -35,7 +56,7 @@ h1 span{color:var(--dim);font-weight:400;font-size:13px;margin-left:8px}
 .dot.err{background:var(--bad);box-shadow:0 0 0 2px rgba(220,38,38,.2)}
 .meta{color:var(--dim);font-size:12px;text-align:right;line-height:1.6}
 .meta b{color:var(--fg);font-weight:600}
-main{padding:24px 24px 60px;max-width:1280px;margin:0 auto}
+main{padding:20px var(--page-pad) 60px;max-width:1800px;margin:0 auto}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));gap:12px;margin-bottom:22px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 18px;box-shadow:var(--shadow);min-width:0}
 .card .k{color:var(--dim);font-size:12px;margin-bottom:6px;font-weight:500}
@@ -71,6 +92,12 @@ tbody tr:hover{background:rgba(241,245,249,.6)}
 .table-wrap table{min-width:720px}
 @media (max-width: 860px){
   header{padding:12px 16px}
+  /* 窄屏 header 排序（wb 同款）：标题与右侧按钮组同行，导航独立一行可横向滚动，
+     主题按钮不再因为 meta 换行而被顶成孤行。 */
+  header > .header-left{width:auto;flex:1;gap:8px;min-width:0}
+  header > .header-right{display:flex;align-items:center;gap:6px;order:2}
+  header h1{font-size:15px}
+  header .meta{width:100%;text-align:left;font-size:11px;line-height:1.5;order:4}
   main{padding:16px 12px 60px}
   section{padding:14px 14px;border-radius:12px}
   #cards{grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}
@@ -90,7 +117,18 @@ tbody tr:hover{background:rgba(241,245,249,.6)}
 .empty{color:var(--dim);text-align:center;padding:28px 0;font-size:13px}
 .legend{display:flex;gap:16px;color:var(--dim);font-size:11px;margin-top:12px;flex-wrap:wrap}
 .legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:middle}
-.toolbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.toolbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;align-items:center}
+/* 工具栏语义分组分隔：细竖线，不抢按钮视觉 */
+.tb-sep{width:1px;height:20px;background:var(--line);margin:0 2px;flex:0 0 auto}
+/* 批量操作弹出菜单（收纳低频的全局动作） */
+.menu-wrap{position:relative;display:inline-flex}
+.menu-pop{display:none;position:absolute;top:calc(100% + 4px);left:0;min-width:132px;
+  background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:4px;
+  box-shadow:var(--shadow-md);z-index:90}
+.menu-pop.open{display:block;animation:themePop .12s cubic-bezier(0,0,.2,1)}
+.menu-pop button{display:block;width:100%;text-align:left;padding:7px 10px;border-radius:6px;
+  border:none;background:transparent;color:var(--fg);box-shadow:none;font-size:12px}
+.menu-pop button:hover{background:var(--panel2)}
 button{cursor:pointer;font:inherit;font-size:12px;font-weight:500;padding:6px 14px;border-radius:8px;
   border:1px solid var(--accent);background:var(--accent);color:#fff;box-shadow:var(--shadow-sm);transition:all .15s ease}
 button:hover{background:var(--accent-hover);border-color:var(--accent-hover)}
@@ -216,42 +254,250 @@ a:hover{text-decoration:underline}
 .log-msg{color:#cbd5e1;flex:1;word-break:break-all;white-space:pre-wrap}
 .log-empty{padding:48px 24px;text-align:center;color:#64748b;font-size:13px;font-family:inherit}
 
-/* ---- 深色模式：跟随系统 prefers-color-scheme，全站变量整体换肤 ---- */
-@media (prefers-color-scheme: dark){
-  :root{
-    --bg:#0b1220; --panel:#121a2b; --panel2:#0e1626; --panel3:#1b2438;
-    --line:#22304d; --line-hover:#31426b;
-    --fg:#e7eef8; --dim:#93a4bd; --dim-light:#6d7f9a;
-    --accent:#4c8dff; --accent-hover:#6ea4ff; --accent-soft:rgba(76,141,255,.16);
-    --accent2:#2dd47f; --accent2-soft:rgba(45,212,127,.16);
-    --warn:#f0a63c; --warn-soft:rgba(240,166,60,.16);
-    --think:#b39cff; --think-soft:rgba(179,156,255,.16);
-    --bad:#ff7b7b; --bad-soft:rgba(255,123,123,.14);
-    --shadow-sm:0 1px 2px 0 rgba(0,0,0,.5);
-    --shadow:0 1px 3px 0 rgba(0,0,0,.5),0 1px 2px -1px rgba(0,0,0,.45);
-    --shadow-md:0 4px 6px -2px rgba(0,0,0,.5),0 2px 4px -2px rgba(0,0,0,.45);
-    color-scheme:dark;
-  }
-  header{background:rgba(11,18,32,.92)}
-  /* 以下元素在浅色主题里用了硬编码白底，深色下逐一对齐变量 */
-  .badge.off{color:#93a4bd;background:#1b2438;border-color:#31426b}
-  button.sec{background:#1b2438}
-  .modal{background:var(--panel)}
-  .login-link:hover{background:#1b2438}
-  .key-card{background:var(--panel)}
-  .key-action-btn{background:#1b2438}
-  .realm-card.active{background:var(--panel)}
-  .toggle-realm-btn{background:#1b2438}
-  .main-nav-btn:hover{background:#1b2438}
-  .main-nav-btn.active{background:var(--panel2)}
-  #analyticsKpiCards .card{background:var(--panel)}
-  ::-webkit-scrollbar{width:0;height:0}
+/* ===== 深色主题覆盖层（wb 同款思路）：浅色写死的地方逐条给出深色对应 ===== */
+[data-theme="dark"] .badge.ok{color:#4ade80;background:rgba(34,197,94,.16);border-color:rgba(34,197,94,.32)}
+[data-theme="dark"] .badge.s{color:#60a5fa;background:rgba(59,130,246,.16);border-color:rgba(59,130,246,.32)}
+[data-theme="dark"] .badge.off{color:#94a3b8;background:rgba(148,163,184,.14);border-color:rgba(148,163,184,.22)}
+[data-theme="dark"] .badge.warn{color:#fbbf24;background:rgba(245,158,11,.16);border-color:rgba(245,158,11,.35)}
+[data-theme="dark"] .badge.bad{color:#f87171;background:rgba(248,113,113,.16);border-color:rgba(248,113,113,.35)}
+[data-theme="dark"] .realm-badge-intl{color:#38bdf8;background:rgba(2,132,199,.2);border-color:rgba(2,132,199,.4)}
+[data-theme="dark"] .realm-badge-cn{color:#f87171;background:rgba(220,38,38,.2);border-color:rgba(220,38,38,.4)}
+[data-theme="dark"] .modal-mask{background:rgba(0,0,0,.65)}
+[data-theme="dark"] tbody tr:hover{background:rgba(30,41,59,.55)}
+[data-theme="dark"] button.sec{background:var(--panel);border-color:var(--line)}
+[data-theme="dark"] .modal{background:var(--panel)}
+[data-theme="dark"] .login-link:hover{background:var(--panel2)}
+[data-theme="dark"] .key-card{background:var(--panel)}
+[data-theme="dark"] .key-card.disabled{background:rgba(30,41,59,.5)}
+[data-theme="dark"] .key-action-btn{background:var(--panel)}
+[data-theme="dark"] .main-nav-btn:hover{background:var(--panel)}
+[data-theme="dark"] .main-nav-btn.active{background:var(--panel)}
+[data-theme="dark"] .range-btn.active{color:#fff}
+[data-theme="dark"] #analyticsKpiCards .card{background:var(--panel)}
+[data-theme="dark"] .realm-card.active{background:var(--panel)}
+[data-theme="dark"] .toggle-realm-btn{background:var(--panel2)}
+[data-theme="dark"] .toggle-realm-btn:hover{background:rgba(255,255,255,.06)}
+[data-theme="dark"] .log-line:hover{background:rgba(255,255,255,.05)}
+
+/* ===== 顶部右侧区（主题切换组件，wb 同款） ===== */
+.header-right{display:flex;align-items:center;gap:10px}
+.theme-dropdown-wrap{position:relative;display:inline-flex}
+.theme-btn{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:34px;height:32px;border-radius:8px;border:1px solid var(--line);
+  background:var(--panel);color:var(--dim);box-shadow:var(--shadow-sm);
+  cursor:pointer;padding:0;transition:all .15s ease;
+}
+.theme-btn:hover{
+  color:var(--fg);border-color:var(--line-hover);
+  background:var(--panel2);box-shadow:var(--shadow-md);
+}
+.theme-btn-icon{width:16px;height:16px;display:inline-flex;align-items:center;justify-content:center}
+.theme-btn-icon svg{width:16px;height:16px;display:block}
+.theme-dropdown{
+  display:none;position:absolute;top:calc(100% + 6px);right:0;
+  min-width:130px;background:var(--panel);border:1px solid var(--line);
+  border-radius:10px;padding:4px;box-shadow:var(--shadow-md);
+  z-index:100;backdrop-filter:blur(8px);
+}
+.theme-dropdown.open{display:block;animation:themePop .12s cubic-bezier(0,0,.2,1)}
+@keyframes themePop{from{opacity:0;transform:scale(.96) translateY(-4px)}to{opacity:1;transform:scale(1) translateY(0)}}
+.theme-option{
+  width:100%;display:flex;align-items:center;gap:8px;padding:7px 10px;
+  border-radius:6px;border:none;background:transparent;color:var(--fg);
+  font-size:12px;cursor:pointer;text-align:left;transition:background .12s ease;
+  box-shadow:none;
+}
+.theme-option:hover{background:var(--panel2)}
+.theme-opt-icon{width:14px;height:14px;flex-shrink:0;color:var(--dim)}
+.theme-option:hover .theme-opt-icon{color:var(--fg)}
+.theme-opt-text{flex:1;font-weight:500}
+.theme-opt-check{width:13px;height:13px;flex-shrink:0;opacity:0;color:var(--accent)}
+.theme-option.active .theme-opt-check{opacity:1}
+.theme-option.active{font-weight:600;color:var(--accent)}
+.theme-option.active .theme-opt-icon{color:var(--accent)}
+
+/* ===== 页面区块导航（wb 同款）：.main-page 两栏布局 =====
+   导航项完全由页面内的 section 现场生成：标题取该 section 首个 h2 的文本
+   （忽略用于显示状态的 <em>），锚点 id 由标题内容哈希得到。 */
+.main-page{display:none}
+.main-page.active{display:block}
+.main-page.page-nav-on.active{display:grid;grid-template-columns:196px minmax(0,1fr);gap:20px;align-items:start}
+.main-page.page-nav-on > *{grid-column:2;min-width:0}
+/* 内容包在 .page-nav-body 里，grid 里只剩「侧栏 + 内容」两项，侧栏才跨得满
+   整个内容区；区块间距也仍只由 section 自己的 margin 决定。 */
+.main-page.page-nav-on > .page-sidebar{grid-column:1;grid-row:1 / -1;position:sticky;
+  top:var(--page-nav-top,84px);z-index:6;background:var(--panel);border:1px solid var(--line);
+  border-radius:14px;padding:10px;box-shadow:var(--shadow);
+  max-height:calc(100vh - var(--page-nav-top,84px) - 20px);overflow:auto}
+.page-sidebar-title{font-size:11px;font-weight:700;color:var(--dim);text-transform:uppercase;
+  letter-spacing:.6px;padding:6px 10px 8px}
+.page-nav{display:flex;flex-direction:column;gap:2px}
+.page-nav-item{appearance:none;background:transparent;border:1px solid transparent;color:var(--dim);
+  text-align:left;padding:8px 10px;border-radius:8px;font:inherit;font-size:13px;line-height:1.35;
+  cursor:pointer;transition:all .15s ease;overflow-wrap:anywhere}
+.page-nav-item:hover{color:var(--fg);background:var(--panel2)}
+.page-nav-item.active{color:var(--fg);background:var(--panel2);border-color:var(--line);font-weight:600}
+button.page-nav-top{display:flex;align-items:center;justify-content:center;gap:6px;width:100%;
+  margin-bottom:8px;padding:7px 10px;border-radius:8px;font-size:12px;font-weight:600;
+  background:var(--panel2);border:1px solid var(--line);color:var(--fg);box-shadow:none;
+  transition:all .15s ease}
+button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);color:var(--accent)}
+.page-sidebar-head{display:flex;align-items:center;justify-content:space-between;gap:6px}
+.page-sidebar-toggle{appearance:none;flex:0 0 auto;width:22px;height:22px;padding:0;
+  display:inline-flex;align-items:center;justify-content:center;border-radius:6px;
+  border:1px solid var(--line);background:var(--panel2);color:var(--dim);
+  font:inherit;font-size:12px;line-height:1;cursor:pointer;transition:all .15s ease}
+.page-sidebar-toggle:hover{color:var(--fg);border-color:var(--line-hover)}
+/* 收起侧栏（宽屏生效；窄屏本来就是横向胶囊行） */
+@media (min-width:861px){
+  .main-page.page-nav-on.page-nav-collapsed.active{grid-template-columns:44px minmax(0,1fr);gap:12px}
+  .main-page.page-nav-on.page-nav-collapsed > .page-sidebar{padding:6px 4px;overflow:hidden}
+  .main-page.page-nav-on.page-nav-collapsed .page-sidebar-title,
+  .main-page.page-nav-on.page-nav-collapsed .page-nav,
+  .main-page.page-nav-on.page-nav-collapsed button.page-nav-top{display:none}
+  .main-page.page-nav-on.page-nav-collapsed .page-sidebar-head{justify-content:center;padding:0}
+}
+.main-page.page-nav-on section{scroll-margin-top:var(--page-nav-top,84px)}
+.main-page.page-nav-on section.page-nav-flash{outline:2px solid var(--accent);outline-offset:2px}
+@media (max-width:860px){
+  .main-page.page-nav-on.active{grid-template-columns:minmax(0,1fr);gap:14px}
+  .main-page.page-nav-on > *{grid-column:1}
+  .main-page.page-nav-on > .page-sidebar{grid-row:auto;max-height:none;overflow:visible;padding:8px;
+    border-radius:12px;background:var(--header-bg);backdrop-filter:blur(10px);
+    display:flex;align-items:center;gap:8px}
+  .page-sidebar-title{display:none}
+  .page-sidebar-head{display:none}
+  .page-nav{flex:1 1 auto;min-width:0;flex-direction:row;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch;padding-bottom:2px;
+    scrollbar-width:thin}
+  .page-nav-item{white-space:nowrap;padding:7px 12px;border-radius:999px;
+    background:var(--panel2);border-color:var(--line)}
+  button.page-nav-top{width:auto;flex:0 0 auto;margin-bottom:0;padding:7px 12px;border-radius:999px;
+    white-space:nowrap}
 }
 </style>
+<script>
+/* 主题初始化：在 <body> 解析前运行（wb 同款）——内联且零依赖是有意的，
+   外链或 defer 脚本会来不及阻止「闪错主题」。三态：light / dark / system；
+   偏好存 localStorage（qd-theme），system 跟随 prefers-color-scheme。 */
+(function(){
+  var THEME_KEY = 'qd-theme';
+  var mq = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+  function getPref(){
+    try { return localStorage.getItem(THEME_KEY) || 'system'; } catch(e){ return 'system'; }
+  }
+  function resolve(pref){
+    if(pref === 'dark' || pref === 'light') return pref;
+    return (mq && mq.matches) ? 'dark' : 'light';
+  }
+  var savedTheme = getPref();
+  var resolvedTheme = resolve(savedTheme);
+  document.documentElement.setAttribute('data-theme', resolvedTheme);
+  document.documentElement.setAttribute('data-theme-pref', savedTheme);
+  document.documentElement.style.colorScheme = resolvedTheme;
+
+  var svgSun = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"></path></svg>';
+  var svgMoon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"></path></svg>';
+  var svgMonitor = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>';
+
+  function updateThemeUI(pref, resolved){
+    var icon = document.getElementById('themeToggleIcon');
+    var btn = document.getElementById('themeToggleBtn');
+    if(!icon) return;
+    if(pref === 'dark'){ icon.innerHTML = svgMoon; }
+    else if(pref === 'light'){ icon.innerHTML = svgSun; }
+    else { icon.innerHTML = svgMonitor; }
+    ['light', 'dark', 'system'].forEach(function(val){
+      var opt = document.getElementById('themeOpt' + val.charAt(0).toUpperCase() + val.slice(1));
+      if(opt) opt.classList.toggle('active', pref === val);
+    });
+    var label = pref === 'dark' ? '深色' : (pref === 'light' ? '浅色' : '跟随系统 (' + (resolved === 'dark' ? '当前深色' : '当前浅色') + ')');
+    if(btn) btn.title = '颜色主题: ' + label;
+  }
+
+  window.applyTheme = function(pref){
+    var resolved = resolve(pref);
+    document.documentElement.setAttribute('data-theme', resolved);
+    document.documentElement.setAttribute('data-theme-pref', pref);
+    document.documentElement.style.colorScheme = resolved;
+    try { localStorage.setItem(THEME_KEY, pref); } catch(e){}
+    updateThemeUI(pref, resolved);
+  };
+
+  window.selectTheme = function(pref, evt){
+    if(evt){ evt.preventDefault(); evt.stopPropagation(); }
+    window.applyTheme(pref);
+    var menu = document.getElementById('themeDropdown');
+    var btn = document.getElementById('themeToggleBtn');
+    if(menu) menu.classList.remove('open');
+    if(btn) btn.setAttribute('aria-expanded', 'false');
+  };
+
+  window.toggleThemeMenu = function(evt){
+    if(evt){ evt.preventDefault(); evt.stopPropagation(); }
+    var menu = document.getElementById('themeDropdown');
+    var btn = document.getElementById('themeToggleBtn');
+    if(!menu) return;
+    var isOpen = menu.classList.toggle('open');
+    if(btn) btn.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+  };
+
+  window.initThemeSystem = function(){
+    var curPref = getPref();
+    updateThemeUI(curPref, resolve(curPref));
+    if(mq && mq.addEventListener){
+      mq.addEventListener('change', function(){
+        if(getPref() === 'system'){ window.applyTheme('system'); }
+      });
+    }
+    document.addEventListener('click', function(e){
+      var wrap = document.getElementById('themeDropdownWrap');
+      if(wrap && !wrap.contains(e.target)){
+        var menu = document.getElementById('themeDropdown');
+        var btn = document.getElementById('themeToggleBtn');
+        if(menu && menu.classList.contains('open')){
+          menu.classList.remove('open');
+          if(btn) btn.setAttribute('aria-expanded', 'false');
+        }
+      }
+    });
+    document.addEventListener('keydown', function(e){
+      if(e.key === 'Escape'){
+        var menu = document.getElementById('themeDropdown');
+        var btn = document.getElementById('themeToggleBtn');
+        if(menu && menu.classList.contains('open')){
+          menu.classList.remove('open');
+          if(btn) btn.setAttribute('aria-expanded', 'false');
+        }
+      }
+    });
+  };
+  // 页签预点亮（wb 同款）：.main-page 的显隐靠 CSS 类，body 解析前先把上次
+  // 的页签点亮，避免「所有页面都 display:none 的白屏一闪」。主脚本 boot 后
+  // switchMainTab() 会再对齐一次（URL ?tab= 优先级最高）。
+  var TABS = ['gateway','analytics','logs','settings'];
+  var pickTab = null;
+  try {
+    var qTab = new URLSearchParams(location.search).get('tab');
+    var sTab = localStorage.getItem('qd-main-tab');
+    pickTab = [qTab, sTab].find(function(t){ return TABS.indexOf(t) !== -1; }) || 'gateway';
+  } catch(e) { pickTab = 'gateway'; }
+  window.__MAIN_TAB__ = pickTab;
+  document.addEventListener('DOMContentLoaded', function(){
+    TABS.forEach(function(t){
+      var page = document.getElementById('page' + t.charAt(0).toUpperCase() + t.slice(1));
+      if(page) page.classList.toggle('active', t === pickTab);
+      var btn = document.getElementById('btnNav' + t.charAt(0).toUpperCase() + t.slice(1));
+      if(btn) btn.classList.toggle('active', t === pickTab);
+    });
+    window.initThemeSystem();
+  });
+})();
+</script>
 </head>
 <body>
 <header>
-  <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap">
+  <div class="header-left" style="display:flex;align-items:center;gap:18px;flex-wrap:wrap">
     <h1><span class="dot" id="statusDot"></span>Qoder 网关看板
       <a id="updateBadge" href="#" target="_blank" rel="noopener"
          style="display:none;margin-left:10px;font-size:12px;font-weight:600;vertical-align:middle;
@@ -274,7 +520,40 @@ a:hover{text-decoration:underline}
       </button>
     </nav>
   </div>
-  <div class="meta" id="meta"></div>
+  <div class="header-right">
+    <div class="theme-dropdown-wrap" id="themeDropdownWrap">
+      <button type="button" class="theme-btn" id="themeToggleBtn" onclick="toggleThemeMenu(event)" title="颜色主题" aria-label="切换颜色主题" aria-haspopup="true" aria-expanded="false">
+        <span id="themeToggleIcon" class="theme-btn-icon"></span>
+      </button>
+      <div class="theme-dropdown" id="themeDropdown" role="menu" aria-label="选择颜色主题">
+        <button type="button" class="theme-option" id="themeOptLight" onclick="selectTheme('light', event)" role="menuitem">
+          <svg class="theme-opt-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="4"></circle>
+            <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"></path>
+          </svg>
+          <span class="theme-opt-text">浅色</span>
+          <svg class="theme-opt-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+        </button>
+        <button type="button" class="theme-option" id="themeOptDark" onclick="selectTheme('dark', event)" role="menuitem">
+          <svg class="theme-opt-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"></path>
+          </svg>
+          <span class="theme-opt-text">深色</span>
+          <svg class="theme-opt-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+        </button>
+        <button type="button" class="theme-option" id="themeOptSystem" onclick="selectTheme('system', event)" role="menuitem">
+          <svg class="theme-opt-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="3" width="20" height="14" rx="2"></rect>
+            <line x1="8" y1="21" x2="16" y2="21"></line>
+            <line x1="12" y1="17" x2="12" y2="21"></line>
+          </svg>
+          <span class="theme-opt-text">跟随系统</span>
+          <svg class="theme-opt-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+        </button>
+      </div>
+    </div>
+    <div class="meta" id="meta"></div>
+  </div>
 </header>
 <div id="panelGate" style="position:fixed;inset:0;z-index:600;display:none;
      align-items:center;justify-content:center;padding:20px;background:var(--bg)">
@@ -294,7 +573,7 @@ a:hover{text-decoration:underline}
   </div>
 </div>
 <main>
-  <div id="pageGateway">
+  <div id="pageGateway" class="main-page">
   <!-- 版本中枢控制栏 (三列等高对齐网格) -->
   <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-bottom:18px">
     
@@ -346,11 +625,12 @@ a:hover{text-decoration:underline}
         <span id="gatewayDot" class="dot" style="width:9px;height:9px"></span>
         <span id="activeGatewayName" style="font-size:20px;font-weight:700;color:var(--accent);letter-spacing:-.4px">国际版 (Global)</span>
       </div>
-      <div style="margin-top:auto">
-        <button class="toggle-realm-btn" id="btnToggleRealm" onclick="toggleActiveGatewayRealm()" style="cursor:pointer;width:100%;padding:7px 12px;font-size:12px">
-          ⇄ 切换默认出口为【国内版】
-        </button>
+      <div id="realmModeBar" style="display:flex;gap:4px;margin:4px 0 8px;flex-wrap:wrap">
+        <button class="range-btn" id="realmModeAuto" onclick="setRealmMode('auto')">自动</button>
+        <button class="range-btn" id="realmModeCn" onclick="setRealmMode('cn')">锁定国内</button>
+        <button class="range-btn" id="realmModeIntl" onclick="setRealmMode('intl')">锁定国际</button>
       </div>
+      <div id="realmActual" style="font-size:11px;color:var(--dim);margin:0 0 8px;line-height:1.5">本次实际出口：—</div>
     </div>
 
   </div>
@@ -371,17 +651,23 @@ a:hover{text-decoration:underline}
 
   <section>
     <h2>账号<em id="acctCount"></em></h2>
-    <div class="toolbar">
+    <div class="toolbar" style="align-items:center">
     <button onclick="openLoginModal()">+ 添加账号 (OAuth)</button>
     <button class="sec" id="btnCheckin" onclick="doCheckin(this)" style="display:none">每日签到</button>
-    <button class="sec" id="btnScanDesktop" onclick="scanDesktop(this)">扫描本地凭证</button>
-    <button class="sec" onclick="openPatImport()">🔑 导入 PAT</button>
-    <button class="sec" onclick="exportAccounts(this)">导出账号</button>
-    <button class="sec" onclick="openImport()">导入账号</button>
     <button class="sec" onclick="fetchCredits(this)">刷新积分</button>
-    <button class="sec" onclick="setAll(true, this)">全部启用</button>
-    <button class="sec" onclick="setAll(false, this)">全部停用</button>
-    
+    <span class="tb-sep" aria-hidden="true"></span>
+    <button class="sec" id="btnScanDesktop" onclick="scanDesktop(this)">扫描本地凭证</button>
+    <button class="sec" onclick="openPatImport()">导入 PAT</button>
+    <button class="sec" onclick="openImport()">导入账号</button>
+    <button class="sec" onclick="exportAccounts(this)">导出账号</button>
+    <span class="tb-sep" aria-hidden="true"></span>
+    <div class="menu-wrap">
+      <button class="sec" onclick="toggleBulkMenu(event)">批量操作 ▾</button>
+      <div class="menu-pop" id="bulkMenu">
+        <button type="button" onclick="setAll(true, this)">全部启用</button>
+        <button type="button" onclick="setAll(false, this)">全部停用</button>
+      </div>
+    </div>
   </div>
     <div id="accounts"></div>
   </section>
@@ -408,7 +694,9 @@ a:hover{text-decoration:underline}
         <span class="badge warn" style="font-size:10px">A → B</span> 归一化时被挪档 ·
         <span class="badge bad" style="font-size:10px">→ 未下发</span> 请求了但被丢弃（模型无档位表）；
         <span style="color:var(--dim)">—</span> 表示该行没有档位字段（旧行 / 客户端未请求）</span>
-      <span><b>Key</b>＝仅显示标识（面板备注名 / 内置来源），不涉明文；<span style="color:var(--dim)">无 Key / 面板会话</span> 表示该行不带 Key（聚合时归入 (no-key) 桶）</span>
+      <span><b>Key</b>＝仅显示标识（面板备注名 / 内置来源），不涉明文；<span style="color:var(--dim)">无 Key / 面板会话</span> 表示该行不带 Key（聚合时归入「无 Key」桶）</span>
+      <span><b>区域</b>＝这条请求**实际走了哪个区**（usage 行逐请求落盘，确定值）。上方网关卡片里那条「最近一次对话的出口」
+        与本列**同源**（都读 usage 行），只是它只看最近一条并给出换区原因；逐条历史看这一列</span>
     </div>
     <div id="recentPagination" style="display:flex;align-items:center;justify-content:space-between;margin-top:14px;padding-top:12px;border-top:1px solid var(--line);font-size:12px;color:var(--dim);flex-wrap:wrap;gap:8px">
       <div id="recentPageInfo">第 1 / 1 页 · 共 0 条记录</div>
@@ -506,7 +794,7 @@ a:hover{text-decoration:underline}
 
   
   </div><!-- /pageGateway -->
-  <div id="pageAnalytics" style="display:none">
+  <div id="pageAnalytics" class="main-page">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:12px">
       <div>
         <h2 style="margin:0;font-size:16px;color:var(--fg);display:flex;align-items:center;gap:8px">
@@ -606,7 +894,7 @@ a:hover{text-decoration:underline}
 
 
 
-  <div id="pageSettings" style="display:none">
+  <div id="pageSettings" class="main-page">
     <div style="margin-bottom:16px">
       <h2 style="margin:0;font-size:16px;color:var(--fg)">设置</h2>
     </div>
@@ -745,7 +1033,7 @@ a:hover{text-decoration:underline}
     </section>
   </div>
 
-  <div id="pageLogs" style="display:none">
+  <div id="pageLogs" class="main-page">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:12px">
       <div>
         <h2 style="margin:0;font-size:16px;color:var(--fg)">网关运行日志</h2>
@@ -794,7 +1082,7 @@ a:hover{text-decoration:underline}
           <span style="width:10px;height:10px;border-radius:50%;background:#ef4444;display:inline-block"></span>
           <span style="width:10px;height:10px;border-radius:50%;background:#f59e0b;display:inline-block"></span>
           <span style="width:10px;height:10px;border-radius:50%;background:#10b981;display:inline-block"></span>
-          <span style="font-size:11px;color:#94a3b8;font-family:monospace;margin-left:8px">wb-proxy-console.log</span>
+          <span style="font-size:11px;color:#94a3b8;font-family:monospace;margin-left:8px">qoder-proxy-console.log</span>
         </div>
         <div id="logTerminalStatus" style="font-size:11px;color:#64748b;font-family:monospace">就绪</div>
       </div>
@@ -1020,6 +1308,97 @@ window.VIEW_REALM = "intl";
 window.MODELS_DATA = [];
 window.ACCOUNTS = [];
 
+/* ---- #26 自动路由：三态开关 + 本次实际出口 ----
+   隐式行为必须可见：自动换区是后台替用户做的决定，所以必须显示出来（响应头 X-Qoder-Realm → 界面）。
+   三态：auto（由环境变量控制，只能展示、不能在线改）/ cn / intl（显式锁定默认出口）。 */
+function realmModeOf(state){
+  const s = state || {};
+  if(s.auto_enabled) return 'auto';
+  return (s.current === 'cn') ? 'cn' : 'intl';
+}
+// 卡片「最近一次对话的出口」：数据源＝最近请求表的 **usage 行**（持久化、可查历史）。
+// 响应头那条数据源已按契约切断（管理端点永不返回 X-Qoder-Realm），这里不再读任何响应头。
+// 三态严格区分——**不把「不知道」与「没发生」混为一谈**：
+//   realm_reason 键不存在 → 字段上线前的旧行（不知道） ／ "" → 没换区（没发生） ／ 其余 → 换区 + 确定性原因
+function realmActualNote(rows, state){
+  const list = Array.isArray(rows) ? rows : [];
+  const nameOf = r => (r === 'cn' ? '国内版' : (r === 'intl' ? '国际版' : (r || '未知')));
+  // 每个原因都带上「我能做什么」——比只说「在哪推走的」有用（natie 的建议）
+  const WHY = { model_missing: '当前区官方清单里没有这个模型：它天生只在另一区提供，加账号也改变不了；想固定用它就把默认出口切到那一区',
+                no_account: '模型在当前区本来有（或无法判断），是账号可用性把它推走的：给默认出口那一区加一个可用账号即可，不加则会一直走自动路由' };
+  const stamp = r => (r && r.iso) ? String(r.iso).replace('T', ' ').slice(5) : '';
+  if(!list.length){
+    return { tone: 'dim', head: '最近一次对话的出口：还不确定',
+             detail: '还没有可读的 usage 行；拿不到「最近一次对话」时不显示默认值（那是假指示）' };
+  }
+  // 最近请求表第 1 页时间倒序：取**最近一条非 error 的行**（失败行可能没有真实出账区，不该拿它当结论）
+  const newest = list.find(r => !r.error) || list[0];
+  const at = stamp(newest);
+  const hasKey = Object.prototype.hasOwnProperty.call(newest, 'realm_reason');
+  const knownCount = list.filter(r => Object.prototype.hasOwnProperty.call(r, 'realm_reason')).length;
+  const switchedCount = list.filter(r => r.realm_reason === 'model_missing' || r.realm_reason === 'no_account').length;
+  const scope = '（样本：最近请求表当前页 ' + list.length + ' 条）';
+  if(!hasKey){
+    return { tone: 'dim', head: '最近一次对话的出口：未知（旧记录）',
+             detail: '这一行没有 realm_reason 字段：它产生于该字段上线之前' + scope + '，据此判断不了换没换区（不猜，也不显示成「没换区」）' };
+  }
+  if(newest.realm_reason){
+    const why = WHY[newest.realm_reason] || ('后端原因码 ' + newest.realm_reason);
+    return { tone: 'warn', head: '最近一次对话（' + at + '）走了 ' + nameOf(newest.realm) + '：被自动换区',
+             detail: '原因：' + why + '；' + scope };
+  }
+  const never = (switchedCount === 0 && knownCount === list.length);
+  return { tone: 'dim', head: '最近一次对话（' + at + '）走了 ' + nameOf(newest.realm) + '：未换区',
+           detail: (never
+             ? '本页 ' + list.length + ' 条样本里没有出现过自动换区（「从没换过」的完整历史要看 usage 行累计，这里只代表当前样本）'
+             : '本页样本里有 ' + switchedCount + ' 条被自动换过区，最近这一条没有') + '；' + scope };
+}
+function renderRealmMode(){
+  const st = window.REALM_STATE || {};
+  const mode = realmModeOf(st);
+  [['auto', 'realmModeAuto'], ['cn', 'realmModeCn'], ['intl', 'realmModeIntl']].forEach(pair => {
+    const el = document.getElementById(pair[1]);
+    if(el) el.classList.toggle('active', pair[0] === mode);
+  });
+  const bar = document.getElementById('realmModeBar');
+  if(bar){
+    const env = st.auto_env || 'QD_AUTO_REALM';
+    bar.title = st.auto_enabled
+      ? ('自动路由已开启（环境变量 ' + env + '）：当前区缺模型或没有可用账号时会自动换区；改这个开关要重启网关，面板只展示状态')
+      : ('未开启自动路由：恒用锁定出口；要开启需设置环境变量 ' + env + ' 并重启网关');
+  }
+}
+function renderRealmActual(){
+  const el = document.getElementById('realmActual');
+  if(!el) return;
+  const note = realmActualNote((RECENT_SNAPSHOT || {}).rows, window.REALM_STATE);
+  el.innerHTML = '<b>' + esc(note.head) + '</b>' + (note.detail ? '<br>' + esc(note.detail) : '');
+  el.style.color = (note.tone === 'warn') ? 'var(--warn)' : 'var(--dim)';
+}
+async function setGatewayRealm(realm){
+  try {
+    const res = await postJSON('/realm', {realm: realm});
+    window.ACTIVE_GATEWAY_REALM = res.current || realm;
+    window.VIEW_REALM = window.ACTIVE_GATEWAY_REALM;
+    toast('默认出口已设为: ' + (window.ACTIVE_GATEWAY_REALM === 'intl' ? '国际版' : '国内版'));
+    window.updateUI();
+    await loadAccounts();
+    await loadModels();
+    await refresh();
+  } catch(e) {
+    toast('切换失败: ' + e.message, 'bad');
+  }
+}
+function setRealmMode(mode){
+  const st = window.REALM_STATE || {};
+  if(mode === 'auto'){
+    toast('自动路由由环境变量 ' + (st.auto_env || 'QD_AUTO_REALM') + ' 控制，改动需要重启网关；面板只展示当前状态', 'warn');
+    return;
+  }
+  if(st.auto_enabled) toast('自动路由已开启：锁定只改默认出口，当前区缺模型/无可用账号时仍会自动换区', 'warn');
+  setGatewayRealm(mode);
+}
+
 function updateUI(){
   const isIntlView = (window.VIEW_REALM === "intl");
   const tIntl = document.getElementById("tabIntl");
@@ -1045,12 +1424,6 @@ function updateUI(){
   const ep = document.getElementById("activeEndpoint");
   if(ep) ep.textContent = isIntlGw ? "https://api1.qoder.sh" : "https://gateway.qoder.com.cn";
 
-  const btnToggle = document.getElementById("btnToggleRealm");
-  if(btnToggle) {
-    btnToggle.textContent = isIntlGw ? "切换默认出口为【国内版】" : "切换默认出口为【国际版】";
-    btnToggle.style.borderColor = isIntlGw ? "#dc2626" : "var(--accent)";
-    btnToggle.style.color = isIntlGw ? "#dc2626" : "var(--accent)";
-  }
   const cardGw = document.getElementById("cardGatewayCtrl");
   if(cardGw){
     cardGw.style.borderColor = isIntlGw ? "rgba(37,99,235,.28)" : "rgba(220,38,38,.28)";
@@ -1095,6 +1468,8 @@ function updateUI(){
   if(elCnCred) elCnCred.textContent = hasCnCred ? fmt(cnCred) : "—";
   const elCnAcct = document.getElementById("tabCnAccts");
   if(elCnAcct) elCnAcct.textContent = cnAccts.length;
+  renderRealmMode();      // #26：自动 / 锁定国内 / 锁定国际 三态
+  renderRealmActual();    // #26：本次实际出口（有头=换过，无头=没换）
 };
 
 // —— 项目新版本检测（运行信息卡片；自动检查一次 + 手动「立即检查」）——
@@ -1170,26 +1545,14 @@ async function switchViewRealm(r){
   ]);
 };
 
-async function toggleActiveGatewayRealm(){
-  const next = (window.ACTIVE_GATEWAY_REALM === "intl" ? "cn" : "intl");
-  try {
-    const res = await postJSON("/realm", {realm: next});
-    window.ACTIVE_GATEWAY_REALM = res.current || next;
-    toast("网关默认上游已切换并永久保存为: " + (window.ACTIVE_GATEWAY_REALM === "intl" ? "国际版" : "国内版"));
-    window.VIEW_REALM = window.ACTIVE_GATEWAY_REALM;
-    window.updateUI();
-    await loadAccounts();
-    await loadModels();
-    await refresh();
-  }catch(e){
-    toast("切换失败: " + e.message, "bad");
-  }
-};
-
 async function initRealm(preserveView){
   try{
     const r = await getJSON("/realm");
     if(r && r.current) window.ACTIVE_GATEWAY_REALM = r.current;
+    // #26：auto_enabled 来自环境变量（只读展示）；current 是锁定生效值
+    window.REALM_STATE = { current: (r && r.current) || window.ACTIVE_GATEWAY_REALM,
+                           auto_enabled: !!(r && r.auto_enabled),
+                           auto_env: (r && r.auto_env) || "QD_AUTO_REALM" };
   } catch(e){}
   // preserveView=true：只同步"网关默认出口"，**不动用户当前正在看的视图**
   // （此前 doCheckin 等动作后会调用本函数，导致视图被重置回网关默认区，
@@ -1360,7 +1723,14 @@ function renderAvailableModels(){
     }
 
     // 5. 模型 ID：官方模型名（唯一填写值）+ 未开通套餐的官方原因 + 官方介绍
-    const idLines = ['<div><b>' + esc(m.id) + '</b></div>'];
+    // #26 步4：单区独有的模型才给这个字段（双区都有的不给，避免把「都能用」误标成独占）
+    const excl = (m.realm_exclusive === 'intl' || m.realm_exclusive === 'cn') ? m.realm_exclusive : null;
+    const exclBadge = excl
+      ? ' <span class="' + (excl === 'intl' ? 'realm-badge-intl' : 'realm-badge-cn') + '" style="font-size:10px" title="'
+        + esc('该模型只在' + (excl === 'intl' ? '国际版' : '国内版') + '提供：默认出口在另一区时会被自动路由改走（未开自动路由则该请求不可用）')
+        + '">仅' + (excl === 'intl' ? '国际版' : '国内版') + '</span>'
+      : '';
+    const idLines = ['<div><b>' + esc(m.id) + '</b>' + exclBadge + '</div>'];
     if(m.enabled === false){
       const reason = m.disabled_reason || '需要升级或购买千问官方套餐开放';
       idLines.push('<div style="margin-top:3px"><span class="badge warn" title="' + esc(reason)
@@ -1520,7 +1890,11 @@ function renderGrowthTasks(r){
     const sum = r.summary || {};
     const accts = r.accounts || [];
     const streak = sum.streak_days || 0;
-    const energy = sum.energy || 0;
+    // #25：退化账本是「未知」而不是 0 —— 显示 0 会让用户以为额度耗尽（issue 报告者正是被这点误导）。
+    // 判据：后端 credits_unknown=True（单账号）或显式 energy=null；energy===0 才是真·归零，要照实显示 0。
+    const unknownUids = Array.isArray(sum.credits_unknown_accounts) ? sum.credits_unknown_accounts : [];
+    const energyUnknown = (sum.credits_unknown === true) || (sum.energy === null);
+    const energy = energyUnknown ? null : (sum.energy || 0);
     const tr = sum.travel || {};
 
     // 全部账号（批量）视图：卡片改成合计口径，活动行已按活动聚合并标注每账号资格
@@ -1528,7 +1902,15 @@ function renderGrowthTasks(r){
     const lblStk = document.getElementById('stkLabel');
     const lblNrg = document.getElementById('nrgLabel');
     if(lblStk) lblStk.textContent = isAll ? '连续签到（批量视图）' : '连续签到天数';
-    if(lblNrg) lblNrg.textContent = isAll ? '合计积分余额（全部账号）' : '积分额度余额';
+    if(lblNrg){
+      // 合计视图必须点名「已排除 N 个未知账号」：否则用户拿这个合计去和账号卡片对账，会以为少算了
+      lblNrg.textContent = isAll
+        ? (unknownUids.length ? ('合计积分余额（已排除 ' + unknownUids.length + ' 个未知账号）') : '合计积分余额（全部账号）')
+        : (energyUnknown ? '积分额度余额（未知）' : '积分额度余额');
+      lblNrg.title = unknownUids.length
+        ? ('未知账号（账本退化响应，未并入合计、也不当作 0）：' + unknownUids.map(u => String(u).slice(0, 8)).join('、'))
+        : (energyUnknown ? (sum.energy_note || '余额未知（等待下次成功刷新）') : '');
+    }
     renderCodePanel(sum);
 
     const sel = document.getElementById("growthAcctSelect");
@@ -1542,7 +1924,14 @@ function renderGrowthTasks(r){
     const elStk = document.getElementById("stkDays");
     if(elStk) elStk.textContent = streak + ' 天';
     const elNrg = document.getElementById("nrgBalance");
-    if(elNrg) elNrg.textContent = energy;
+    if(elNrg){
+      if(energyUnknown){
+        elNrg.innerHTML = '<span style="color:var(--warn);font-size:16px" title="'
+          + esc(sum.energy_note || '余额未知（等待下次成功刷新）') + '">未知</span>';
+      } else {
+        elNrg.textContent = energy;   // 含 0：真·耗尽显示 0，与「未知」严格区分
+      }
+    }
 
     const elCat = document.getElementById("catState");
     const elCatDesc = document.getElementById("catDesc");
@@ -1674,7 +2063,9 @@ async function loadSchedulerStatus(){
     if(txt) txt.textContent = s.enabled ? ('运行中 · ' + modeText) : '已暂停';
     if(times) times.textContent = '上次: ' + (s.last_run_time || '-') + ' · 下次: ' + (s.next_run_time || '-');
     if(btn) btn.textContent = s.enabled ? '暂停调度' : '启用调度';
-    if(btnTrig) btnTrig.textContent = (window.VIEW_REALM === 'intl') ? '立即保活刷新' : '立即巡检保活';
+    // 按钮文案固定「立即巡检保活」：巡检同时覆盖两个区域（保活+签到+积分），
+  // 按当前视图改文案只会让人以为「切区后动作不同」。
+  if(btnTrig) btnTrig.textContent = '立即巡检保活';
   }catch(e){}
 }
 
@@ -1687,7 +2078,7 @@ async function triggerSchedulerNow(btn){
   }catch(e){
     toast("触发失败: " + e.message, "bad");
   }finally{
-    if(btn){ btn.disabled = false; btn.textContent = (window.VIEW_REALM === 'intl') ? '立即保活刷新' : '立即巡检保活'; }
+    if(btn){ btn.disabled = false; btn.textContent = '立即巡检保活'; }
   }
 }
 
@@ -1898,6 +2289,8 @@ async function getJSON(url){
   }
   await throwPanelAuthError(r);
   if(!r.ok) throw new Error(r.status);
+  // #26 契约冻结：出口相关的响应头只在 chat 类请求且自动换区时出现，管理端点永不带（读到只会是旧进程残留），
+  // 因此这里**不再读任何响应头**；面板改从 usage 行读「最近一次对话的出口」（realm + realm_reason）。
   return r.json();
 }
 async function postJSON(url, body){
@@ -2100,7 +2493,7 @@ async function fetchCredits(btn){
     if(btn){ btn.disabled = false; btn.textContent = '刷新积分'; }
   }
 }
-const queryCredits = fetchCredits;
+// queryCredits 别名已删除：fetchCredits 只有一个名字，避免两个名字指同一动作。
 
 async function toggleAccount(uid, enable, btn){
   if(btn) btn.disabled = true;
@@ -2151,13 +2544,29 @@ async function testAccount(uid, btn){
     if(btn){ btn.disabled = false; btn.textContent = '测试'; }
   }
 }
-async function refreshAccounts(){
-  try{ const r = await postJSON('/accounts/refresh', {});
-       const okc = (r.results||[]).filter(x=>x.ok).length;
-       toast('刷新完成: ' + okc + '/' + (r.results||[]).length);
-       await loadAccounts(); }
-  catch(e){ toast(e.message); }
+/* 批量操作弹出菜单：点击外部 / Esc 关闭（与主题菜单同一交互模型） */
+function toggleBulkMenu(evt){
+  if(evt){ evt.preventDefault(); evt.stopPropagation(); }
+  const menu = document.getElementById('bulkMenu');
+  if(!menu) return;
+  menu.classList.toggle('open');
 }
+document.addEventListener('click', function(e){
+  const wrap = e.target.closest && e.target.closest('.menu-wrap');
+  const menu = document.getElementById('bulkMenu');
+  if(menu && menu.classList.contains('open') && !wrap){
+    menu.classList.remove('open');
+  }
+});
+document.addEventListener('keydown', function(e){
+  if(e.key === 'Escape'){
+    const menu = document.getElementById('bulkMenu');
+    if(menu) menu.classList.remove('open');
+  }
+});
+
+// refreshAccounts（无按钮调用点的批量凭证刷新）已删除：账号行的「刷新」逐个可用，
+// 全量积分刷新走「刷新积分」；批量凭证刷新没有界面入口，留着是死代码。
 async function setAll(enable, btn){
   if(btn) btn.disabled = true;
   try{
@@ -2590,6 +2999,13 @@ function keyDisplay(id){
   }
   return { label: esc(hit.name || '未命名'), sub: esc(short), cls: '', title: 'Key 标识 ' + esc(raw) };
 }
+// usage 行的区域：**确定值**（落盘时就写了，不是推断）。这一列逐请求、来自 usage 行；
+// 网关卡片那条「最近一次对话的出口」与本列**同源**（也读 usage 行）——响应头那条数据源已按契约切断。
+function realmBadgeOf(realm){
+  if(realm === 'intl') return '<span class="realm-badge-intl" style="font-size:10px">国际版</span>';
+  if(realm === 'cn') return '<span class="realm-badge-cn" style="font-size:10px">国内版</span>';
+  return '<span style="color:var(--dim)" title="该行没有记录区域（旧行或未落盘）">—</span>';
+}
 function keyCell(r){
   const d = keyDisplay(r.key_id);
   if(d.cls) return '<span class="' + d.cls + '" title="' + d.title + '">' + d.label + (d.sub ? ' ' + d.sub : '') + '</span>';
@@ -2799,13 +3215,14 @@ async function refreshInner(){
   const countEl = document.getElementById('recentCount');
   if(countEl) countEl.textContent = '(第 ' + RECENT_PAGE + ' 页 / 共 ' + fmt(total) + ' 条)';
   document.getElementById('recent').innerHTML = rows.length ?
-    '<table><thead><tr><th>时间</th><th>模型</th><th>账号</th><th style="text-align:left">Key</th><th style="text-align:left">档位</th><th>模式</th><th>耗时</th><th>首字</th><th>速度</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th><th>总 token</th></tr></thead><tbody>'
+    '<table><thead><tr><th>时间</th><th>模型</th><th>账号</th><th style="text-align:left">Key</th><th style="text-align:left">档位</th><th style="text-align:center;width:72px">区域</th><th>模式</th><th>耗时</th><th>首字</th><th>速度</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th><th>总 token</th></tr></thead><tbody>'
     + rows.map(r => '<tr>'
         + '<td class="mono">' + esc((r.iso||'').replace('T',' ').slice(5)) + '</td>'
         + '<td class="mono">' + esc(r.model) + '</td>'
         + '<td class="mono" style="font-size:11px;color:var(--dim)">' + esc((r.account||'—').slice(0,8)) + '</td>'
         + '<td style="text-align:left">' + keyCell(r) + '</td>'
         + '<td style="text-align:left;white-space:nowrap">' + effortCell(r) + '</td>'
+        + '<td style="text-align:center;white-space:nowrap">' + realmBadgeOf(r.realm) + '</td>'
         + '<td><span class="badge ' + (r.stream?'s':'') + '">' + (r.stream?'流式':'非流式') + '</span></td>'
         + '<td>' + (r.error ? '<span class="badge bad">失败</span>' : (r.elapsed_ms!=null ? fmt(r.elapsed_ms)+' ms' : '—')) + '</td>'
         + '<td>' + (r.ttft_ms!=null ? fmt(r.ttft_ms)+' ms' : '—') + '</td>'
@@ -2818,6 +3235,7 @@ async function refreshInner(){
       + '</tr>').join('') + '</tbody></table>'
     : '<div class="empty">还没有请求记录</div>';
   renderEffortByKey();   // 样本变了就重算档位分布
+  renderRealmActual();   // #26：卡片「最近一次对话的出口」也读这批 usage 行（不再依赖响应头）
 }
 
 (async function initDashboard(){
@@ -2981,9 +3399,12 @@ async function startDashboard(){
   await refresh();
   updateRecentLimitButtons();
   const tabFromUrl = new URLSearchParams(window.location.search).get('tab');
-  if(tabFromUrl && ['gateway', 'analytics', 'logs', 'settings'].includes(tabFromUrl)){
-    switchMainTab(tabFromUrl);
-  }
+  let tabPick = null;
+  try { tabPick = localStorage.getItem('qd-main-tab'); } catch(e){}
+  const tabTarget = MAIN_TABS.includes(tabFromUrl) ? tabFromUrl
+    : (MAIN_TABS.includes(tabPick) ? tabPick : 'gateway');
+  switchMainTab(tabTarget);
+  restorePageNavHash();
   // Polling only starts after the panel is unlocked, so a locked browser
   // never hammers the server with 401s.
   PANEL_TIMERS.forEach(t => clearInterval(t));
@@ -3608,28 +4029,323 @@ async function saveLimits(btn){
     if(btn){ btn.disabled = false; btn.textContent = '保存限额'; }
   }
 }
+
+const MAIN_TABS = ['gateway', 'analytics', 'logs', 'settings'];
+
+/* ---- 页面区块导航（wb 同款全套移植）----
+   导航项完全由页面内的 section 现场生成：标题取该 section 首个 h2 的文本
+   （忽略用于显示状态的 <em>），锚点 id 由标题内容哈希得到。对所有
+   .main-page 生效，所以新增页面、增删区块或调整顺序都不需要改这里。 */
+const PAGE_NAV_TOP_VAR = '--page-nav-top';
+/* 侧栏收起状态跨页面、跨刷新共用一份 */
+const PAGE_NAV_COLLAPSE_KEY = 'qd-page-nav-collapsed';
+/* 只有一项的页面不给侧栏：白占一列宽度，也没什么可跳的 */
+const PAGE_NAV_MIN_SECTIONS = 2;
+let pageNavLock = 0;
+let pageNavTimer = 0;
+
+/* 参与导航的区块：页面内最外层的 section（嵌套的 section 属于父区块的内容，
+   不单独成项），自身没被 display:none 隐藏，且带 h2 标题。判据用 computed
+   display 而不是 offsetParent —— 后者在整页隐藏（切到其它标签页）时会把所有
+   区块都判成不可见，导航会整个空掉。 */
+function pageNavSections(page){
+  if(!page) return [];
+  return Array.from(page.querySelectorAll('section')).filter(function(sec){
+    if(getComputedStyle(sec).display === 'none') return false;
+    if(!sec.querySelector('h2')) return false;
+    for(let p = sec.parentElement; p && p !== page; p = p.parentElement){
+      if(p.tagName === 'SECTION') return false;
+    }
+    return true;
+  });
+}
+
+function pageNavLabel(section, index){
+  const h2 = section.querySelector('h2');
+  if(h2){
+    const clone = h2.cloneNode(true);
+    clone.querySelectorAll('em').forEach(el => el.remove());
+    const text = (clone.textContent || '').replace(/s+/g, ' ').trim();
+    if(text) return text;
+  }
+  return '未命名区块 ' + (index + 1);
+}
+
+/* 由标题内容导出稳定 id：与区块顺序无关，链接可长期复用 */
+function pageNavAnchorId(label, taken){
+  let hash = 5381;
+  for(let i = 0; i < label.length; i++) hash = ((hash << 5) + hash + label.charCodeAt(i)) >>> 0;
+  const base = 'page-sec-' + hash.toString(36);
+  let id = base, n = 2;
+  while(taken.has(id)) id = base + '-' + (n++);
+  return id;
+}
+
+/* 区块清单的指纹：只有它变了才重建导航，免得轮询重建表格时把高亮抖掉 */
+function pageNavSignature(page){
+  return pageNavSections(page).map(function(sec, i){ return pageNavLabel(sec, i); }).join('');
+}
+
+/* 跳转时要让开的距离：吸顶 header，窄屏下再加上同样吸顶的导航条本身 */
+function pageNavHeaderOffset(page){
+  const header = document.querySelector('header');
+  const base = (header ? header.offsetHeight : 64) + 14;
+  const sidebar = page ? page.querySelector('.page-sidebar') : null;
+  if(sidebar && window.matchMedia('(max-width:860px)').matches){
+    return base + sidebar.offsetHeight + 10;
+  }
+  return base;
+}
+
+function syncPageNavOffset(){
+  const header = document.querySelector('header');
+  const top = (header ? header.offsetHeight : 64) + 14;
+  document.documentElement.style.setProperty(PAGE_NAV_TOP_VAR, top + 'px');
+}
+
+function setActivePageNav(page, id){
+  const nav = page ? page.querySelector('.page-nav') : null;
+  if(!nav) return;
+  nav.querySelectorAll('.page-nav-item').forEach(function(item){
+    item.classList.toggle('active', !!id && item.dataset.target === id);
+  });
+}
+
+function scrollToPageSection(page, id, smooth){
+  const section = document.getElementById(id);
+  if(!section) return;
+  const top = section.getBoundingClientRect().top + window.pageYOffset - pageNavHeaderOffset(page);
+  window.scrollTo({ top: Math.max(0, top), behavior: smooth === false ? 'auto' : 'smooth' });
+  setActivePageNav(page, id);
+  // 平滑滚动期间抑制滚动高亮，避免中途掠过其它区块把高亮抢走
+  pageNavLock = Date.now() + 700;
+  section.classList.add('page-nav-flash');
+  setTimeout(() => section.classList.remove('page-nav-flash'), 900);
+  try {
+    const url = new URL(window.location.href);
+    url.hash = id;
+    history.replaceState(null, '', url.toString());
+  } catch(e){}
+}
+
+/* 回到顶部：和区块跳转一样在平滑滚动期间抑制滚动高亮；顺便清掉锚点。 */
+function scrollPageToTop(page){
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+  pageNavLock = Date.now() + 700;
+  const first = page ? page.querySelector('.page-nav-item') : null;
+  if(first) setActivePageNav(page, first.dataset.target);
+  try {
+    const url = new URL(window.location.href);
+    history.replaceState(null, '', url.pathname + url.search);
+  } catch(e){}
+}
+
+function pageNavSpy(){
+  if(Date.now() < pageNavLock) return;
+  const page = document.querySelector('.main-page.active.page-nav-on');
+  if(!page) return;
+  const nav = page.querySelector('.page-nav');
+  if(!nav) return;
+  const items = Array.from(nav.querySelectorAll('.page-nav-item'));
+  if(!items.length) return;
+  const threshold = pageNavHeaderOffset(page) + 8;
+  let activeId = items[0].dataset.target;
+  for(const item of items){
+    const section = document.getElementById(item.dataset.target);
+    if(!section) continue;
+    if(section.getBoundingClientRect().top - threshold <= 0) activeId = item.dataset.target;
+    else break;
+  }
+  // 滚到底时高亮最后一项，否则末尾区块永远点不亮
+  if(window.innerHeight + window.pageYOffset >= document.documentElement.scrollHeight - 4){
+    activeId = items[items.length - 1].dataset.target;
+  }
+  setActivePageNav(page, activeId);
+}
+
+function onPageNavScroll(){
+  pageNavSpy();
+}
+
+function pageNavCollapsedPref(){
+  try { return localStorage.getItem(PAGE_NAV_COLLAPSE_KEY) === '1'; } catch(e){ return false; }
+}
+
+/* 收起与否只体现为页面上的一个类，样式和窄屏回退都由 CSS 决定 */
+function applyPageNavCollapse(page, collapsed){
+  if(!page) return;
+  page.classList.toggle('page-nav-collapsed', !!collapsed);
+  const btn = page.querySelector('.page-sidebar-toggle');
+  if(!btn) return;
+  const label = collapsed ? '展开本页导航' : '收起本页导航';
+  btn.textContent = collapsed ? '»' : '«';
+  btn.title = label;
+  btn.setAttribute('aria-label', label);
+  btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+}
+
+function togglePageNavCollapse(page){
+  const collapsed = !page.classList.contains('page-nav-collapsed');
+  try { localStorage.setItem(PAGE_NAV_COLLAPSE_KEY, collapsed ? '1' : '0'); } catch(e){}
+  applyPageNavCollapse(page, collapsed);
+}
+
+function initPageNav(page){
+  if(!page) return;
+  syncPageNavOffset();
+  const sections = pageNavSections(page);
+  const signature = pageNavSignature(page);
+  let sidebar = page.querySelector('.page-sidebar');
+
+  // 区块不足两项就不给侧栏，页面保持单栏
+  if(sections.length < PAGE_NAV_MIN_SECTIONS){
+    if(sidebar) sidebar.remove();
+    page.classList.remove('page-nav-on', 'page-nav-collapsed');
+    delete page.dataset.pageNavSignature;
+    return;
+  }
+  // 清单没变就不动 DOM，保留现有高亮
+  if(sidebar && page.dataset.pageNavSignature === signature) return;
+
+  const taken = new Set(Array.from(document.querySelectorAll('[id]')).map(el => el.id));
+  const anchors = [];
+  sections.forEach(function(section, i){
+    const label = pageNavLabel(section, i);
+    let id = section.id;
+    if(!id){
+      id = pageNavAnchorId(label, taken);
+      section.id = id;
+    }
+    taken.add(id);
+    anchors.push({ id: id, label: label });
+  });
+
+  // 重建时保留原来的高亮，别因为一次重建就闪回第一项
+  const prevActive = sidebar ? sidebar.querySelector('.page-nav-item.active') : null;
+  const prevTarget = prevActive ? prevActive.dataset.target : null;
+
+  // 内容整体包一层：grid 里只剩「侧栏 + 内容」两项
+  let body = page.querySelector('.page-nav-body');
+  if(!body){
+    body = document.createElement('div');
+    body.className = 'page-nav-body';
+    Array.from(page.children).forEach(function(el){ if(el !== sidebar) body.appendChild(el); });
+    page.appendChild(body);
+  }
+
+  if(!sidebar){
+    sidebar = document.createElement('aside');
+    sidebar.className = 'page-sidebar';
+    sidebar.setAttribute('aria-label', '本页区块导航');
+    page.insertBefore(sidebar, page.firstChild);
+  }
+  sidebar.textContent = '';
+  const head = document.createElement('div');
+  head.className = 'page-sidebar-head';
+  const title = document.createElement('div');
+  title.className = 'page-sidebar-title';
+  title.textContent = '本页导航';
+  head.appendChild(title);
+  const collapseBtn = document.createElement('button');
+  collapseBtn.type = 'button';
+  collapseBtn.className = 'page-sidebar-toggle';
+  collapseBtn.addEventListener('click', function(){ togglePageNavCollapse(page); });
+  head.appendChild(collapseBtn);
+  sidebar.appendChild(head);
+  applyPageNavCollapse(page, pageNavCollapsedPref());
+
+  const toTop = document.createElement('button');
+  toTop.type = 'button';
+  toTop.className = 'page-nav-top';
+  toTop.textContent = '↑ 回到顶部';
+  toTop.title = '回到顶部';
+  toTop.addEventListener('click', function(){ scrollPageToTop(page); });
+  sidebar.appendChild(toTop);
+
+  const nav = document.createElement('nav');
+  nav.className = 'page-nav';
+  anchors.forEach(function(a){
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'page-nav-item';
+    btn.dataset.target = a.id;
+    btn.textContent = a.label;
+    btn.title = a.label;
+    btn.addEventListener('click', function(){ scrollToPageSection(page, a.id); });
+    nav.appendChild(btn);
+  });
+  sidebar.appendChild(nav);
+
+  page.classList.add('page-nav-on');
+  page.dataset.pageNavSignature = signature;
+
+  if(!window.__pageNavBound){
+    window.__pageNavBound = true;
+    window.addEventListener('scroll', onPageNavScroll, { passive: true });
+    window.addEventListener('resize', function(){
+      syncPageNavOffset();
+      initPageNav(document.querySelector('.main-page.active'));
+      onPageNavScroll();
+    });
+  }
+  observePageNav();
+  const keep = prevTarget && anchors.some(function(a){ return a.id === prevTarget; });
+  setActivePageNav(page, keep ? prevTarget : anchors[0].id);
+  onPageNavScroll();
+}
+
+/* 区块在运行时可能增删或整块显隐，让导航跟上，免得侧栏停在旧清单上。
+   只盯当前页：非当前页的变化在切过去时由 initPageNav() 重算。 */
+function refreshPageNav(){
+  pageNavTimer = 0;
+  initPageNav(document.querySelector('.main-page.active'));
+}
+
+function observePageNav(){
+  if(window.__pageNavObserved || typeof MutationObserver === 'undefined') return;
+  window.__pageNavObserved = true;
+  const schedule = function(records){
+    if(records && records.every(function(r){
+      const el = r.target;
+      return el && el.closest && el.closest('.page-sidebar');
+    })) return;
+    if(pageNavTimer) clearTimeout(pageNavTimer);
+    pageNavTimer = setTimeout(refreshPageNav, 200);
+  };
+  new MutationObserver(schedule).observe(document.body, {
+    childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class'],
+  });
+}
+
+/* 带 #锚点 打开时直接落到对应区块 */
+function restorePageNavHash(){
+  const page = document.querySelector('.main-page.active.page-nav-on');
+  if(!page) return;
+  const id = (window.location.hash || '').slice(1);
+  if(!id) return;
+  const navigable = pageNavSections(page).some(function(s){ return s.id === id; });
+  if(navigable) scrollToPageSection(page, id, false);
+}
+
 function switchMainTab(tab){
   currentMainTab = tab;
-  const btnGateway = document.getElementById('btnNavGateway');
-  const btnAnalytics = document.getElementById('btnNavAnalytics');
-  const btnLogs = document.getElementById('btnNavLogs');
-  const btnSettings = document.getElementById('btnNavSettings');
-  const pageGateway = document.getElementById('pageGateway');
-  const pageAnalytics = document.getElementById('pageAnalytics');
-  const pageLogs = document.getElementById('pageLogs');
-  const pageSettings = document.getElementById('pageSettings');
-  const tabs = [
-    ['gateway', btnGateway, pageGateway],
-    ['analytics', btnAnalytics, pageAnalytics],
-    ['logs', btnLogs, pageLogs],
-    ['settings', btnSettings, pageSettings]
-  ];
-  tabs.forEach(([name, btn, page]) => {
+  const tabs = MAIN_TABS.map(function(name){
+    return [name,
+            document.getElementById('btnNav' + name.charAt(0).toUpperCase() + name.slice(1)),
+            document.getElementById('page' + name.charAt(0).toUpperCase() + name.slice(1))];
+  });
+  tabs.forEach(function(pair){
+    const name = pair[0], btn = pair[1], page = pair[2];
     if(!btn || !page) return;
     const on = (name === tab);
     btn.classList.toggle('active', on);
-    page.style.display = on ? 'block' : 'none';
+    // 页面显隐靠 .main-page.active（CSS），pageNav 的两栏布局也挂在这套类上
+    page.classList.toggle('active', on);
   });
+  try { localStorage.setItem('qd-main-tab', tab); } catch(e){}
+  if(typeof initPageNav === 'function'){
+    initPageNav(document.querySelector('.main-page.active'));
+  }
   if(tab === 'analytics') loadAnalytics();
   if(tab === 'settings') loadSettings();
   if(tab === 'logs'){

@@ -1,5 +1,9 @@
 # tests/ —— 套件化测试（P0-2 骨架）
 
+> **能让机器自证的，别写成对人的要求** —— 产物自证（跑出来就带）优于检查项（需要有人去比对）：
+> 前者连「忘了核对」这个失败模式都消掉了。本文件下面几节（观测点原则 / 迁移策略 / 桩的保真度 /
+> 基线数字）都是这条的不同侧面。
+
 ## 怎么跑
 
     python tests/run_all.py              # 全部套件（并发，一行一套件）
@@ -84,6 +88,25 @@
 
    这三条都只动**备份副本**（`%TEMP%` 下先备份、跑完立即还原），原文件不留痕。
 
+## 第三步：上游异常形状 + Anthropic 档位接线（本轮）
+
+| 套件 | 类型 | 覆盖 |
+|---|---|---|
+| `_test_stream_guards.py` | 守卫（离线纯函数） | 上游信封 body **不保证是 JSON object**（实测有裸数组/标量）。三处守卫 `clean_chunk` / `iter_inner_sse` / `aggregate_stream` 遇非 dict 帧：① 不抛异常；② 不吞后续帧（异常帧夹在中间时正文仍完整）；③ 既有语义不回退（噪声清洗、usage 首个优先、正文折叠）；④ 集成一条：异常帧走完整 Anthropic 流式管线 |
+| `_test_anthropic_wiring_meta.py` | 接线（HTTP 层 + 端到端） | `/v1/messages` 的 `thinking.budget_tokens` 要经 `catalog_meta` 才能映射成 `reasoning_effort`。断言拦在 `open_upstream` **唯一出站口**（不是「`messages_to_chat` 被调用过」）：实际交给上游的 `chat_req` 必须带档位、且档位在该模型官方档位表内；另加端到端「档位真的写进上游 `parameters`」与两条静态钉住 |
+
+### 能红自证（本轮两条）
+
+1. **stream_guards**：删掉 `qoder_proxy.py` 里三处 `isinstance(..., dict)` 守卫（回到改动前形状）
+   → 6 条 `[FAIL] ... AttributeError: 'list' object has no attribute 'get'` → RED exit 1；恢复后 GREEN 20/20。
+2. **anthropic_wiring_meta**：把 `_handle_anthropic` 的 `catalog_meta_for(...)` 下传改回
+   `messages_to_chat(payload)` → `[FAIL] model=qmodel_38max：chat_req.reasoning_effort 非空` 等 6 条 → RED exit 1；恢复后 GREEN 16/16。
+
+   同样只动备份副本；跑完 `git diff --stat` 与本轮改动一致，原文件无变异痕迹。
+
+> 两个套件都把自己的 `QD_PROXY_USAGE_DIR` 指到 `tempfile.mkdtemp()`：被桩中止的请求
+> 也会走 `record_error` 落盘，不能写进仓库的 `usage/`（并发编排下是跨进程共享路径）。
+
 ## 迁移期纪律（每批迁移后都要过一遍）
 
 ### 1. 路径：一律基于 `__file__`，绝不用 cwd
@@ -148,3 +171,147 @@ shutil/struct/sys/tarfile/tempfile/time`）全部模块级 import 并放进 `__a
 `dep_scan.py --leaf-only` 当前**没有输出** —— 跑完 55 个段后，**没有一个段是纯叶子**：
 段与段之间共享大量全局（`time`/`base64`/`payload`/`url` 等是显式共享，`_A`/`_orig_sleep2`
 这类是隐式继承）。这与第三批的回滚现象完全一致，也直接支持「legacy 作终态」的结论。
+
+---
+
+## 夹具纪律：**所有出站函数默认桩住**（2026-10-13，由一次真实踩坑立规）
+
+**事故**：写 #25 的「文案矩阵」探针时只桩了 `Account.campaigns()`，漏桩 `Account.claim_campaign()`。
+夹具里那条 `CLAIMABLE` 活动于是走了真实 `claim_campaign` —— 探针**真的向 qoder.sh 打了一次
+claim POST**（用的是假 token，回 401 `TOKEN_EXPIRE`，无状态改变，但性质是"离线夹具出网了"）。
+
+**为什么危险**：这类探针通常带着**真实账号的 token**（或仓库里的 accounts/*.json），漏桩就不是
+"打一次 401"，而是真的领取/刷新/写账本 —— 夹具本该零副作用。
+
+**规矩**：
+
+1. 夹具**开头**统一把所有出站函数桩掉，再写用例；宁可多桩一行，不要赌"这条路径不会走到"：
+   - `qoder_accounts.http_json`（**唯一真正的网络出口**，拦它最划算）；
+   - `Account.campaigns` / `claim_campaign` / `checkin` / `campaign_checkin` /
+     `fetch_credits` / `fetch_plan` / `refresh` / `native_machine_identity`；
+   - `Account.save` / `_stamp_checkin`（防写盘）；
+   - 调度器侧 `run_keepalive` / `run_batch_checkin` / `time.sleep`（防真等）。
+2. 环境隔离：`ACCOUNTS_DIR` / `QD_PROXY_USAGE_DIR` 指向 `tempfile.mkdtemp()`，
+   `QD_NATIVE_IDENTITY=0`（不拉起官方原生桥）。
+3. **自证**：夹具跑完打印一条"出网计数"（例如 `http_json` 的调用次数）—— 期望 0；
+   非 0 就是漏桩，直接判红。
+4. 变异/能红证据只在**副本**上做（见上文 reserve_blocked 的示范），原文件不留痕。
+
+## 桩的保真度纪律（棉花糖这轮踩出来的两条）
+
+这两条与前面记的「锚点缺失即抛」「按函数而非区间做纯度检查」是同一类：**桩的保真度**
+直接决定断言的可信度 —— 桩太粗会假绿，桩不对会假红。
+
+### 1. 元素桩要照 DOM 语义做
+
+`textContent` / `innerHTML` 的 setter 会把值转成字符串。用普通对象字面量当元素桩时，
+`el.textContent = 1234` 之后读回来是 `'1234'`，断言 `el.textContent === 1234` 会直接红
+（实测：棉花糖第一版就这么红了一次）。正确做法：
+
+    const el = {};
+    Object.defineProperty(el, 'textContent', {
+      get() { return this._t ?? ''; },
+      set(v) { this._t = String(v); },   // 照 DOM 语义：任何值都变字符串
+    });
+
+同理，`classList` 需要真的维护一个 Set（否则 `contains()` 恒假、`add()` 无痕），
+`children` / `appendChild` 要真的累积 —— 否则「追加 vs 重建」这类行为断言测不出来。
+
+### 2. 被测函数调用的兄弟函数要显式注入空桩
+
+被测函数若会调用同页面的另一个渲染函数（例如 `renderCodePanel`），必须把它作为参数
+注入一个空桩。否则一个单元断言会顺带拖进半个页面：任何兄弟函数的改动都会让这条断言红，
+而它俩其实没有语义关系。
+
+判据：**一条断言的失败原因应当唯一指向它要守的那件事**。做不到就说明注入面没划清。
+
+## 基线数字（提交前核对用）
+
+**用途**：新增/删除套件时，`python tests/run_all.py` 的 `TOTAL N checks` 是本仓测试覆盖的
+**守门数值**。它下降通常意味着「断言少了但测试仍然绿」—— 这是最难发现的一类缺失
+（没有红、没有报错，只是覆盖变窄了），所以每次提交前后都值得看一眼。
+
+**基线（v1.3.7 · 2026-10-13）**：
+
+| 口径 | 数值 |
+|---|---|
+| 套件数 | **28 suites** |
+| 全部断言 | **1005 checks** |
+| 结果 | 0 failed / exit 0 |
+| 前端六套件小计 | **105**（9/19/19/15/12/31） |
+| legacy 套件 | 630（其中 4 条 SKIP，语义见 `_test_qoder.py` 的 SUMMARY 说明） |
+
+**提交前建议三步**：
+
+1. `python tests/run_all.py`，确认 `0 failed` 且 `TOTAL` 不低于上表；
+2. `git status --porcelain`，确认没有 `_mig*` / `*.bak*` / `*.mutbak` 之类的临时残留；
+3. `git add -A`（**不要只用具体文件名 add** —— 新增的套件文件会被静默漏掉，表现为
+   「测试仍然全绿，但总数比基线低」，例如 105 变 97）。
+
+## 指纹行（每个套件都自带）
+
+每个套件在开头打印两行（前端 JS 与后端 Python **同格式**）：
+
+    SUITE: _test_xxx.py                     md5=<套件自身全文 md5>
+    FILE: qoder_proxy.py md5=<...> bytes=<...> as-of=<ISO-8601 UTC Z>
+
+**为什么要它**：出过一次「同一份代码在不同人手里是不同版本」的误报 —— 报告方说「我跑的是新版」，
+复核方跑的是旧版，双方都对，但结论相反。**只报 md5 不够，因为 `md5=x` 在两个时点可以同时为真**，
+所以还要 `as-of` 时间戳；只报被测文件也不够，因为「你跑的是哪一份」问的是**套件**，所以还要 `SUITE:`。
+
+**规矩（一个套件可能依赖多个被测文件时）**：
+
+- 每个套件列出它**主要守护**的被测文件，**1~4 个**，不追求列全；
+- 判据是「本套件失败时，看指纹行就知道跑的是哪份产物」；
+- 实现只在 `tests/_suite_head.py` 的 `declare_suite(suite_file, files)` 一处，各套件 import 调用；
+- 量纲分开标名：`bytes=` 是**磁盘字节数**（与 `md5sum` / `Get-FileHash` / `wc -c` 同口径），
+  JS 侧另有 `codeunits=` 表示字符串长度 —— 同一个词不混两种量纲；
+- `SUITE:` 的 md5 在**启动时**取值（代表被执行的那份字节），不是打印时刻读盘 —— 否则运行中被编辑会误导。
+
+## 改共享模块时的一条纪律
+
+> **改 `_suite_head.py`（或任何被多处依赖的共享模块）时，先列出它的所有消费者，再动手。**
+
+来历：这条教训在本仓出现过**两次**，形状一样 ——
+
+- 第一次：迁移 `_test_qoder.py` 的段落时，段里定义的全局（`time = _time_for_11` / `_A` / `_orig_sleep2`）
+  是给**后续段**用的，搬走就让后面的段 NameError，而新套件自己反而是绿的；
+- 第二次：给 `_suite_head.py` 加 `declare_suite()` 时忘了加进 `__all__`，4 个用 `from _suite_head import *`
+  的套件当场 `NameError`（run_all 显示 24 passed / 4 failed / 4 suites without SUMMARY）。
+
+两次的共性是：**共享的东西一旦被多处依赖，它的每一次扩张都要同时考虑所有依赖方** ——
+只想着「新增」而不想「导出面 / 依赖面」，就会造出「本地看着对、整体是崩的」那种失败。
+
+**可执行做法，是前置/后置的一对**：
+
+1. **前置 —— 改之前先列消费者**：`rg -l "_suite_head" tests/`（或对应的导入名），确认这次扩张会影响谁；
+2. **后置 —— 改完立刻跑一次全量、看总数对不对**：
+   · **这是默认动作，不是补救动作** —— 本仓四次同形的坑（迁移时被搬走的全局 / 共享头部的导出面 /
+     单文件语法外引用 `ROOT_DASH` 未定义 …）**没有一次被单套件测试抓到**，全是被**总数变化**抓到的；
+   · 判读：总数比基线低、或出现 `(+N suites without SUMMARY)`，就是有套件崩了（不是「跑得慢」）；
+   · 起作用的原因很简单：**总数是个不会被局部自测发现的变化** —— 局部测试跑得再绿，也看不见「另一个套件崩了」。
+
+## 证据可得性：证据在哪里，取决于读者会去哪里找
+
+来历：`run_all.py` 的兜底行（套件没自己声明指纹时由 runner 补一条 `SUITE: … (runner-computed)`）
+最初只 `print` 到 runner 的 stdout。拿铁复核时**只读了 `logs: <dir>` 里的日志文件**，于是以为「兜底没兜住 JS 套件」，
+翻终端输出才发现兜底行在 stdout。
+
+**根因不是实现错，是证据放错了地方**：`logs: <dir>` 这个提示本身就在告诉读者「日志才是留存证据」——
+只保存日志的人复查时会重复同一段误判。现在兜底行**同时追加进该套件的 log**，两处都有。
+
+**推广**：写任何诊断/指纹/兜底输出时，别只问「我打出来了吗」，要问「**复查的人会去哪里找**」。
+证据出现在读者不会去的地方，等于不存在。
+
+## 可靠性三层：原则 < 动作 < 工具约束 —— 但工具也会说假话
+
+来历：一次批量替换里，锚点没匹配上，**脚本却无条件打印了「已改」** —— 工具说了假话，而我照着它以为改好了。
+（拿铁把它归纳成这三层，正好解释为什么「把约定做进工具」比「写成纪律」强，也解释了它为什么还不是终点。）
+
+- **原则**（记不住）< **动作 / checklist**（记得住，但仍依赖人）< **工具约束**（不依赖人）；
+- **但工具不是终点**：当工具自己就是说假话的那一环时，上面两层全断。所以
+  **工具的成功报告必须来自对结果的验证，而不是对动作的发起**：
+  · 批量替换后断言「旧串没了 / 新串在 / 文件长度或哈希变了」（任一不符即报失败）；
+  · runner 兜底失败时要打 `runner fallback FAILED: <reason>`，不能静默 `return None` ——
+    否则「零触发」与「坏了」在输出上完全一样。
+- 一句话：**「我执行了动作」≠「动作产生了预期效果」。**

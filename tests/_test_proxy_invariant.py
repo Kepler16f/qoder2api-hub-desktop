@@ -26,6 +26,10 @@ def check(label, ok, detail=None):
         print("  [FAIL] %s %r" % (label, detail))
 
 
+import os as _os_fp, sys as _sys_fp
+_sys_fp.path.insert(0, _os_fp.path.dirname(_os_fp.path.abspath(__file__)))
+from _suite_head import declare_suite
+declare_suite(__file__, ["qoder_accounts.py", "qoder_proxy.py"])
 print("[proxy-invariant] 出站不变量")
 calls = []
 orig = A.http_json
@@ -49,13 +53,15 @@ finally:
 check("fetch_credits 走统一出站函数 http_json（不直连）", n_fetch == 1, n_fetch)
 
 # 基线登记：直连 urlopen 的调用点数量。改动这个数字之前，先确认新点是否带账号凭证。
-# fork 校准：本仓库出站收口比上游更紧——所有带凭证调用（含上游收拢的
-# http_json 内部与更新检查）都走 UPSTREAM_OPENER（逐请求代理感知，修
-# WinError 10061 死端口 bug），故 qoder_accounts 直连为 0；qoder_proxy 仅剩
-# 本地端口探测 1 处（127.0.0.1，无代理语义）。新增直连前先评估：带凭证或
-# 公网访问的调用一律走 UPSTREAM_OPENER。
-src_a = open(os.path.join(ROOT, "qoder_accounts.py"), encoding="utf-8").read()
-n_direct_a = src_a.count("urllib.request.urlopen(")
+src = open(os.path.join(ROOT, "qoder_accounts.py"), encoding="utf-8").read()
+n_direct = src.count("urllib.request.urlopen(")
+# task-83 后基线 2 -> 0：全部出站改走 _opener_for_request()（每请求现建 opener，
+# 代理只看环境变量——#27：Windows 注册表继承与首次请求固化已修复）。新增任何
+# urllib.request.urlopen 都意味着绕过该策略——必须重新评估。
+# fork：_opener_for_request() 委托给 UPSTREAM_OPENER 单例（保留
+# QD_PROXY_UPSTREAM_PROXY 钉死与 UpstreamOpener._stub 测试注入点）。
+check("qoder_accounts.py 直连 urlopen 基线 == 0（出站统一走 _opener_for_request）",
+      n_direct == 0, n_direct)
 src_p = open(os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8").read()
 n_direct_p = src_p.count("urllib.request.urlopen(")
 check("qoder_accounts.py 直连 urlopen 基线 == 0（fork：凭证出站全走 UPSTREAM_OPENER）",

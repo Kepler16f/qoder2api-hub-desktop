@@ -37,6 +37,11 @@ os.environ.setdefault("USAGE_DIR",
 os.environ.setdefault("QD_NATIVE_IDENTITY", "0")
 
 import qoder_proxy as P
+
+# ---- 指纹行（与前端六个 _test_dashboard_*.js 同格式；复用 tests/_suite_head.py 的实现）----
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests"))
+from _suite_head import declare_suite  # noqa: E402
+declare_suite(__file__, ["qoder_proxy.py", "qoder_accounts.py", "qoder_sign.py"])
 import qoder_sign as S
 import qoder_catalog as C
 import qoder_accounts as A
@@ -306,12 +311,15 @@ print()
 print("[5.8] off-peak (低谷) window detection — cross-midnight 22:00-08:00 UTC+8")
 import datetime as _dt
 def _ts(h, m):
-    # 构造 UTC+8 指定时刻对应的 epoch（固定 +8 与官方时区一致）
-    utc_naive = _dt.datetime.utcnow() if False else None
-    base = _dt.datetime.now(_dt.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    # 构造 UTC+8 指定时刻对应的 epoch（固定 +8 与官方时区一致）。
+    # naive.timestamp() 把墙钟按**系统本地时区**解释；先加回本地 offset 得到
+    # 「h:m 视作 UTC」的 epoch，再减 8h 得到「h:m 在 UTC+8」的 epoch。
+    # 旧版把 offset 的符号写反：本地恰好是 UTC+8 时两个错误抵消所以一直绿，
+    # CI 的 UTC runner 上（offset=0）构造出的时刻偏移 -16h，5 条窗口断言全红
+    # ——「测试只在本地跑」的盲区第一次被 CI 实际抓住。
     target_local_naive = _dt.datetime.now().replace(hour=h, minute=m, second=0, microsecond=0)
-    return target_local_naive.timestamp() - (_dt.datetime.now().astimezone().utcoffset().total_seconds()
-                                             - 8 * 3600)
+    local_offset = _dt.datetime.now().astimezone().utcoffset().total_seconds()
+    return target_local_naive.timestamp() + (local_offset - 8 * 3600)
 for hh, mm, expect, label in [
         (1, 0, True, "01:00 inside window"),
         (12, 0, False, "12:00 outside"),
@@ -3775,8 +3783,10 @@ _DASH36 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.ht
 _JS36 = r"""
 const fs = require('fs');
 const html = fs.readFileSync(process.env.DASH36, 'utf-8');
-const mm = html.match(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/);
-const script = mm ? mm[1] : '';
+// 页面现在有多个 <script> 块（head 主题脚本 + body 主脚本）——只取第一个会
+// 抽到主题脚本而拿不到 fmtNextCheckin（#52 曾因此误报 missing）。取全部块拼接。
+const blocks = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)].map(m => m[1]);
+const script = blocks.join('\n');
 const s = script.indexOf('function fmtNextCheckin(x){');
 const e = script.indexOf('async function doCheckin(btn){');
 let pure = (s >= 0 && e > s) ? script.slice(s, e) : '';

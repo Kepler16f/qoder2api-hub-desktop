@@ -68,6 +68,57 @@ _stream_last_used = {}       # uid -> (最近建流时间戳, session_key)
 STREAM_SPREAD_WINDOW = 60    # 秒：此窗口内被**其他会话**用过的账号优先跳过
 STREAM_STALE_TTL = 300       # 秒：清理字典条目的上限（内存回收，非逻辑依赖）
 
+# 每账号信号量（硬保证）：同一账号同时只有一条上游流。时间戳是"尽量分散"，
+# 信号量是"绝不并发"——两个会话同时打同一个号时第二个会被上游掐。信号量
+# 在 open_upstream 选号时非阻塞 acquire，流结束（record_usage）时 release。
+_account_sems = {}           # uid -> threading.Semaphore(1)
+_sem_lock = threading.Lock()
+_sem_acquired_at = {}        # uid -> acquire 时间戳（泄漏防护用）
+_SEM_STALE_TTL = 600         # 秒：信号量超过此时间视为泄漏，强制回收
+
+
+def _get_account_sem(uid):
+    with _sem_lock:
+        if uid not in _account_sems:
+            _account_sems[uid] = threading.Semaphore(1)
+        return _account_sems[uid]
+
+
+def _try_acquire_account_sem(uid):
+    """非阻塞获取账号信号量；成功返回 True（调用方必须在流结束时 release）。
+
+    泄漏防护：若信号量被持有超过 _SEM_STALE_TTL（600s = 最长流时间），
+    视为泄漏（调用方崩溃/遗漏 release），强制回收后重新获取——宁可短暂
+    允许并发也不永久锁死账号。
+    """
+    sem = _get_account_sem(uid)
+    if sem.acquire(blocking=False):
+        _sem_acquired_at[uid] = time.time()
+        return True
+    # 检查是否泄漏
+    held_since = _sem_acquired_at.get(uid, 0)
+    if held_since and time.time() - held_since > _SEM_STALE_TTL:
+        log("account %s semaphore leaked (%.0fs) - force releasing"
+            % (uid[:8], time.time() - held_since), level="WARN", tag="chat")
+        try:
+            sem.release()   # 强制释放泄漏的信号量
+        except Exception:
+            pass
+        if sem.acquire(blocking=False):
+            _sem_acquired_at[uid] = time.time()
+            return True
+    return False
+
+
+def _release_account_sem(uid):
+    try:
+        _sem_acquired_at.pop(uid, None)
+        sem = _account_sems.get(uid)
+        if sem:
+            sem.release()
+    except Exception:
+        pass
+
 
 def _spread_skip_accounts(realm, session_key, now, all_same_realm,
                           window=None):
@@ -106,7 +157,9 @@ from pathlib import Path
 # 上游是 1.2.x/1.3.x semver 号线，日期制天然不撞；桌面发行线是另一套号(1.0.x_R
 # tag)，「检查更新」按它对比本仓库 Releases。历史号（fork 旧 1.2.18-1.2.20、
 # 2026.10.07、2026.10.08）不改写，对应关系见 README 版本线说明。
-VERSION = "2026.10.14.1_re"
+# 本次并入上游 v1.3.5/v1.3.6/v1.3.7 + 发布后杂项 → 2026.10.14.2-5_upstream；
+# 合并手术（传输收口/冲突融合）→ .6_re。
+VERSION = "2026.10.14.6_re"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -214,14 +267,79 @@ def validate_public_http_url(url, allow_local=False):
     return url
 
 
+# 双区自动路由（#26 步1/步2）：默认开启。**显式指定永远优先** —— 本开关只作用于
+# 「用户没指定区域」时的兜底路径（?realm= / Key 绑定 / X-Realm 任一存在时都不会走到这里）。
+AUTO_REALM_ENABLED = os.environ.get("QD_AUTO_REALM", "1").lower() not in (
+    "0", "false", "no", "off")
+
+
 def detect_model_realm(model_id):
-    """模型 -> 出口区域。区域独占模型强制路由到其归属出口，其余跟随全局开关。"""
+    """模型 -> 出口区域（**纯数据判断，不查账号可用性**）。
+
+    优先级：区域独占硬表 > 清单驱动自动路由（步1）> 全局开关。
+    清单驱动只在「该模型只在一个区域存在」时换区；双区都有的模型维持当前区
+    （判不出就不猜 —— 双区同名模型物理上无法靠名字区分，见评估 §2）。
+    账号可用性不在这里判（那会污染 row_matches_realm 等纯统计路径），
+    由 fallback_realm_by_accounts() 在选号前单独做（步2）。
+    """
     owner = exclusive_realm(model_id)
     if owner:
         return owner
     if not model_id:
         return CURRENT_REALM
+    if AUTO_REALM_ENABLED:
+        realm, reason = qoder_catalog.auto_realm_for_model(model_id, CURRENT_REALM)
+        if realm:
+            log("auto realm switch: %s (model=%r, current=%s -> %s)"
+                % (reason, model_id, CURRENT_REALM, realm), tag="realm")
+            return realm
     return CURRENT_REALM
+
+
+def auto_realm_reason(model, realm):
+    """本次自动换区的**确定性**原因（给面板显示结论，不让它自己推断）。
+
+      model_missing  当前区的官方清单里没有这个模型（独占表与清单驱动都归此类）
+      no_account     模型本身在当前区有（或无法判断），是账号可用性把我们推过去的
+    用同一份数据源复算（catalog 的 auto_realm_for_model），与 detect_model_realm
+    同源，不做二次猜测。
+    """
+    try:
+        hint, _why = qoder_catalog.auto_realm_for_model(model, CURRENT_REALM)
+        if hint == realm:
+            return "model_missing"
+    except Exception:
+        pass
+    return "no_account"
+
+
+def fallback_realm_by_accounts(realm, model):
+    """步2：当前区**一个可用账号都没有**时回退另一区（判不出就维持现状）。
+
+    只在未显式指定区域时被调用（open_upstream 内）。判据三段：
+      当前区 count_ready > 0        -> 不动
+      当前区 == 0 且 另一区 > 0     -> 换区（打日志）
+      两区都是 0 / 异常 / 无池      -> 不动（交给既有错误路径，不猜）
+    """
+    if not AUTO_REALM_ENABLED or POOL is None:
+        return realm
+    if realm != CURRENT_REALM:
+        # **模型归属优先于账号可用性**：realm 已被模型规则（独占表/清单驱动）推走，
+        # 说明当前区根本没有这个模型；此时再按账号把请求换回去，只会打到
+        # 「没有这个模型」的上游。停在目标区、由选号给出「无可用账号」的明确错误
+        # 才是正确行为。
+        return realm
+    try:
+        if POOL.count_ready(realm, model=model or None) > 0:
+            return realm
+        other = "intl" if realm == "cn" else "cn"
+        if POOL.count_ready(other, model=model or None) > 0:
+            log("auto realm switch (no ready account): realm %s has no usable "
+                "account for %r -> %s" % (realm, model or "?", other), tag="realm")
+            return other
+    except Exception as exc:
+        log("auto realm fallback skipped: %s" % exc, level="WARN")
+    return realm
 
 
 # 目前双区模型清单不同（源自官方 catalog 快照差集），独占表给区域特供模型。
@@ -286,6 +404,22 @@ def install_console_close_handler():
         return handler
     except Exception:
         return None
+
+
+# Launcher names differ per platform; the messages below are read by whoever
+# is staring at the terminal, so point at the file that actually exists there.
+IS_WINDOWS = os.name == "nt"
+START_SCRIPT = "start-qoder-proxy.bat" if IS_WINDOWS \
+    else "start-qoder-proxy.sh"
+FIREWALL_SCRIPT = "allow-firewall.bat" if IS_WINDOWS else "allow-firewall.sh"
+
+
+def port_owner_hint(port):
+    """One-liner(s) the user can paste to see which process holds a port."""
+    cmds = ["netstat -ano | findstr :%d" % port] if IS_WINDOWS else \
+        ["ss -ltnp | grep :%d" % port,
+         "lsof -iTCP:%d -sTCP:LISTEN" % port]
+    return cmds
 
 
 CHAT_PATH = ("/algo/api/v2/service/pro/sse/agent_chat_generation"
@@ -498,7 +632,7 @@ def row_matches_realm(row, realm):
 
 def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
                  gen_ms=None, fp=None, account=None, effort=None,
-                 effort_requested=None, key_id=None):
+                 effort_requested=None, key_id=None, realm_reason=None):
     """Accumulate stats, append a JSONL row, and persist the summary.
 
     P1-3（推理档位审计 + key 归属）：后三个参数都是**可选**的，旧调用路径不传
@@ -513,6 +647,8 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
     if acc:
         # 本账号刚消耗额度：让 /accounts 的下一次轮询尽快回读 quota
         acc.credits_dirty = True
+        # 流结束：释放该账号的并发信号量（硬保证同号不并发）
+        _release_account_sem(acc.uid)
     if not fields:
         return None
     row = {
@@ -542,6 +678,13 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
     if key_id:
         # 只记 key 的**标识**（panel 分配的 id / legacy / launcher），绝无明文 key。
         row["key_id"] = str(key_id)
+    if realm_reason is not None:
+        # #26：本次是否**自动换区**及原因（持久化，面板不依赖响应头即可读到）。
+        #   "model_missing" 当前区官方清单里没有这个模型（独占表 / 清单驱动）
+        #   "no_account"    模型本区有（或无法判断），是账号可用性把它推走的
+        #   ""（空串）      本次**没有换区**（正常路径）
+        #   键不存在        该行产生于本字段上线前（旧行）—— 与「没换区」明确区分
+        row["realm_reason"] = str(realm_reason)
     acc = POOL.get(account) if (account and POOL) else None
     row["realm"] = acc.realm if acc else CURRENT_REALM
     if gen_ms and gen_ms > 0:
@@ -1224,6 +1367,30 @@ def save_persisted_realm(realm):
 
 API_KEY = None
 SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
+
+
+def _refreshable_accounts(accounts):
+    """从账号集合里挑出**可以安全打上游**的号（#25 遗留其二）。
+
+    判据与 pick/count_ready 的准入一致：enabled 且有凭证。禁用号 / 坏凭证号
+    打上游不但没有意义，还可能被上游回一个**空账本**，把本地账本再零化一次
+    （本仓那个 enabled=False 的 intl 号正是这个形态）。
+
+    返回 (targets, skipped)：skipped 是 [{"uid", "reason"}]，调用方**必须**把它
+    放进响应里 —— 否则「少刷新了几个号」会变成静默行为，排查时看不见。
+    """
+    targets, skipped = [], []
+    for a in accounts or []:
+        if a is None:
+            continue
+        if not a.enabled:
+            skipped.append({"uid": a.uid, "reason": "disabled"})
+            continue
+        if not a.access_token:
+            skipped.append({"uid": a.uid, "reason": "no_credential"})
+            continue
+        targets.append(a)
+    return targets, skipped
 
 
 def account_views(realm=None):
@@ -2157,6 +2324,24 @@ def fetch_models(realm=None):
     return entries
 
 
+def fetch_models_merged():
+    """#26 步4：两区并集，逐条附区域标注。返回 [(mid, meta, realm)]。
+
+    同一上游 key 在两区都有的**只保留一条**（当前区优先），避免客户端看到
+    重复 id；顺序为「当前区在前 + 各自清单顺序」。
+    """
+    out = []
+    seen = set()
+    cur = CURRENT_REALM if CURRENT_REALM in ("cn", "intl") else "cn"
+    for r in (cur, "intl" if cur == "cn" else "cn"):
+        for mid, meta in fetch_models(realm=r):
+            if mid in seen:
+                continue
+            seen.add(mid)
+            out.append((mid, meta, r))
+    return out
+
+
 def read_dynamic_models(realm=None):
     """COSY 签名拉取 /algo/api/v2/model/list（chat scene）。失败返回 []。
 
@@ -2251,7 +2436,7 @@ def off_peak_active_now(window_start, window_end, tz=None, now=None):
     return cur >= s or cur < e      # 跨午夜窗口（22:00-08:00）
 
 
-def model_entry(mid, meta):
+def model_entry(mid, meta, realm=None):
     """Build a rich /v1/models entry.
 
     - `id` = **官方模型名 display_name**（如 `Qwen3.8-Max`）——客户端唯一需要
@@ -2278,6 +2463,17 @@ def model_entry(mid, meta):
         "enabled": meta.get("enable", True) is not False,
     }
     item["name"] = display_name
+    if realm:
+        # #26 步4：该条来自哪个区域（默认单区视图也带，便于面板/客户端标注）
+        item["realm"] = realm
+        try:
+            _span = qoder_catalog.key_realm_span(mid)
+            if len(_span) == 1:
+                # 只在**一个**区域存在（如仅 intl 的 Sonus）—— 面板据此打「仅国际版」角标；
+                # 双区都有的不给该字段（避免把「都能用」误标成独占）。
+                item["realm_exclusive"] = _span[0]
+        except Exception:
+            pass
     # 描述：来源自带动态/本地 description，否则取官方桌面版文案
     desc = meta.get("description") or ""
     if not desc:
@@ -2477,6 +2673,8 @@ def clean_chunk(raw):
     try:
         obj = json.loads(raw)
     except Exception:
+        return raw
+    if not isinstance(obj, dict):
         return raw
     changed = False
     for choice in obj.get("choices") or []:
@@ -2681,6 +2879,21 @@ def supported_efforts(meta):
     enabled = tc.get("enabled") if isinstance(tc.get("enabled"), dict) else {}
     efforts = enabled.get("efforts") if isinstance(enabled.get("efforts"), dict) else {}
     return [e for e in EFFORT_RANK if e in efforts]
+
+
+def catalog_meta_for(model_key, realm=None):
+    """按上游 key 取该模型在官方目录里的元数据（找不到返回 {}）。
+
+    Anthropic 入口在调用 qoder_anthropic.messages_to_chat 时需要一个 meta，
+    否则 effort_from_anthropic 取不到 supported 档位表 -> 思考档位被静默丢弃。
+    """
+    for m in qoder_catalog.models_for_realm(realm or CURRENT_REALM):
+        if m.get("key") == model_key:
+            return m
+    for m in qoder_catalog.STATIC_INTL_MODELS + qoder_catalog.STATIC_CN_MODELS:
+        if m.get("key") == model_key:
+            return m
+    return {}
 
 
 def default_effort(meta):
@@ -4189,13 +4402,36 @@ class RateLimited(Exception):
 ERROR_COOLDOWN_WAIT_MAX = 10.0
 
 
-def _short_error_cooldown_wait(realm, model, exclude=None):
-    """账号级（错误/传输）短冷却的最短剩余秒数；不适用则返回 0。
+def _realm_ready_total(realm, model=None):
+    """本区域当前可轮换的就绪账号数 —— **唯一口径**（#29 的成因就是两处口径分叉）。
 
-    - 只看 cooldown_until（错误冷却）；若该模型正被上游频控
-      （model_cooldowns）则返回 0，交给429路径处理——两者语义严格分开。
-    - exclude（本请求已试过的账号）中的冷却账号**不算**：等它冷却好了也
-      不会再被本请求使用，纯属浪费。
+    冷却函数曾用 len(POOL.accounts)（全局），open_upstream 用 count_ready(realm)。
+    双区池（1 cn + 1 intl）下前者是 2、后者是 1，于是「本区域唯一账号」被当成
+    多号池，single_account 判定反了 -> 冷却不再压到 3s。两处都必须走这里。
+    """
+    if not POOL or not realm:
+        # 无池、或调用方给不出 realm（例如仅实现部分接口的测试桩对象）-> 保守 1
+        # （= 单号池语义：冷却压短）。绝不因为「判不出区域」而误判成多号池。
+        return 1
+    try:
+        return max(1, POOL.count_ready(realm, model=model))
+    except Exception:
+        return 1
+
+
+def _short_error_cooldown_wait(realm, model, exclude=None):
+    """账号级短冷却（含**预算内**的模型级频控窗）的最短剩余秒数；不适用返回 0。
+
+    两条冷却来源**一起收集、取最小值**（#29 起）：
+      · cooldown_until：账号级错误/传输冷却（原有语义）；
+      · model_cooldowns[model]：**仅当剩余 <= ERROR_COOLDOWN_WAIT_MAX(10s)** 时纳入；
+        超出预算的长频控仍交回 429 路径（客户端退避），不在这里吞掉。
+    为什么不再短路：旧实现「遇到任一 model_cooldowns > now 就 return 0」，会让
+    「号 A 长频控」连带把「号 B 只有 3s 可自愈」一起放弃（#29 的次生坑）。
+    本函数**只决定等不等、不写任何冷却字段**，退避写者语义不变。
+    已登记的语义变化：真 429 窗口 <=10s 时会被「等待 + 重试」，客户端收到
+    延迟后的成功而不是 429（>10s 的行为不变）。
+    - exclude（本请求已试过的账号）**不算**：等它冷却好了也不会再被本请求使用。
     """
     if not POOL:
         return 0.0
@@ -4207,8 +4443,11 @@ def _short_error_cooldown_wait(realm, model, exclude=None):
             continue
         if a.uid in exclude:
             continue
-        if a.model_cooldowns.get(model, 0.0) > now:
-            return 0.0          # 上游频控生效中 -> 正当429，不等待
+        m_remain = a.model_cooldowns.get(model, 0.0) - now
+        if m_remain > 0:
+            if m_remain <= ERROR_COOLDOWN_WAIT_MAX:
+                waits.append(m_remain)      # 预算内的频控窗：值得等它过去
+            continue                        # 超预算：跳过该号（别的号仍可纳入）
         remain = a.cooldown_until - now
         if 0 < remain <= ERROR_COOLDOWN_WAIT_MAX:
             waits.append(remain)
@@ -4465,7 +4704,9 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
             POOL.affinity.unbind(session_key)
         except Exception:
             pass
-    total = len(POOL.accounts) if POOL else 1
+    # #29：口径必须与 open_upstream 一致 —— 用**本区域**就绪数，而不是全局账号数，
+    # 否则双区池里本区域唯一账号会被当成多号池，冷却不压 3s。
+    total = _realm_ready_total(getattr(account, "realm", "") or "", model)
     # 针对 10605 / retryAfterSeconds 解析冷却时长
     retry_secs = 30
     m = re.search(r'retryAfterSeconds\D+(\d+)', detail)
@@ -4475,9 +4716,12 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
         except Exception:
             pass
     if status_int == 429:
-        account.note_error("envelope 429", model=model, cooldown=retry_secs)
-        log("account %s throttled via envelope (429), cooling for %ds"
-            % (account.uid[:8], retry_secs), level="WARN", tag="chat")
+        actual = account.note_error("envelope 429", model=model,
+                                    cooldown=retry_secs)
+        log("account %s throttled via envelope (429), cooling for %.0fs "
+            "(requested %ds, realm_ready=%d)"
+            % (account.uid[:8], float(actual or 0), retry_secs, total),
+            level="WARN", tag="chat")
         schedule_auto_refresh(account, "envelope 429")
     elif status_int in (401, 403):
         dead = qoder_accounts.session_dead(detail)
@@ -4491,11 +4735,14 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
             cd = 300
         else:
             cd = retry_secs if is_queue else 60
-        account.note_error("envelope HTTP %s: %s" % (status_int, detail[:80]),
-                           cooldown=cd, single_account=(total <= 1),
-                           model=model if (is_queue or is_paid) else None)
-        log("account %s rejected via envelope (HTTP %s, queue=%s, paidwall=%s), cooling for %ds and rotating"
-            % (account.uid[:8], status_int, is_queue, is_paid, cd), level="WARN", tag="chat")
+        actual = account.note_error("envelope HTTP %s: %s"
+                                    % (status_int, detail[:80]),
+                                    cooldown=cd, single_account=(total <= 1),
+                                    model=model if (is_queue or is_paid) else None)
+        log("account %s rejected via envelope (HTTP %s, queue=%s, paidwall=%s), "
+            "cooling for %.0fs (requested %d, realm_ready=%d) and rotating"
+            % (account.uid[:8], status_int, is_queue, is_paid,
+               float(actual or 0), cd, total), level="WARN", tag="chat")
         if dead:
             account.enabled = False
             account.save(ACCOUNTS_DIR) if account.path else None
@@ -4633,8 +4880,18 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
     （_sweeps 保护下最多 UPSTREAM_MAX_SWEEPS 轮）；仍失败才抛
     RateLimited 或最后一个错误。
     """
-    realm = target_realm or detect_model_realm(payload.get("model")) or CURRENT_REALM
     model = str(payload.get("model") or "")
+    realm = target_realm or detect_model_realm(model) or CURRENT_REALM
+    if not target_realm:
+        # 步2：只在**用户没显式指定**时，按账号可用性兜底换区
+        realm = fallback_realm_by_accounts(realm, model)
+        if realm != CURRENT_REALM:
+            # #26：换区可见（覆盖所有自动路径：独占表 / 清单驱动 / 账号回退）
+            log("request routed to realm %s (default=%s, model=%r)"
+                % (realm, CURRENT_REALM, model), tag="realm")
+            if usage_ctx is not None:
+                # 确定性原因 → 面板直接显示，不必自己推断
+                usage_ctx["realm_reason"] = auto_realm_reason(model, realm)
     model_key = qoder_catalog.resolve_upstream_key(model, realm=realm)
 
     representative = POOL.pick(realm=realm) if POOL else None
@@ -4645,6 +4902,9 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
         usage_ctx["effort_requested"] = requested_effort(payload)
         usage_ctx["effort"] = (body_obj.get("parameters") or {}).get(
             "reasoning_effort")
+        # #26：本次实际出口（自动路由后可能与请求开始时不同）—— 调用方据此
+        # 在响应头/日志里对用户可见，也让 usage 行与真实出账区一致。
+        usage_ctx["realm"] = realm
     encoded = qoder_encode(json.dumps(body_obj, ensure_ascii=False).encode("utf-8"))
 
     if not session_key:
@@ -4653,7 +4913,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
             log("affinity: derived %s for %d msgs"
                 % (session_key, len(body_obj.get("messages") or [])))
 
-    total = max(1, POOL.count_ready(realm, model=model)) if POOL else 1
+    total = _realm_ready_total(realm, model)   # #29：与冷却函数共用同一口径
     tried = set()
     last_error = None
     last_429 = None
@@ -4683,7 +4943,12 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
 
     # 额外 +2 次迭代预算：只供"短错误冷却等待续上"使用（正常轮换仍由
     # tried 集合自然终止）。
+    _sem_held = None   # 当前持有信号量的账号（成功时由 record_usage 释放）
     for _ in range(total + 2):
+        # 换号前释放上一号的信号量（错误路径的兜底；成功路径已置 None）
+        if _sem_held:
+            _release_account_sem(_sem_held)
+            _sem_held = None
         account = POOL.pick_for_session(realm=realm, session_key=session_key,
                                         exclude=tried, model=model) if POOL else None
         if account is None:
@@ -4703,6 +4968,12 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
                 POOL.affinity.unbind(session_key)
             continue
         tried.add(account.uid)
+        # 信号量硬保证：该账号已有活跃流时跳过（换号继续），防两会话并发打同一号
+        if not _try_acquire_account_sem(account.uid):
+            log("account %s has an active stream (semaphore) - rotating"
+                % account.uid[:8], tag="chat")
+            continue
+        _sem_held = account.uid
         # 身份相关的 aliyun_user_type 需要真实账号
         body_obj["aliyun_user_type"] = account.user_type or \
             qoder_sign.DEFAULT_USER_TYPE
@@ -4819,6 +5090,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
             # task-74 三族：成功收尾 -> 统一复位（三族计数 + 软冷却 + 模型冷却）。
             # note_success 是 clear_error(model) 的超集；刻意不动 balance_until。
             account.note_success(model=model)
+            _sem_held = None   # 成功返回：信号量由 record_usage 释放
             return resp, account, encoded
 
         exc = last_exc
@@ -5013,6 +5285,11 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
         except Exception as sweep_exc:
             last_error = sweep_exc
 
+    # 循环结束（全部账号耗尽）：释放最后一个持有的信号量（防泄漏）
+    if _sem_held:
+        _release_account_sem(_sem_held)
+        _sem_held = None
+
     if last_error is not None:
         if last_429 is not None:
             raise RateLimited(last_429, last_429_detail,
@@ -5032,6 +5309,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
     raise RuntimeError(
         "no usable account for realm '%s': all are disabled, cooling down, or expired"
         % realm)
+    # NOTE: _sem_held 的信号量在每次外层循环迭代开头已释放（换号兜底），
+    # 成功路径由 record_usage 释放——此处不需要额外清理。
 
 
 def sse_with_heartbeat(source, send, interval=None, idle_limit=None):
@@ -5229,8 +5508,9 @@ def iter_inner_sse(resp, holder=None):
         if isinstance(inner, dict):
             # task-34：只观测（计数 + 首次告警），不影响下面的清洗/透传分支。
             note_inner_upstream_error(inner, status=status)
-        if holder is not None and inner.get("usage") and not holder.get("usage"):
-            holder["usage"] = inner["usage"]
+            if holder is not None and inner.get("usage") \
+                    and not holder.get("usage"):
+                holder["usage"] = inner["usage"]
         cleaned = clean_chunk(body)
         if not cleaned:
             continue
@@ -5257,6 +5537,8 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
         try:
             chunk = json.loads(data)
         except Exception:
+            continue
+        if not isinstance(chunk, dict):
             continue
         if first_chunk_at is None:
             first_chunk_at = time.time()
@@ -6346,6 +6628,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Transfer-Encoding", "chunked")
+        realm_used = getattr(self, "realm_used", "") or ""
+        if realm_used:
+            # #26：流式响应同样标注实际出口 + 原因
+            self.send_header("X-Qoder-Realm", realm_used)
+            realm_reason = getattr(self, "realm_reason", "") or ""
+            if realm_reason:
+                self.send_header("X-Qoder-Realm-Reason", realm_reason)
         if cors_origin_allowed(self.path):
             self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
@@ -6441,6 +6730,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        realm_used = getattr(self, "realm_used", "") or ""
+        if realm_used:
+            # #26：本次**实际出口**（自动路由后可能与请求开始时不同）
+            self.send_header("X-Qoder-Realm", realm_used)
+            realm_reason = getattr(self, "realm_reason", "") or ""
+            if realm_reason:
+                self.send_header("X-Qoder-Realm-Reason", realm_reason)
         if cors_origin_allowed(self.path):
             self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
@@ -6657,6 +6953,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        # #26：每个请求入口清空「本次实际出口」标注。self 在 keep-alive 连接上是
+        # **复用**的，不清空的话后续非 chat 端点（/v1/models、/usage/*、/realm）
+        # 会带回上一次 chat 的残留值 —— 那会让面板把「上一次的出口」当成「本次的」。
+        self.realm_used = ""
+        self.realm_reason = ""
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
@@ -6728,8 +7029,12 @@ class Handler(BaseHTTPRequestHandler):
                 })
             return self._json(200, info)
         if path == "/realm":
+            # #26：面板需要知道「自动路由是否开着」——mode 由 auto_enabled + current
+            # 推导：自动开 = 未显式指定时会按模型/账号可用性兜底换区；否则恒用 current。
             return self._json(200, {"current": CURRENT_REALM,
-                                    "options": ["intl", "cn"]})
+                                    "options": ["intl", "cn"],
+                                    "auto_enabled": bool(AUTO_REALM_ENABLED),
+                                    "auto_env": "QD_AUTO_REALM"})
         if path in ("/v1/models", "/models"):
             if not self._authorized():
                 return
@@ -6738,7 +7043,19 @@ class Handler(BaseHTTPRequestHandler):
                 entries = fetch_models(realm=req_realm)
             except Exception as exc:
                 return self._error(502, str(exc))
-            data = [model_entry(mid, meta) for mid, meta in entries]
+            merge = str((query.get("merge_realms") or [""])[0]).lower() in (
+                "1", "true", "yes", "on")
+            if merge:
+                # #26 步4：两区并集（**opt-in**）。默认必须保持单区视图 ——
+                # 否则 _verify_models 与既有客户端会看到「多出来的」别区模型。
+                merged = fetch_models_merged()
+                data = [model_entry(mid, meta, realm=r)
+                        for mid, meta, r in merged]
+                return self._json(200, {"object": "list", "data": data,
+                                        "realm": "all", "merged": True,
+                                        "realms": ["cn", "intl"]})
+            data = [model_entry(mid, meta, realm=req_realm)
+                    for mid, meta in entries]
             try:
                 catalog_source = qoder_catalog.snapshot_source(req_realm)
             except Exception as exc:   # 只读探针：失败也不能拖垮模型列表
@@ -6777,9 +7094,14 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/accounts/credits":
             if not self._authorized():
                 return
-            for a in (POOL.accounts if POOL else []):
+            # #25：只强刷 enabled 且有凭证的号 —— 禁用号/坏凭证号打上游会被
+            # 回一个空账本，把本地账本再零化一次；被跳过的号在 skipped 里可区分。
+            targets, skipped = _refreshable_accounts(POOL.accounts if POOL else [])
+            for a in targets:
                 a.fetch_credits()
-            return self._json(200, {"accounts": account_views()})
+            return self._json(200, {"accounts": account_views(),
+                                    "skipped": skipped,
+                                    "refreshed": len(targets)})
         if path == "/accounts":
             if not self._authorized():
                 return
@@ -7211,17 +7533,17 @@ class Handler(BaseHTTPRequestHandler):
                 targets = [a for a in POOL.accounts if a.realm == realm]
             else:
                 targets = list(POOL.accounts)
+            # #25：与 GET 同一条守卫（显式 uid 指向禁用号时也会落到 skipped）
+            targets, skipped = _refreshable_accounts(targets)
             results = []
             for account in targets:
-                if account is None:
-                    continue
                 res = account.fetch_credits()
                 account.fetch_plan()
                 results.append({"uid": account.uid, "ok": res.get("ok", False),
                                 "credits": account.credits,
                                 "plan": account.plan,
                                 "error": res.get("error", "")})
-            return self._json(200, {"results": results,
+            return self._json(200, {"results": results, "skipped": skipped,
                                     "accounts": account_views()})
         if path == "/tasks/run":
             import qoder_tasks
@@ -7416,15 +7738,16 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/accounts/refresh":
             uid = payload.get("uid")
             targets = [POOL.get(uid)] if uid else list(POOL.accounts)
+            # #25：第三个同类入口 —— 同样只对 enabled 且有凭证的号打上游
+            # （refresh 会打 OAuth 端点并 save 落盘，对禁用号纯属副作用）。
+            targets, skipped = _refreshable_accounts(targets)
             results = []
             for account in targets:
-                if account is None:
-                    continue
                 ok = account.refresh()
                 account.save(ACCOUNTS_DIR)
                 results.append({"uid": account.uid, "ok": ok,
                                 "error": account.last_error})
-            return self._json(200, {"results": results})
+            return self._json(200, {"results": results, "skipped": skipped})
         if path == "/accounts/test":
             uid = payload.get("uid")
             if not uid:
@@ -7650,14 +7973,18 @@ class Handler(BaseHTTPRequestHandler):
         ok, problem = qoder_anthropic.validate_request(payload)
         if not ok:
             return self._error(400, problem, "invalid_request_error")
-        chat_req = qoder_anthropic.messages_to_chat(payload)
+        req_realm = self._request_realm() or CURRENT_REALM
+        model_hint = payload.get("model") or "auto"
+        model_key = qoder_catalog.resolve_upstream_key(model_hint, realm=req_realm)
+        # 传 supported 档位表，否则 effort_from_anthropic 会静默丢弃思考档位。
+        meta = catalog_meta_for(model_key, req_realm)
+        chat_req = qoder_anthropic.messages_to_chat(
+            payload, catalog_meta=meta, supported=supported_efforts(meta))
         model = chat_req.get("model") or payload.get("model") or "auto"
         want_stream = bool(payload.get("stream"))
         session_key = extract_session_key(self.headers, chat_req)
         fp = prompt_fingerprint(chat_req.get("messages"))
         t_start = time.time()
-        req_realm = self._request_realm() or CURRENT_REALM
-        model_key = qoder_catalog.resolve_upstream_key(model, realm=req_realm)
         # ---- 形态决策单点：在这里算唯一一次，随 chat_req 下传 ----
         chat_req["_qd_structured"] = structured_tool_history_enabled(
             model=model, model_key=model_key, realm=req_realm,
@@ -7676,6 +8003,9 @@ class Handler(BaseHTTPRequestHandler):
             upstream, account, _ = open_upstream(
                 chat_req, session_key=session_key, target_realm=req_realm,
                 usage_ctx=usage_ctx)
+            # #26：记录实际出口（自动路由后可能与 req_realm 不同）→ 响应头可见
+            self.realm_used = usage_ctx.get("realm") or req_realm
+            self.realm_reason = usage_ctx.get("realm_reason") or ""
         except RateLimited as exc:
             record_error(model, 429, exc.detail[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000))
@@ -7729,7 +8059,8 @@ class Handler(BaseHTTPRequestHandler):
                                  fp=fp, account=account.uid,
                                  effort=usage_ctx.get("effort"),
                                  effort_requested=usage_ctx.get("effort_requested"),
-                                 key_id=self._key_id_for_usage())
+                                 key_id=self._key_id_for_usage(),
+                                 realm_reason=usage_ctx.get("realm_reason", ""))
                     return
                 except UpstreamStatus as exc:
                     # Anthropic 侧不重开（见 docstring）：直接给终态 error 事件。
@@ -7753,7 +8084,8 @@ class Handler(BaseHTTPRequestHandler):
                              fp=fp, account=account.uid,
                              effort=usage_ctx.get("effort"),
                              effort_requested=usage_ctx.get("effort_requested"),
-                             key_id=self._key_id_for_usage())
+                             key_id=self._key_id_for_usage(),
+                             realm_reason=usage_ctx.get("realm_reason", ""))
                 return
             try:
                 chat_obj, account = aggregate_with_envelope_retry(
@@ -7776,7 +8108,8 @@ class Handler(BaseHTTPRequestHandler):
                          elapsed_ms=wall, fp=fp, account=account.uid,
                          effort=usage_ctx.get("effort"),
                          effort_requested=usage_ctx.get("effort_requested"),
-                         key_id=self._key_id_for_usage())
+                         key_id=self._key_id_for_usage(),
+                         realm_reason=usage_ctx.get("realm_reason", ""))
             return self._json(200, result)
 
     def _handle_responses(self, payload):
@@ -7801,17 +8134,24 @@ class Handler(BaseHTTPRequestHandler):
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
             if want_stream:
-                # 流式：先发 SSE 头 + 连接期心跳（防客户端空闲超时掐断）
+                # 流式：先发 SSE 头 + 连接期心跳（防客户端空闲超时掐断）。
+                # 注意：_sse_begin 先于建连，自动路由的 X-Qoder-Realm 头此刻
+                # 未知、流式响应不带它（用量行仍会记录实际出口，见 #26）。
                 self._sse_begin()
                 upstream, account, _ = self._open_upstream_with_heartbeat(
                     chat_req, session_key=session_key,
                     target_realm=req_realm, usage_ctx=usage_ctx)
                 if upstream is None:
                     return  # 错误已作为 SSE 帧写入流中
+                self.realm_used = usage_ctx.get("realm") or req_realm
+                self.realm_reason = usage_ctx.get("realm_reason") or ""
             else:
                 upstream, account, _ = open_upstream(
                     chat_req, session_key=session_key,
                     target_realm=req_realm, usage_ctx=usage_ctx)
+                # #26：记录实际出口（自动路由后可能与 req_realm 不同）→ 响应头可见
+                self.realm_used = usage_ctx.get("realm") or req_realm
+                self.realm_reason = usage_ctx.get("realm_reason") or ""
         except RateLimited as exc:
             t = time.time() - t_start
             record_error(model, 429, exc.detail[:200],
@@ -7879,7 +8219,8 @@ class Handler(BaseHTTPRequestHandler):
                                          fp=fp, account=account.uid,
                                          effort=usage_ctx.get("effort"),
                                          effort_requested=usage_ctx.get("effort_requested"),
-                                         key_id=self._key_id_for_usage())
+                                         key_id=self._key_id_for_usage(),
+                                         realm_reason=usage_ctx.get("realm_reason", ""))
                             return
                         except UpstreamStatus as exc:
                             _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
@@ -7947,7 +8288,8 @@ class Handler(BaseHTTPRequestHandler):
                              fp=fp, account=account.uid,
                              effort=usage_ctx.get("effort"),
                              effort_requested=usage_ctx.get("effort_requested"),
-                             key_id=self._key_id_for_usage())
+                             key_id=self._key_id_for_usage(),
+                             realm_reason=usage_ctx.get("realm_reason", ""))
                 return
             try:
                 chat_obj, account = aggregate_with_envelope_retry(
@@ -7970,10 +8312,15 @@ class Handler(BaseHTTPRequestHandler):
                          elapsed_ms=wall, fp=fp, account=account.uid,
                          effort=usage_ctx.get("effort"),
                          effort_requested=usage_ctx.get("effort_requested"),
-                         key_id=self._key_id_for_usage())
+                         key_id=self._key_id_for_usage(),
+                         realm_reason=usage_ctx.get("realm_reason", ""))
             return self._json(200, result)
 
     def do_POST(self):
+        # #26：同 do_GET —— 每次请求入口清空，避免 keep-alive 复用实例时把上一次
+        # chat 的出口/原因带到别的响应上。
+        self.realm_used = ""
+        self.realm_reason = ""
         path = self.path.split("?")[0]
         if path == "/settings/save":
             if not self._panel_ok():
@@ -8045,6 +8392,9 @@ class Handler(BaseHTTPRequestHandler):
             upstream, account, _ = open_upstream(payload, session_key=session_key,
                                                  target_realm=req_realm,
                                                  usage_ctx=usage_ctx)
+            # #26：记录实际出口（自动路由后可能与 req_realm 不同）→ 响应头可见
+            self.realm_used = usage_ctx.get("realm") or req_realm
+            self.realm_reason = usage_ctx.get("realm_reason") or ""
         except RateLimited as exc:
             record_error(model, 429, exc.detail[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000))
@@ -8106,7 +8456,8 @@ class Handler(BaseHTTPRequestHandler):
                                          fp=fp, account=account.uid,
                                          effort=usage_ctx.get("effort"),
                                          effort_requested=usage_ctx.get("effort_requested"),
-                                         key_id=self._key_id_for_usage())
+                                         key_id=self._key_id_for_usage(),
+                                         realm_reason=usage_ctx.get("realm_reason", ""))
                             return
                         except UpstreamStatus as exc:
                             _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
@@ -8174,7 +8525,8 @@ class Handler(BaseHTTPRequestHandler):
                              fp=fp, account=account.uid,
                              effort=usage_ctx.get("effort"),
                              effort_requested=usage_ctx.get("effort_requested"),
-                             key_id=self._key_id_for_usage())
+                             key_id=self._key_id_for_usage(),
+                             realm_reason=usage_ctx.get("realm_reason", ""))
                 return
             try:
                 result, account = aggregate_with_envelope_retry(
@@ -8206,7 +8558,8 @@ class Handler(BaseHTTPRequestHandler):
                          fp=fp, account=account.uid,
                          effort=usage_ctx.get("effort"),
                          effort_requested=usage_ctx.get("effort_requested"),
-                         key_id=self._key_id_for_usage())
+                         key_id=self._key_id_for_usage(),
+                         realm_reason=usage_ctx.get("realm_reason", ""))
             return self._json(200, result)
 
 
@@ -8278,11 +8631,11 @@ def main(argv=None):
                   "started.")
             print()
             print("  Fix: start qoder-proxy on a different port, e.g.")
-            print("          start-qoder-proxy.bat %d" % (args.port + 1))
+            print("          %s %d" % (START_SCRIPT, args.port + 1))
             print("          python qoder_proxy.py --port %d" % (args.port + 1))
             print()
-            print("  Check who owns the port:  netstat -ano | findstr :%d"
-                  % args.port)
+            for cmd in port_owner_hint(args.port):
+                print("  Check who owns the port:  %s" % cmd)
             print()
             raise SystemExit(1)
         print()
@@ -8405,8 +8758,12 @@ def main(argv=None):
         print("    Clients: Base URL = the API address above, then paste "
               "the key.")
         print()
-        print("    If nothing can connect, allow python through the")
-        print("    firewall: run allow-firewall.bat once as administrator.")
+        if IS_WINDOWS:
+            print("    If nothing can connect, allow python through the")
+            print("    firewall: run %s once as administrator." % FIREWALL_SCRIPT)
+        else:
+            print("    If nothing can connect, open the port in the firewall")
+            print("    once:  sudo ./%s %d" % (FIREWALL_SCRIPT, args.port))
         print("  " + "=" * 62)
         print()
         sys.stdout.flush()
@@ -8437,8 +8794,9 @@ def main(argv=None):
         print()
         print("  Fix: stop the program holding the port, or pick another "
               "port:")
-        print("          netstat -ano | findstr :%d" % args.port)
-        print("          start-qoder-proxy.bat %d" % (args.port + 1))
+        for cmd in port_owner_hint(args.port):
+            print("          %s" % cmd)
+        print("          %s %d" % (START_SCRIPT, args.port + 1))
         print()
         raise SystemExit(1)
     log("listening  : http://%s:%d/v1  (api key: %s)"
