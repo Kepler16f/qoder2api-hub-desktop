@@ -483,6 +483,10 @@ try:
     P.POOL = _pool          # 上一块 finally 还原了 None，这里重新挂上临时池
     _acc.cooldown_until = 0
     _acc.last_error = ""
+    # fork：上一块成功路径的信号量由 record_usage 释放，而测试不跑响应
+    # 处理——手动清掉，否则 persistent 块 pick 到账号会被 sem 挡住（换号
+    # 无号 -> last_error=None -> RuntimeError 而非 HTTPError）。
+    P._release_account_sem(_acc.uid)
     raised = None
     t0 = time.time()
     try:

@@ -64,8 +64,6 @@ check("qoder_accounts.py 直连 urlopen 基线 == 0（出站统一走 _opener_fo
       n_direct == 0, n_direct)
 src_p = open(os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8").read()
 n_direct_p = src_p.count("urllib.request.urlopen(")
-check("qoder_accounts.py 直连 urlopen 基线 == 0（fork：凭证出站全走 UPSTREAM_OPENER）",
-      n_direct_a == 0, n_direct_a)
 check("qoder_proxy.py 直连 urlopen 基线 == 1（fork：仅本地端口探测）",
       n_direct_p == 1, n_direct_p)
 
