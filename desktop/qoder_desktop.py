@@ -1147,6 +1147,14 @@ def run_windows_shell(state, cfg, config_path, paths, auto_close_ms=None,
                                         print("[desktop] window shot ->", wshot)
                                 except Exception as exc:
                                     print("[desktop] shot failed: %r" % exc)
+                            def _probe2():
+                                host.execute_script(
+                                    "JSON.stringify({done: !!window.__qdProbeDone,"
+                                    "sec: (document.getElementById('desktopSection')||{}).style"
+                                    " ? document.getElementById('desktopSection').style.display : 'NO-EL',"
+                                    "group: (document.getElementById('clientSettingsGroup')||{}).style"
+                                    " ? document.getElementById('clientSettingsGroup').style.display : 'NO-EL'})",
+                                    lambda hr, res: print("[desktop] settings probe2:", res))
                             if (os.environ.get("QD_DESKTOP_SETTINGS")
                                     or "").strip() in ("1", "true", "yes"):
                                 host.execute_script(
@@ -1154,6 +1162,9 @@ def run_windows_shell(state, cfg, config_path, paths, auto_close_ms=None,
                                     "window.onerror=function(m,s,l,c,e){"
                                     "__qdErrs.push(m+' @'+l+':'+c);return false;};"
                                     "switchMainTab('settings');"
+                                    "loadSettings(false).then(function(){"
+                                    "window.__qdProbeDone=true;})"
+                                    ".catch(function(){});"
                                     "JSON.stringify({bridge: !!window.__qdDesktop,"
                                     "v: window.__qdDesktop ? window.__qdDesktop.v : 'NO-BRIDGE',"
                                     "sec: (document.getElementById('desktopSection')||{}).style"
@@ -1168,7 +1179,8 @@ def run_windows_shell(state, cfg, config_path, paths, auto_close_ms=None,
                                     "limitsRows: document.querySelectorAll('#limitsTbody tr').length,"
                                     "lanToggle: !!document.getElementById('setLanToggle'),"
                                     "deskTray: !!document.getElementById('deskTray')};})()})",
-                                    lambda hr, res: print("[desktop] settings probe:", res))
+                                    lambda hr, res: (print("[desktop] settings probe:", res),
+                                        root.after(1200, _probe2)))
                             if (os.environ.get("QD_DESKTOP_TOGGLE_TEST")
                                     or "").strip() in ("1", "true", "yes"):
                                 # 端到端自检（会改配置，默认关闭）：模拟用户点开关，
