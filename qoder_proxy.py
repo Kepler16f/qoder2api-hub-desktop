@@ -164,7 +164,9 @@ from pathlib import Path
 # 2026.10.07、2026.10.08）不改写，对应关系见 README 版本线说明。
 # 本次并入上游 v1.3.5/v1.3.6/v1.3.7 + 发布后杂项 → 2026.10.15.1-4_upstream；
 # 合并手术（传输收口/冲突融合）→ .5_re。（发版日 10-15，勿沿用工作开始日的旧日期）
-VERSION = "2026.10.15.5_re"
+# 当日第二批：.6_re = 信号量排队优化（超并发等待而非 502）；
+# .7_upstream = 并入上游 v1.4.0（智能体一键配置 + PR #30 工具嵌套修复）。
+VERSION = "2026.10.15.7_upstream"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 

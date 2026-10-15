@@ -80,6 +80,12 @@ jobs:
           SRC=$(grep -oP 'VERSION = "\K[^"]+' qoder_proxy.py | head -n1 || true)
           echo "source: version=$SRC tag=$GITHUB_REF_NAME"
           TAG="${GITHUB_REF_NAME#v}"
+          # fork 双版本线：桌面发行 tag 形如 1.0.x_R（_R 后缀），网关
+          # VERSION 是日期制（YYYY.MM.DD.N_upstream/_re）——两条线有意
+          # 不同名，桌面 tag 跳过对比；其余 tag 仍按上游纪律断言。
+          case "$TAG" in
+            *_R) echo "desktop release tag ($TAG): gateway VERSION is a separate line - skip"; exit 0;;
+          esac
           if [ -z "$SRC" ]; then
             echo "::error::could not read VERSION from qoder_proxy.py"
             exit 1
