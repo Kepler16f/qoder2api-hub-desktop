@@ -1,7 +1,7 @@
 # Qoder2API-Hub Desktop — Qoder 双区多账号网关 · 开箱即用桌面客户端
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-1.0.2_R-2496ED?style=flat-square" alt="Version 1.0.2_R">
+  <img src="https://img.shields.io/badge/Release-1.0.3_R-2496ED?style=flat-square" alt="Version 1.0.3_R">
   <img src="https://img.shields.io/badge/Desktop-Win_x64_·_Win_ARM64_·_macOS_·_Linux-8A2BE2?style=flat-square" alt="Desktop Platforms">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
@@ -507,6 +507,14 @@ python _verify_models.py --base http://127.0.0.1:8790
 >   天然不撞。历史号对应：`2026.10.07` ≈ 2026.10.7.1_upstream（上游 v1.2.18）、
 >   `2026.10.08` ≈ 2026.10.8.1_re（上下文压缩）；更早的「网关 1.2.18/1.2.19/
 >   1.2.20」是 fork 旧连号（1.2.18 与上游撞车才改制），仅为历史记录。
+
+### v1.0.3_R — 桌面版：随网关 2026.10.14.2–6 发布
+
+随上一条目（网关 2026.10.14.2–6：并入上游 v1.3.5–v1.3.7）发布的桌面版——双区自动路由、
+路由决策可观测、四个报告问题修复、看板深色体系换新（`data-theme` + 手动切换）、
+传输收口融合（`_opener_for_request` 委托 `UPSTREAM_OPENER`）。桌面新增随批次搭载：
+上游 403+112 付费墙识别、SSE 连接期心跳、代理侧上下文压缩、账号测试结论持久显示。
+发布说明见 [Releases](https://github.com/Kepler16f/qoder2api-hub-desktop/releases/tag/v1.0.3_R)。
 
 ### 网关 2026.10.14.2–6 — 并入上游 v1.3.5–v1.3.7（桌面版待发）
 
