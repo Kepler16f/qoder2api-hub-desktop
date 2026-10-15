@@ -75,7 +75,7 @@ STREAM_STALE_TTL = 300       # 秒：清理字典条目的上限（内存回收�
 _account_sems = {}           # uid -> threading.Semaphore(1)
 _sem_lock = threading.Lock()
 _sem_acquired_at = {}        # uid -> acquire 时间戳（泄漏防护用）
-_SEM_STALE_TTL = 600         # 秒：信号量超过此时间视为泄漏，强制回收
+_SEM_STALE_TTL = 120         # 秒：信号量超过此时间视为泄漏，强制回收（大多数流 5–60s 完成）
 _SEM_WAIT_MAX = float(os.environ.get("QD_SEM_WAIT_MAX") or 60)
 # 秒：账号信号量全占时的排队等待预算——超并发（客户端并发数 > 账号池容量）
 # 时先短暂排队等活跃流释放，而不是立即 502（10-15 实测：agent 并发 7+ 请求
@@ -123,6 +123,50 @@ def _release_account_sem(uid):
             sem.release()
     except Exception:
         pass
+
+
+class _SemGuardResponse(object):
+    """包装上游响应：close/exit 时释放该账号的信号量（幂等）。
+
+    record_usage 只在成功路径调用；流失败/客户端断开/信封错误等路径
+    不会走到 record_usage → 信号量泄漏 → 账号被锁 _SEM_STALE_TTL 秒。
+    本包装器保证 `with upstream:` 块退出时**必定**释放（无论成功/异常）。
+    """
+
+    def __init__(self, resp, uid):
+        self._resp = resp
+        self._uid = uid
+        self._released = False
+
+    def _release(self):
+        if not self._released:
+            self._released = True
+            _release_account_sem(self._uid)
+
+    def __enter__(self):
+        self._resp.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        try:
+            return self._resp.__exit__(*args)
+        finally:
+            self._release()
+
+    def __iter__(self):
+        return self._resp.__iter__()
+
+    def close(self):
+        try:
+            self._resp.close()
+        finally:
+            self._release()
+
+    def read(self, *a):
+        return self._resp.read(*a)
+
+    def __getattr__(self, name):
+        return getattr(self._resp, name)
 
 
 def _spread_skip_accounts(realm, session_key, now, all_same_realm,
@@ -654,8 +698,8 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
     if acc:
         # 本账号刚消耗额度：让 /accounts 的下一次轮询尽快回读 quota
         acc.credits_dirty = True
-        # 流结束：释放该账号的并发信号量（硬保证同号不并发）
-        _release_account_sem(acc.uid)
+        # 信号量释放由 _SemGuardResponse（with upstream: exit）统一处理，
+        # 此处不再释放——避免与包装器双重 release 破坏信号量计数。
     if not fields:
         return None
     row = {
@@ -5137,8 +5181,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
             # task-74 三族：成功收尾 -> 统一复位（三族计数 + 软冷却 + 模型冷却）。
             # note_success 是 clear_error(model) 的超集；刻意不动 balance_until。
             account.note_success(model=model)
-            _sem_held = None   # 成功返回：信号量由 record_usage 释放
-            return resp, account, encoded
+            _sem_held = None   # 包装器接管释放（with upstream: exit 时必定触发）
+            return _SemGuardResponse(resp, account.uid), account, encoded
 
         exc = last_exc
         # ---- 错误分类（与原有轮换语义一致） ----
