@@ -774,8 +774,9 @@ print()
 print("[17] SSE heartbeat during long upstream silence (TTFT up to 71s observed)")
 check("sse_with_heartbeat helper exists",
       "def sse_with_heartbeat(" in _src15)
-check("heartbeat emits SSE comment frames (': ping')",
-      'b": ping\\n\\n"' in _src15)
+check("heartbeat emits empty-delta keepalive chunks (not comments)",
+      '_HEARTBEAT_CHUNK' in _src15
+      and b'"delta":{}' in P.Handler._HEARTBEAT_CHUNK)
 check("heartbeat enabled by default with env override",
       'os.environ.get("QD_SSE_HEARTBEAT"' in _src15)
 check("both streaming paths wrap their source with heartbeat",
@@ -798,8 +799,9 @@ for item in P.sse_with_heartbeat(_slow_gen(), _sent2.append, interval=0.15,
     _slow.append(item)
 check("heartbeat: data passes through unchanged",
       _slow == [b"data: late\n\n", b"data: late2\n\n"], _slow)
-check("heartbeat: comment frames sent during both silences",
-      len(_sent2) >= 2 and all(f == b": ping\n\n" for f in _sent2),
+check("heartbeat: keepalive chunks sent during both silences",
+      len(_sent2) >= 2 and all(b'"id":"keepalive"' in f
+                               and b'"delta":{}' in f for f in _sent2),
       (len(_sent2), _sent2))
 
 
@@ -961,12 +963,13 @@ _A.http_json = fake_status_404
 res_intl = acc_intl.checkin()
 cap_intl, reason_intl = acc_intl.checkin_capability()
 _A.http_json = _orig_hj
-check("404 status -> (ok, unavailable) with explicit reason",
-      res_intl.get("ok") is True and res_intl.get("unavailable") is True
-      and res_intl.get("reason") == _A.CHECKIN_REASON_NOT_FOUND, res_intl)
-check("404 message names the missing endpoint + hand-off to official client",
-      "daily-check-in" in str(res_intl.get("msg"))
-      and "客户端" in str(res_intl.get("msg")), res_intl.get("msg"))
+# 上游 #25 语义重构：404 经 campaign 链路返回 ok=False + error（不再
+# ok=True+unavailable）；「不可用」结论改由 capability 缓存承载（见下一条）。
+check("404 status -> ok=False with HTTP 404 error (campaign path)",
+      res_intl.get("ok") is False
+      and "HTTP 404" in str(res_intl.get("error")), res_intl)
+check("404 capability cached unavailable (endpoint-missing conclusion)",
+      "404" in reason_intl or "not_found" in reason_intl, reason_intl)
 check("capability cached as unavailable -> can_checkin False (no repeated 404s)",
       cap_intl is False and acc_intl.can_checkin() is False and "404" in reason_intl)
 # TTL 到期后回到"未探测"，下一次调用会真的重探（活动上线即自动恢复）
