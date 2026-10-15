@@ -510,6 +510,40 @@ finally:
     import shutil as _sh
     _sh.rmtree(_td, ignore_errors=True)
 
+# fork：并发超容量排队——信号量被占时 open_upstream 等待释放而非立即放弃
+import threading as _th3
+_th3.Thread(target=lambda: (time.sleep(1.2),
+                            P._release_account_sem("queue-test-uid")),
+            daemon=True).start()
+import tempfile as _tfp3
+_td3 = _tfp3.mkdtemp(prefix="qdqueue_")
+pool3 = A.AccountPool(_td3)
+pool3.add(A.Account({"uid": "queue-test-uid", "realm": "cn",
+                     "accessToken": "dt-q", "refreshToken": "drt-q",
+                     "expiresAt": 9999999999}))
+_orig_pool3 = P.POOL
+P.POOL = pool3
+P._try_acquire_account_sem("queue-test-uid")   # 先占住（模拟活跃流）
+t0 = time.time()
+_r3 = _e3 = None
+try:
+    _r3, _u3, _ = P.open_upstream(
+        {"model": "qfmodel", "messages": [{"role": "user", "content": "hi"}],
+         "stream": False}, target_realm="cn")
+except Exception as _x3:
+    _e3 = _x3
+took3 = time.time() - t0
+check("semaphore contention: queues and serves after release (no 502)",
+      _r3 is not None and _e3 is None and 1.0 <= took3 <= 14.0,
+      {"took": round(took3, 2), "err": repr(_e3)})
+check("semaphore contention: account intact after queueing",
+      _u3 is not None and _u3.uid == "queue-test-uid"
+      and _u3.cooldown_until <= time.time(),
+      (_u3.uid if _u3 else None, round(_u3.cooldown_until - time.time(), 1) if _u3 else None))
+P.POOL = _orig_pool3
+import shutil as _sh3
+_sh3.rmtree(_td3, ignore_errors=True)
+
 # 传输层瞬时故障分类（TLS EOF 等）
 import urllib.error as _ue4
 import ssl as _ssl_for_11

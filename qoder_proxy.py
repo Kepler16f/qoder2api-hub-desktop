@@ -75,6 +75,10 @@ _account_sems = {}           # uid -> threading.Semaphore(1)
 _sem_lock = threading.Lock()
 _sem_acquired_at = {}        # uid -> acquire 时间戳（泄漏防护用）
 _SEM_STALE_TTL = 600         # 秒：信号量超过此时间视为泄漏，强制回收
+_SEM_WAIT_MAX = float(os.environ.get("QD_SEM_WAIT_MAX") or 15)
+# 秒：账号信号量全占时的排队等待预算——超并发（客户端并发数 > 账号池容量）
+# 时先短暂排队等活跃流释放，而不是立即 502（10-15 实测：agent 并发 7+ 请求
+# 打 6 账号，超发请求全撞 502）。0 = 关闭排队（恢复旧行为）。
 
 
 def _get_account_sem(uid):
@@ -4970,9 +4974,20 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
         tried.add(account.uid)
         # 信号量硬保证：该账号已有活跃流时跳过（换号继续），防两会话并发打同一号
         if not _try_acquire_account_sem(account.uid):
-            log("account %s has an active stream (semaphore) - rotating"
-                % account.uid[:8], tag="chat")
-            continue
+            # 并发超容量：该账号已有活跃流。排队等它释放（轮询复用泄漏
+            # 防护的 stale 回收），预算内抢到就继续用；超时才换号/放弃。
+            waited = 0.0
+            while waited < _SEM_WAIT_MAX:
+                time.sleep(0.3)
+                waited += 0.3
+                if _try_acquire_account_sem(account.uid):
+                    log("account %s freed after %.1fs of queueing - serving"
+                        % (account.uid[:8], waited), tag="chat")
+                    break
+            else:
+                log("account %s busy for %.0fs (queue budget spent) - rotating"
+                    % (account.uid[:8], waited), level="WARN", tag="chat")
+                continue
         _sem_held = account.uid
         # 身份相关的 aliyun_user_type 需要真实账号
         body_obj["aliyun_user_type"] = account.user_type or \
