@@ -943,6 +943,42 @@ for item in P.sse_with_heartbeat(_one_gen(), _sent4.append, interval=0,
 check("heartbeat: interval=0 disables (pure pass-through)",
       _got4 == [b"data: only\n\n"] and _sent4 == [], (_got4, _sent4))
 
+# fork：上游 200 后零字节看门狗（2026-10-16 13:11-13:21 实测：57 万 token
+# xhigh 流被上游接受后永不出数据，900s 旧上限远大于客户端 5 分钟超时）。
+import threading as _th5
+_sent5, _raised5 = [], None
+
+
+def _silent_gen():
+    _th5.Event().wait(5)      # 模拟上游 200 后永不发数据也不关流
+    yield b"data: never\n\n"
+
+
+try:
+    for _ in P.sse_with_heartbeat(_silent_gen(), _sent5.append,
+                                  interval=0.05, idle_limit=0.25):
+        pass
+except Exception as exc:
+    _raised5 = exc
+check("watchdog: silent upstream raises TimeoutError",
+      isinstance(_raised5, TimeoutError) and "no data" in str(_raised5),
+      repr(_raised5))
+check("watchdog: keepalives kept flowing while upstream silent",
+      len(_sent5) >= 2, len(_sent5))
+check("watchdog: UPSTREAM_IDLE_MAX default 180s + env override hook",
+      P.UPSTREAM_IDLE_MAX == 180.0
+      and 'os.environ.get("QD_UPSTREAM_IDLE_MAX"' in _src15,
+      P.UPSTREAM_IDLE_MAX)
+check("watchdog: both streaming pumps wired to idle_limit=UPSTREAM_IDLE_MAX",
+      _src15.count("idle_limit=UPSTREAM_IDLE_MAX") >= 2,
+      _src15.count("idle_limit=UPSTREAM_IDLE_MAX"))
+check("watchdog: stall rotation on TimeoutError present in both pumps",
+      _src15.count("stall_retries < 1") >= 2,
+      _src15.count("stall_retries < 1"))
+check("watchdog: pump error path no longer assumes .status (TimeoutError safe)",
+      'getattr(exc, "status", None) or 504' in _src15
+      and 'getattr(pump_exc, "status", None) or 504' in _src15)
+
 # 行为：内容审核信封 -> 一次都不重开（open_upstream 不被再次调用）并上抛
 class _DiErrResp(object):
     def __iter__(self):

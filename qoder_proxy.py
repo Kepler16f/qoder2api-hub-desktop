@@ -70,6 +70,14 @@ _SEM_WAIT_MAX = float(os.environ.get("QD_SEM_WAIT_MAX") or 60)
 # 时先短暂排队等活跃流释放，而不是立即 502（10-15 实测：agent 并发 7+ 请求
 # 打 6 账号，超发请求全撞 502）。0 = 关闭排队（恢复旧行为）。
 
+UPSTREAM_IDLE_MAX = float(os.environ.get("QD_UPSTREAM_IDLE_MAX") or 180)
+# 秒：上游"HTTP 200 后零字节"看门狗（sse_with_heartbeat 的 idle_limit）。
+# 实测（2026-10-16 13:11-13:21）：~57 万 token 的 xhigh 流被上游接受后
+# 永远不出数据（调度饿死/静默丢弃），网关默认 900s 空闲上限远大于客户端
+# 5 分钟回合超时 → 客户端"Turn execution failed reason=unknown"反复重试。
+# 合法首字延迟实测 40-71s，180s 留足余量；超时后换号重开一次（见泵循环
+# 的 TimeoutError 分支）。0 = 关闭看门狗（恢复 900s 旧行为）。
+
 
 def _get_account_sem(uid):
     with _sem_lock:
@@ -181,7 +189,9 @@ from pathlib import Path
 # 10-16：.1_re = 移除并发分散（spread 与信号量叠加会把号全堵死）；号忙
 # 立刻换号扫、全忙才末位排队。
 # 10-16：.2_upstream = 并入上游 v1.4.1（issue #33 单块 dict 图像内容修复）。
-VERSION = "2026.10.16.2_upstream"
+# .3_re = 上游静默看门狗：200 后零数据 180s（QD_UPSTREAM_IDLE_MAX）即换号
+# 重开一次，超限以错误帧收尾；修"Turn execution failed reason=unknown"。
+VERSION = "2026.10.16.3_re"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -8313,6 +8323,7 @@ class Handler(BaseHTTPRequestHandler):
                 # （access log 记 200 + 业务错 418 即此形态）。只要还没向
                 # 客户端写出任何上游字节，就重开上游再试。
                 attempts = 0
+                stall_retries = 0     # 上游 200 后静默的换号重试（只做一次）
                 cur = upstream
                 pump_exc = None
                 try:
@@ -8330,7 +8341,8 @@ class Handler(BaseHTTPRequestHandler):
                             inner = _count_src(
                                 sse_with_heartbeat(
                                     iter_inner_sse(cur, holder=holder),
-                                    self._sse_write))
+                                    self._sse_write,
+                                    idle_limit=UPSTREAM_IDLE_MAX or None))
                             for frame in stream_responses_events(inner, model, holder):
                                 if first_ms is None:
                                     first_ms = int((time.time() - t_start) * 1000)
@@ -8349,6 +8361,38 @@ class Handler(BaseHTTPRequestHandler):
                                          key_id=self._key_id_for_usage(),
                                          realm_reason=usage_ctx.get("realm_reason", ""))
                             return
+                        except TimeoutError as exc:
+                            # 上游 200 后零字节看门狗（同 chat 泵）：未消费
+                            # 任何上游数据行时换号重开一次。
+                            if consumed.get("n", 0) == 0 and stall_retries < 1:
+                                stall_retries += 1
+                                log("upstream stalled (no data %.0fs) on "
+                                    "'%s' model '%s' - rotating (responses)"
+                                    % (UPSTREAM_IDLE_MAX, account.uid[:8],
+                                       model), level="WARN", tag="chat")
+                                try:
+                                    # 必须用转换后的 chat 请求体重开：原始
+                                    # Responses 体的会话在 input 字段里，而
+                                    # build_qoder_body 只读 messages -> 空会话。
+                                    cur2, account, _ = open_upstream(
+                                        chat_req, session_key=session_key,
+                                        target_realm=req_realm,
+                                        usage_ctx=usage_ctx)
+                                except Exception as rex:
+                                    log("responses stall reopen failed: %s"
+                                        % str(rex)[:160], level="WARN",
+                                        tag="chat")
+                                    pump_exc = exc
+                                    break
+                                if cur is not upstream:
+                                    try:
+                                        cur.close()
+                                    except Exception:
+                                        pass
+                                cur = cur2
+                                continue
+                            pump_exc = exc
+                            break
                         except UpstreamStatus as exc:
                             _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
                             # 控制帧（response.created 等）先于数据，不能算
@@ -8391,17 +8435,22 @@ class Handler(BaseHTTPRequestHandler):
                         except Exception:
                             pass
                 if pump_exc is not None:
-                    record_error(model, pump_exc.status, pump_exc.detail,
+                    # pump_exc 可能是 UpstreamStatus 也可能是 TimeoutError
+                    # （上游静默看门狗）——统一取属性，防二次 AttributeError。
+                    status = getattr(pump_exc, "status", None) or 504
+                    detail = getattr(pump_exc, "detail", None) \
+                        or str(pump_exc)[:200]
+                    record_error(model, status, detail,
                                  elapsed_ms=int((time.time() - t_start) * 1000))
                     msg, _ = friendly_upstream_error(
-                        _to_int_status(pump_exc.status), pump_exc.detail)
+                        _to_int_status(status), detail)
                     log("responses upstream status %s: %s"
-                        % (pump_exc.status, msg[:200]), level="ERROR",
+                        % (status, msg[:200]), level="ERROR",
                         tag="chat")
                     # Responses 协议靠终态事件收尾：只关流会让客户端一直等。
                     try:
                         self._sse_write(_responses_failed_frame(
-                            holder, _to_int_status(pump_exc.status), msg))
+                            holder, _to_int_status(status), msg))
                     except Exception:
                         pass
                     self._sse_end()
@@ -8591,6 +8640,7 @@ class Handler(BaseHTTPRequestHandler):
                 # 流内信封重试（同上：200 建流后信封投 418 的形态），仅在
                 # 尚未向客户端写出任何上游字节时重开。
                 attempts = 0
+                stall_retries = 0     # 上游 200 后静默的换号重试（只做一次）
                 cur = upstream
                 pump_exc = None
                 try:
@@ -8600,7 +8650,8 @@ class Handler(BaseHTTPRequestHandler):
                                     recover_leaked_tool_calls(
                                         iter_inner_sse(cur, holder=holder),
                                         allowed_names=_tool_names_from_payload(payload)),
-                                    self._sse_write):
+                                    self._sse_write,
+                                    idle_limit=UPSTREAM_IDLE_MAX or None):
                                 if first_ms is None:
                                     first_ms = int((time.time() - t_start) * 1000)
                                 emitted = True
@@ -8620,6 +8671,38 @@ class Handler(BaseHTTPRequestHandler):
                                          key_id=self._key_id_for_usage(),
                                          realm_reason=usage_ctx.get("realm_reason", ""))
                             return
+                        except TimeoutError as exc:
+                            # 上游 200 后长时间零字节（调度饿死/静默丢弃，
+                            # 见 UPSTREAM_IDLE_MAX 注释）：未向客户端输出过
+                            # 上游字节时换号重开一次；否则只能以错误帧收尾。
+                            if not emitted and stall_retries < 1:
+                                stall_retries += 1
+                                log("upstream stalled (no data %.0fs) on "
+                                    "'%s' model '%s' - rotating"
+                                    % (UPSTREAM_IDLE_MAX, account.uid[:8],
+                                       model), level="WARN", tag="chat")
+                                try:
+                                    # 亲和绑定的号此刻被自己占着（信号量），
+                                    # open_upstream 会自然轮转到其他号。
+                                    cur2, account, _ = open_upstream(
+                                        payload, session_key=session_key,
+                                        target_realm=req_realm,
+                                        usage_ctx=usage_ctx)
+                                except Exception as rex:
+                                    log("chat stall reopen failed: %s"
+                                        % str(rex)[:160], level="WARN",
+                                        tag="chat")
+                                    pump_exc = exc
+                                    break
+                                if cur is not upstream:
+                                    try:
+                                        cur.close()
+                                    except Exception:
+                                        pass
+                                cur = cur2
+                                continue
+                            pump_exc = exc
+                            break
                         except UpstreamStatus as exc:
                             _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
                             if should_retry_envelope(exc, emitted, attempts):
@@ -8658,12 +8741,17 @@ class Handler(BaseHTTPRequestHandler):
                 if pump_exc is not None:
                     exc = pump_exc
                     wall = int((time.time() - t_start) * 1000)
-                    record_error(model, exc.status, exc.detail, elapsed_ms=wall)
+                    # pump_exc 可能是 UpstreamStatus（有 status/detail）也可能是
+                    # TimeoutError（上游静默看门狗）等普通异常——统一取属性，
+                    # 避免 504 路径上 AttributeError 把线程悄悄带走（无日志）。
+                    status = getattr(exc, "status", None) or 504
+                    detail = getattr(exc, "detail", None) or str(exc)[:200]
+                    record_error(model, status, detail, elapsed_ms=wall)
                     msg, etype = friendly_upstream_error(
-                        _to_int_status(exc.status), exc.detail)
+                        _to_int_status(status), detail)
                     err = json.dumps({"error": {
                         "message": msg, "type": etype,
-                        "code": exc.status}}, ensure_ascii=False)
+                        "code": status}}, ensure_ascii=False)
                     try:
                         self._sse_write(("data: %s\n\n" % err).encode("utf-8"))
                         self._sse_write(b"data: [DONE]\n\n")
