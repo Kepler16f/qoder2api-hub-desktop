@@ -1,7 +1,7 @@
 # Qoder2API-Hub Desktop — Qoder 双区多账号网关 · 开箱即用桌面客户端
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-1.0.3_R-2496ED?style=flat-square" alt="Version 1.0.3_R">
+  <img src="https://img.shields.io/badge/Release-1.0.4_R-2496ED?style=flat-square" alt="Version 1.0.4_R">
   <img src="https://img.shields.io/badge/Desktop-Win_x64_·_Win_ARM64_·_macOS_·_Linux-8A2BE2?style=flat-square" alt="Desktop Platforms">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
@@ -548,6 +548,12 @@ python _verify_models.py --base http://127.0.0.1:8790
 - **2026.10.15.6_re · 信号量排队**：客户端并发超过账号池容量时（实测：agent 并发 7+ 请求打 6 账号全撞 502），`open_upstream` 改为对被占账号**排队等待**（最多 15 秒，`QD_SEM_WAIT_MAX` 可调，0 关闭），活跃流释放即服务；超时才换号。
 - **2026.10.15.7_upstream · 上游 v1.4.0**：**智能体一键配置**——看板新页「智能体配置」（Claude Code / Codex / OpenCode / DSH / Crush 五客户端本机探测、文本级增量编辑只改 qoder-proxy 段、备份还原与事务写入、`GET /agents` 等路由仅回环 + 独立 CLI）；**PR #30**——`normalize_tools()` 收口进 `build_qoder_body`，/v1/responses 与 Anthropic 入口的扁平工具统一嵌套化（修复 400 `'function' is a required property`）。
 - CI 适配：上游 tag==VERSION 断言按双版本线调整（桌面 `_R` tag 跳过对比）。
+
+### v1.0.4_R — 桌面版：随网关 2026.10.16.1–2 发布
+
+随上一条目（网关 2026.10.16.1–2：信号量机制重写 + 上游 v1.4.1）发布的桌面版——信号量泄漏修复（流结束必释放、回收 TTL 缩至 120s）、
+图像输入兼容修复（issue #33，三入口 dict content 按单元素列表）、智能体一键配置看板页（v1.4.0）随本版首次搭载。
+发布说明见 [Releases](https://github.com/Kepler16f/qoder2api-hub-desktop/releases/tag/v1.0.4_R)。
 
 ### 网关 2026.10.16.1–2 — 排队重写 + 并入上游 v1.4.1
 
