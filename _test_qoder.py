@@ -979,6 +979,19 @@ check("watchdog: pump error path no longer assumes .status (TimeoutError safe)",
       'getattr(exc, "status", None) or 504' in _src15
       and 'getattr(pump_exc, "status", None) or 504' in _src15)
 
+# fork：chat completions 流式路径接预连接心跳（2026-10-16 实测：Zcode 经
+# dsml-proxy(8791) 转发，其对上游读超时 ~8.5s < 大请求建连 13-26s → 必掐；
+# 头先发出+连接期心跳后中间层不会再超时）。
+check("pre-connect heartbeat wired into /v1/chat/completions stream path",
+      _src15.count("self._open_upstream_with_heartbeat(") >= 2,
+      _src15.count("self._open_upstream_with_heartbeat("))
+check("_sse_begin is idempotent (no double header on heartbeat path)",
+      'if getattr(self, "_chunked", False):\n            return' in _src15)
+check("pre-connect heartbeat aborts cleanly on client disconnect",
+      'aborted["v"] = True' in _src15
+      and _src15.count("aborted[\"v\"]") >= 2,
+      _src15.count('aborted["v"]'))
+
 # 行为：内容审核信封 -> 一次都不重开（open_upstream 不被再次调用）并上抛
 class _DiErrResp(object):
     def __iter__(self):

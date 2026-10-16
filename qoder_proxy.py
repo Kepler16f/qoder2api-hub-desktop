@@ -191,7 +191,10 @@ from pathlib import Path
 # 10-16：.2_upstream = 并入上游 v1.4.1（issue #33 单块 dict 图像内容修复）。
 # .3_re = 上游静默看门狗：200 后零数据 180s（QD_UPSTREAM_IDLE_MAX）即换号
 # 重开一次，超限以错误帧收尾；修"Turn execution failed reason=unknown"。
-VERSION = "2026.10.16.3_re"
+# .4_re = 预连接心跳接入 chat completions 流式路径：Zcode 经 dsml-proxy(8791)
+# 转发、其对上游读超时 ~8.5s < 大请求建连 13-26s，头先发出+连接期心跳后
+# 中间层不再掐流（看门狗只覆盖建流之后，覆盖不到建连阶段的真凶）。
+VERSION = "2026.10.16.4_re"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -6716,8 +6719,11 @@ class Handler(BaseHTTPRequestHandler):
         之前用 `Connection: close` + 裸写字节：客户端（连接池型 harness）
         会把该连接视为可复用，下一次请求落在已半关闭的连接上，表现为
         "一直重连 / 连不上"。改为 chunked 后，流结束发 0 长度的终止块，
-        连接保持 keep-alive，可安全复用。
+        连接保持 keep-alive，可安全复用。幂等：预连接心跳路径会先调一次，
+        `with upstream:` 块内不再重复发头（重复 send_response 会撕裂流）。
         """
+        if getattr(self, "_chunked", False):
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -6755,12 +6761,21 @@ class Handler(BaseHTTPRequestHandler):
         import queue as _q
         box = _q.Queue()
         ctx = {}
+        aborted = {"v": False}
 
         def _open():
             try:
                 resp, acc, enc = open_upstream(
                     payload, session_key=session_key,
                     target_realm=target_realm, usage_ctx=usage_ctx)
+                if aborted["v"]:
+                    # 客户端已在建连期间断开：立即关流（SemGuard 释放信号量）
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                    box.put(("gone", None, None, None))
+                    return
                 box.put(("ok", resp, acc, enc))
             except BaseException as exc:
                 box.put(("err", exc))
@@ -6772,15 +6787,35 @@ class Handler(BaseHTTPRequestHandler):
                 kind = box.get(timeout=heartbeat_interval)
                 break
             except _q.Empty:
-                self._sse_write(self._HEARTBEAT_CHUNK)
+                try:
+                    self._sse_write(self._HEARTBEAT_CHUNK)
+                except (BrokenPipeError, ConnectionResetError,
+                        ConnectionAbortedError, OSError):
+                    # 客户端在建连期间断开：标记中止，等 open_upstream 收尾
+                    # （成功则立即 close 释放信号量），本请求就此结束。
+                    aborted["v"] = True
+                    kind = box.get()
+                    if kind[0] == "ok":
+                        try:
+                            kind[1].close()
+                        except Exception:
+                            pass
+                    return None, None, None
         if kind[0] == "ok":
             return kind[1], kind[2], kind[3]
         exc = kind[1]
         # 错误帧：以 SSE data 事件投递（HTTP 头已发，无法再改状态码）
         try:
-            code = exc.code if hasattr(exc, "code") else 502
+            if isinstance(exc, RateLimited):
+                code = 429
+            else:
+                code = exc.code if hasattr(exc, "code") else 502
             detail = getattr(exc, "qoder_detail", "") or str(exc)[:200]
             msg, etype = friendly_upstream_error(code, detail)
+            if isinstance(exc, RateLimited) and getattr(exc, "wait", None):
+                msg = ("%s; retry in %ds" % (msg, int(exc.wait))) if "retry" \
+                    not in msg.lower() else msg
+            record_error(payload.get("model") or "?", code, detail)
             log("pre-connect upstream error on '%s': HTTP %s %s"
                 % (payload.get("model", "?"), code, detail[:120]),
                 level="WARN", tag="chat")
@@ -8599,12 +8634,31 @@ class Handler(BaseHTTPRequestHandler):
             blocked = self._model_precheck(model, req_realm)
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
-            upstream, account, _ = open_upstream(payload, session_key=session_key,
-                                                 target_realm=req_realm,
-                                                 usage_ctx=usage_ctx)
+            if want_stream:
+                # 流式：先发 SSE 头 + 连接期心跳（同 /v1/responses）。
+                # 背景（2026-10-16 实测）：Zcode 经 dsml-proxy(8791) 转发到本
+                # 网关，dsml-proxy 对上游的读超时仅 ~8.5s；50 万 token 的
+                # xhigh 请求建连要 13-26s（压缩+选号+上游建连）——不先发头
+                # 必被中间层掐死，表现为 Zcode "Turn execution failed
+                # reason=unknown"，且网关侧零错误日志（流继续跑给已死的
+                # 客户端，BrokenPipe 后静默退出）。
+                self._sse_begin()
+                upstream, account, _ = self._open_upstream_with_heartbeat(
+                    payload, session_key=session_key,
+                    target_realm=req_realm, usage_ctx=usage_ctx)
+                if upstream is None:
+                    return  # 错误已作为 SSE 帧写入流中
+            else:
+                upstream, account, _ = open_upstream(
+                    payload, session_key=session_key,
+                    target_realm=req_realm, usage_ctx=usage_ctx)
             # #26：记录实际出口（自动路由后可能与 req_realm 不同）→ 响应头可见
             self.realm_used = usage_ctx.get("realm") or req_realm
             self.realm_reason = usage_ctx.get("realm_reason") or ""
+        except (BrokenPipeError, ConnectionResetError,
+                ConnectionAbortedError):
+            # 流式路径客户端在建连/心跳期间断开（头已发出，无事可做）
+            return
         except RateLimited as exc:
             record_error(model, 429, exc.detail[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000))
