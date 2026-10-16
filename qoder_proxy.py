@@ -57,21 +57,10 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status, UPSTREAM_OPENER)
 
 
-# 每账号"最近建流时间+所属会话"（并发分散依据）：open_upstream 成功建流时
-# 记录，永不清除、靠 60 秒窗口自然过期。
-# 为何不用计数：Counter 方案有泄漏 bug（流失败时不递减 → 全号被标忙）。
-# 为何不"流结束即清除"：两个会话的请求常常**交替到达**（一个流结束后另一个
-# 才开始，时间不重叠），只跳"当前活跃流"不触发 → 两会话仍挤同一账号。
-# 为何要带 session_key：只跳过**别的会话**最近用过的账号——若把自己几秒前
-# 用过的号也跳掉，每轮都换号，会话亲和失效、上游 prompt 缓存全作废（大
-# 会话代价极高）。同会话继续用同一号，不同会话才互相错开。
-_stream_last_used = {}       # uid -> (最近建流时间戳, session_key)
-STREAM_SPREAD_WINDOW = 60    # 秒：此窗口内被**其他会话**用过的账号优先跳过
-STREAM_STALE_TTL = 300       # 秒：清理字典条目的上限（内存回收，非逻辑依赖）
-
-# 每账号信号量（硬保证）：同一账号同时只有一条上游流。时间戳是"尽量分散"，
-# 信号量是"绝不并发"——两个会话同时打同一个号时第二个会被上游掐。信号量
-# 在 open_upstream 选号时非阻塞 acquire，流结束（record_usage）时 release。
+# 每账号信号量（硬保证）：同一账号同时只有一条上游流。信号量是"绝不并发"——
+# 两个会话同时打同一个号时第二个会被上游掐。选号策略（open_upstream）：
+# 号忙时不原地等待，立刻扫下一个号；全部号都忙才做一次有界排队（等任一
+# 活跃流释放）。信号量在选号时非阻塞 acquire，流结束时 release。
 _account_sems = {}           # uid -> threading.Semaphore(1)
 _sem_lock = threading.Lock()
 _sem_acquired_at = {}        # uid -> acquire 时间戳（泄漏防护用）
@@ -169,27 +158,6 @@ class _SemGuardResponse(object):
         return getattr(self._resp, name)
 
 
-def _spread_skip_accounts(realm, session_key, now, all_same_realm,
-                          window=None):
-    """并发分散：返回本次请求应跳过的账号集合。
-
-    跳过"最近 window 秒内被**其他会话**建过流"的账号（本会话自己用过的不跳，
-    保住会话亲和与上游 prompt 缓存——大会话换号的缓存作废代价极高）。
-    若跳过集会吃掉本区全部可用号，则返回空集（退回正常轮转，保证有号可用）。
-    session_key 为 None（超长会话释放亲和/亲和关闭）时，所有其他会话的记录都
-    算"别人用过"——不把 None==None 当作同一会话。
-    """
-    if not all_same_realm or len(all_same_realm) <= 1:
-        return set()
-    w = STREAM_SPREAD_WINDOW if window is None else window
-    recent = {uid for uid, (ts, sk) in _stream_last_used.items()
-              if now - ts < w and uid in all_same_realm
-              and not (session_key and sk == session_key)}
-    if recent >= all_same_realm:
-        return set()
-    return recent
-
-
 def _flush_dns_cache():
     """清 Windows DNS Client 缓存（负缓存会遮蔽 TUN/代理恢复后的解析）。
 
@@ -210,7 +178,9 @@ from pathlib import Path
 # 合并手术（传输收口/冲突融合）→ .5_re。（发版日 10-15，勿沿用工作开始日的旧日期）
 # 当日第二批：.6_re = 信号量排队优化（超并发等待而非 502）；
 # .7_upstream = 并入上游 v1.4.0（智能体一键配置 + PR #30 工具嵌套修复）。
-VERSION = "2026.10.15.7_upstream"
+# 10-16：.1_re = 移除并发分散（spread 与信号量叠加会把号全堵死）；号忙
+# 立刻换号扫、全忙才末位排队。
+VERSION = "2026.10.16.1_re"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -5004,26 +4974,17 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
     queue_wait_spent = 0        # 10605 原地等待累计（秒），上限 QUEUE_WAIT_TOTAL_MAX
     overflow_retried = False    # 上游超限后的加压重建重试（只做一次）
 
-    # 并发分散：跳过其他会话最近用过的账号（见 _spread_skip_accounts）。
-    if POOL and len(POOL.accounts) > 1:
-        now = time.time()
-        # 顺带回收陈旧条目（纯内存卫生，逻辑不依赖）
-        for uid in [u for u, (ts, _sk) in _stream_last_used.items()
-                    if now - ts > STREAM_STALE_TTL]:
-            _stream_last_used.pop(uid, None)
-        skip = _spread_skip_accounts(
-            realm, session_key, now,
-            {a.uid for a in POOL.accounts
-             if a.realm == realm and a.enabled})
-        if skip:
-            tried |= skip
-            log("concurrency spread: skipping %d account(s) used by other "
-                "sessions %s" % (len(skip), sorted(u[:8] for u in skip)),
-                tag="chat")
+    # NOTE: 并发分散（concurrency spread）已移除。它与信号量叠加时会把号
+    # 全堵死（spread 跳几个 + 信号量占几个 = 无号可用 → 60s 空转后 503）。
+    # 现在的策略：号忙立刻换下一个扫，全部忙才末位排队等释放——忙等只
+    # 发生在"真超容量"时，空闲号永远不会被跳过。
 
     # 额外 +2 次迭代预算：只供"短错误冷却等待续上"使用（正常轮换仍由
     # tried 集合自然终止）。
-    _sem_held = None   # 当前持有信号量的账号（成功时由 record_usage 释放）
+    _sem_held = None        # 当前持有信号量的账号（成功路径由包装器接管释放）
+    sem_busy_uids = []      # 扫描中遇到"信号量被占"的账号（全忙时末位排队用）
+    sem_queued = False      # 末位排队只做一轮：预算内没等到就放弃，不反复耗
+    sem_preheld = False     # 排队阶段已预取信号量（跳过主路径的重复 acquire）
     for _ in range(total + 2):
         # 换号前释放上一号的信号量（错误路径的兜底；成功路径已置 None）
         if _sem_held:
@@ -5032,38 +4993,61 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
         account = POOL.pick_for_session(realm=realm, session_key=session_key,
                                         exclude=tried, model=model) if POOL else None
         if account is None:
-            if not waited_cool:
-                wait = _short_error_cooldown_wait(realm, model,
-                                                  exclude=tried)
-                if wait > 0:
-                    waited_cool = True
-                    log("accounts in short error-cooldown for '%s' "
-                        "(%.1fs left) - waiting instead of failing"
-                        % (model, wait), level="WARN", tag="chat")
-                    time.sleep(wait + 0.25)
-                    continue     # 冷却到期后重新 pick，服务该请求
-            break
+            # 没号可换。若扫到的号全是"信号量被占"（并发超容量而非故障），
+            # 对忙号清单做一次有界排队：每 0.3s 轮询全部忙号，谁先释放就用
+            # 谁（等最短剩余流，而不是赌清单里第一个）；预算花光才放弃。
+            # 从清单取号要复检 ready：排队期间账号可能进冷却/被禁用。
+            if sem_busy_uids and not sem_queued:
+                sem_queued = True
+                waited = 0.0
+                while account is None and waited < _SEM_WAIT_MAX:
+                    time.sleep(0.3)
+                    waited += 0.3
+                    for uid in sem_busy_uids:
+                        if not _try_acquire_account_sem(uid):
+                            continue
+                        cand = POOL.get(uid)
+                        if cand is not None and cand.ready(model=model):
+                            log("account %s freed after %.1fs of queueing "
+                                "- serving" % (uid[:8], waited), tag="chat")
+                            account = cand
+                            tried.add(uid)
+                            _sem_held = uid
+                            sem_preheld = True
+                        else:
+                            _release_account_sem(uid)
+                        break
+                if account is None:
+                    log("all %d account(s) busy, queue budget (%.0fs) spent "
+                        "- giving up" % (len(sem_busy_uids), _SEM_WAIT_MAX),
+                        level="WARN", tag="chat")
+            if account is None:
+                if not waited_cool:
+                    wait = _short_error_cooldown_wait(realm, model,
+                                                      exclude=tried)
+                    if wait > 0:
+                        waited_cool = True
+                        log("accounts in short error-cooldown for '%s' "
+                            "(%.1fs left) - waiting instead of failing"
+                            % (model, wait), level="WARN", tag="chat")
+                        time.sleep(wait + 0.25)
+                        continue     # 冷却到期后重新 pick，服务该请求
+                break
         if account.realm != realm:
             if session_key and POOL:
                 POOL.affinity.unbind(session_key)
             continue
         tried.add(account.uid)
-        # 信号量硬保证：该账号已有活跃流时跳过（换号继续），防两会话并发打同一号
-        if not _try_acquire_account_sem(account.uid):
-            # 并发超容量：该账号已有活跃流。排队等它释放（轮询复用泄漏
-            # 防护的 stale 回收），预算内抢到就继续用；超时才换号/放弃。
-            waited = 0.0
-            while waited < _SEM_WAIT_MAX:
-                time.sleep(0.3)
-                waited += 0.3
-                if _try_acquire_account_sem(account.uid):
-                    log("account %s freed after %.1fs of queueing - serving"
-                        % (account.uid[:8], waited), tag="chat")
-                    break
-            else:
-                log("account %s busy for %.0fs (queue budget spent) - rotating"
-                    % (account.uid[:8], waited), level="WARN", tag="chat")
-                continue
+        # 信号量硬保证：同账号绝不并发两条上游流。号忙时不再原地等 60s，
+        # 记入忙号清单、立刻换下一个号；全部号扫完仍忙时才在"没号可换"
+        # 分支统一排队。原先"第一个忙号干等 60s"会让后到的请求卡死在
+        # 排队上，即便池子里还有空闲号。
+        if sem_preheld:
+            sem_preheld = False
+        elif not _try_acquire_account_sem(account.uid):
+            if account.uid not in sem_busy_uids:
+                sem_busy_uids.append(account.uid)
+            continue
         _sem_held = account.uid
         # 身份相关的 aliyun_user_type 需要真实账号
         body_obj["aliyun_user_type"] = account.user_type or \
@@ -5091,7 +5075,6 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
                                              data=encoded.encode("utf-8"),
                                              method="POST", headers=headers)
                 resp = UPSTREAM_OPENER.open(req, timeout=600)
-                _stream_last_used[account.uid] = (time.time(), session_key)
                 break
             except urllib.error.HTTPError as exc:
                 try:
@@ -5401,7 +5384,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
         "no usable account for realm '%s': all are disabled, cooling down, or expired"
         % realm)
     # NOTE: _sem_held 的信号量在每次外层循环迭代开头已释放（换号兜底），
-    # 成功路径由 record_usage 释放——此处不需要额外清理。
+    # 成功路径由 _SemGuardResponse 在 with 退出时释放——此处不需要额外清理。
 
 
 def sse_with_heartbeat(source, send, interval=None, idle_limit=None):

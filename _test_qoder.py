@@ -433,6 +433,7 @@ class _FakeResp(object):
     def __enter__(self): return self
     def __exit__(self, *a): return False
     def read(self, *a): return b"{}"
+    def close(self): pass
 
 def _urlopen_fail_once(req, timeout=None):
     _calls["n"] += 1
@@ -543,6 +544,77 @@ check("semaphore contention: account intact after queueing",
 P.POOL = _orig_pool3
 import shutil as _sh3
 _sh3.rmtree(_td3, ignore_errors=True)
+
+# fork：忙号+闲号混合——号忙必须立刻换下一个号扫（空闲号永不被跳过），
+# 而不是在第一个忙号上干等 _SEM_WAIT_MAX（"两会话打架"的根因之一）。
+_td3b = _tfp3.mkdtemp(prefix="qdsweep_")
+pool3b = A.AccountPool(_td3b)
+pool3b.add(A.Account({"uid": "sweep-busy", "realm": "cn",
+                      "accessToken": "dt-sb", "refreshToken": "drt-sb",
+                      "expiresAt": 9999999999}))
+pool3b.add(A.Account({"uid": "sweep-free", "realm": "cn",
+                      "accessToken": "dt-sf", "refreshToken": "drt-sf",
+                      "expiresAt": 9999999999}))
+_orig_pool3b = P.POOL
+_orig_opener3b = P.UPSTREAM_OPENER
+try:
+    P.POOL = pool3b
+    P.UPSTREAM_OPENER = _FakeOpener(lambda req, timeout=None: _FakeResp())
+    P._try_acquire_account_sem("sweep-busy")   # 占住第一个号（模拟活跃流）
+    t0b = time.time()
+    _r3b, _u3b, _ = P.open_upstream(
+        {"model": "qfmodel", "messages": [{"role": "user", "content": "hi"}],
+         "stream": False}, target_realm="cn")
+    took3b = time.time() - t0b
+    check("sem busy + free account: sweeps to the free one immediately",
+          _r3b is not None and _u3b is not None and _u3b.uid == "sweep-free"
+          and took3b < 5.0,
+          {"took": round(took3b, 2), "used": _u3b.uid if _u3b else None})
+    check("sem busy + free account: busy account's sem still held",
+          "sweep-busy" in P._sem_acquired_at, sorted(P._sem_acquired_at))
+    _r3b.close()   # SemGuard 释放 sweep-free 的信号量
+    check("sem busy + free account: used account's sem released on close",
+          "sweep-free" not in P._sem_acquired_at, sorted(P._sem_acquired_at))
+finally:
+    P._release_account_sem("sweep-busy")
+    P.UPSTREAM_OPENER = _orig_opener3b
+    P.POOL = _orig_pool3b
+    _sh3.rmtree(_td3b, ignore_errors=True)
+
+# fork：全部号都忙——排队预算（人为缩到 1s）耗尽后必须放弃上抛，
+# 而不是无限挂起。预算内等到释放则照常服务（上一块已覆盖）。
+_td3c = _tfp3.mkdtemp(prefix="qdgiveup_")
+pool3c = A.AccountPool(_td3c)
+pool3c.add(A.Account({"uid": "giveup-uid", "realm": "cn",
+                      "accessToken": "dt-g", "refreshToken": "drt-g",
+                      "expiresAt": 9999999999}))
+_orig_pool3c = P.POOL
+_orig_wait3c = P._SEM_WAIT_MAX
+_orig_opener3c = P.UPSTREAM_OPENER
+try:
+    P.POOL = pool3c
+    P._SEM_WAIT_MAX = 1.0
+    P.UPSTREAM_OPENER = _FakeOpener(lambda req, timeout=None: _FakeResp())
+    P._try_acquire_account_sem("giveup-uid")
+    t0c = time.time()
+    _e3c = None
+    try:
+        P.open_upstream(
+            {"model": "qfmodel",
+             "messages": [{"role": "user", "content": "hi"}],
+             "stream": False}, target_realm="cn")
+    except Exception as _x3c:
+        _e3c = _x3c
+    took3c = time.time() - t0c
+    check("all accounts busy: gives up after queue budget (~1s)",
+          _e3c is not None and 0.8 <= took3c <= 6.0,
+          {"took": round(took3c, 2), "err": repr(_e3c)[:80]})
+finally:
+    P._release_account_sem("giveup-uid")
+    P._SEM_WAIT_MAX = _orig_wait3c
+    P.UPSTREAM_OPENER = _orig_opener3c
+    P.POOL = _orig_pool3c
+    _sh3.rmtree(_td3c, ignore_errors=True)
 
 # 传输层瞬时故障分类（TLS EOF 等）
 import urllib.error as _ue4
