@@ -549,6 +549,11 @@ python _verify_models.py --base http://127.0.0.1:8790
 - **2026.10.15.7_upstream · 上游 v1.4.0**：**智能体一键配置**——看板新页「智能体配置」（Claude Code / Codex / OpenCode / DSH / Crush 五客户端本机探测、文本级增量编辑只改 qoder-proxy 段、备份还原与事务写入、`GET /agents` 等路由仅回环 + 独立 CLI）；**PR #30**——`normalize_tools()` 收口进 `build_qoder_body`，/v1/responses 与 Anthropic 入口的扁平工具统一嵌套化（修复 400 `'function' is a required property`）。
 - CI 适配：上游 tag==VERSION 断言按双版本线调整（桌面 `_R` tag 跳过对比）。
 
+### 网关 2026.10.16.1–2 — 排队重写 + 并入上游 v1.4.1
+
+- **2026.10.16.1_re · 信号量机制重写**：移除并发分散（spread 与信号量叠加会把号全堵死），号忙立刻换号扫、全忙才末位排队；信号量泄漏修复（`_SemGuardResponse` 包装确保流结束必释放、泄漏 TTL 600s→120s）。
+- **2026.10.16.2_upstream · 上游 v1.4.1**（issue #33）：单块 dict 图像内容被字符串化成文本的修复——三入口（chat/Responses/Anthropic）的 dict content 一律按单元素列表处理；+4 回归断言。
+
 ### v1.0.3_R — 桌面版：随网关 2026.10.15.1–5 发布
 
 随上一条目（网关 2026.10.15.1–5：并入上游 v1.3.5–v1.3.7）发布的桌面版——双区自动路由、
