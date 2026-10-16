@@ -689,6 +689,14 @@ python _verify_models.py --base http://127.0.0.1:8790
 - **鉴权矩阵**：有效 key 200 / 无效 key 401 / 无凭据 401 / 面板会话 200 / 未设 key 放行 200（**全部 0 次 fetch**）；
 - **边界**：空池 / `POOL=None` / 无 credits 账号 / 部分 credits 全绿。
 
+### v1.4.1
+
+**🐛 问题修复**
+
+- **图像单 part dict 形态被字符串化**（issue #33 反馈的根因）：部分客户端把单个 content part 对象直接当 content 字段（而非列表）发送——chat / Responses 两条路径的 str() 兜底会把整个图像 dict 字符串化成 Python 字面量文本放进消息正文，模型收到的是一段 {'type': 'image_url', ...} 文本，**图像从未真正到达模型**；Anthropic 桥的单块 dict 形态则被压成空文本静默吞掉。三入口全部改为「dict 当单元素列表处理」：图像照常收集、绝不 str()。附 4 条回归断言（chat dict / Responses dict / anthropic 单块 / 非 dict 兜底不变）。
+
+**验证**：全量 **29 suites / 1028 checks / 0 failed**（较 1.4.0 净增 4 条图像形态回归断言）；三入口离线复现：list / dict / anthropic 单块三种形态均正确产出 image_urls。
+
 ### v1.4.0
 
 **✨ 新增功能**

@@ -180,7 +180,8 @@ from pathlib import Path
 # .7_upstream = 并入上游 v1.4.0（智能体一键配置 + PR #30 工具嵌套修复）。
 # 10-16：.1_re = 移除并发分散（spread 与信号量叠加会把号全堵死）；号忙
 # 立刻换号扫、全忙才末位排队。
-VERSION = "2026.10.16.1_re"
+# 10-16：.2_upstream = 并入上游 v1.4.1（issue #33 单块 dict 图像内容修复）。
+VERSION = "2026.10.16.2_upstream"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -3815,7 +3816,13 @@ def _flatten_content_text(content):
         return "", []
     if isinstance(content, str):
         return content, []
-    if not isinstance(content, list):
+    if isinstance(content, dict):
+        # 单 part 形态（部分客户端把单个 part 对象直接当 content 而非列表）：
+        # 当单元素列表处理，绝不 str() —— 否则图像 dict 被字符串化成 Python
+        # 字面量文本，模型收到的是一段 {'type': 'image_url', ...}，
+        # 图像从未真正到达模型（issue #33 的反馈根因）。
+        content = [content]
+    elif not isinstance(content, list):
         return str(content), []
     texts, images = [], []
     for piece in content:
@@ -5799,7 +5806,10 @@ def _flatten_content(content):
         return ""
     if isinstance(content, str):
         return content
-    if not isinstance(content, list):
+    if isinstance(content, dict):
+        # 单 part 形态当单元素列表（同 _flatten_content_text 的 dict 修复）
+        content = [content]
+    elif not isinstance(content, list):
         return str(content)
     texts, parts = [], []
     for piece in content:
