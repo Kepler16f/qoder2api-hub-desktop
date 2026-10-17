@@ -194,7 +194,10 @@ from pathlib import Path
 # .4_re = 预连接心跳接入 chat completions 流式路径：Zcode 经 dsml-proxy(8791)
 # 转发、其对上游读超时 ~8.5s < 大请求建连 13-26s，头先发出+连接期心跳后
 # 中间层不再掐流（看门狗只覆盖建流之后，覆盖不到建连阶段的真凶）。
-VERSION = "2026.10.16.4_re"
+# 10-17：.1_re = Qwen 系模型 max_input_tokens 180000 -> 1000000（官方
+# context_config 本就声明 1M 档；实测 Qwen3.8-Flash 输入 883298 成功、
+# 总顶 ~88.4 万；目录快照与内嵌副本同步，Kimi/GLM/DeepSeek 等不动）。
+VERSION = "2026.10.17.1_re"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -2302,6 +2305,12 @@ def merge_catalog(primary, realm=None):
             # 值抹掉——只用有值字段做增量覆盖。
             base.update({k: v for k, v in meta.items() if v is not None})
             merged[mid] = base
+            # 动态接口的 maxInputTokens 也常标 180000（与官方 context_config
+            # 的 1M 档自相矛盾，实测 Flash 输入 88 万成功）——合并在加载侧
+            # 已做"1M 档拉齐"，这里对动态值同样应用，防覆盖回旧值。
+            _align = getattr(qoder_catalog, "_align_context_floor", None)
+            if _align:
+                _align([merged[mid]])
         elif mid not in merged:
             merged[mid] = {}
     if primary:

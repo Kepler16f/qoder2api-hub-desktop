@@ -24,7 +24,7 @@
     "is_default": false,
     "is_new": true,
     "price_factor": 0.5,
-    "max_input_tokens": 180000,
+    "max_input_tokens": 1000000,
     "minimal_version": {
       "vsc": "999.999.999"
     },
@@ -89,7 +89,7 @@
     "is_new": true,
     "price_factor": 0.0,
     "original_price_factor": 0.1,
-    "max_input_tokens": 180000,
+    "max_input_tokens": 1000000,
     "minimal_version": {
       "vsc": "999.999.999"
     },
@@ -133,7 +133,7 @@
     "is_default": false,
     "is_new": true,
     "price_factor": 0.5,
-    "max_input_tokens": 180000,
+    "max_input_tokens": 1000000,
     "is_sensitive": true,
     "is_editable": true,
     "context_config": {
@@ -190,7 +190,7 @@
     "is_default": false,
     "is_new": true,
     "price_factor": 0.1,
-    "max_input_tokens": 180000,
+    "max_input_tokens": 1000000,
     "is_sensitive": true,
     "is_editable": true,
     "context_config": {
@@ -247,7 +247,7 @@
     "is_default": false,
     "is_new": true,
     "price_factor": 0.1,
-    "max_input_tokens": 180000,
+    "max_input_tokens": 1000000,
     "is_sensitive": true,
     "context_config": {
       "1M": {

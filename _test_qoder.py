@@ -1216,8 +1216,8 @@ check("model_config key", body["model_config"]["key"] == "qmodel_38max")
 check("model_config display_name from official catalog",
       body["model_config"]["display_name"] == "Qwen3.8-Max",
       body["model_config"]["display_name"])
-check("model_config ctx from official catalog (cn 180000)",
-      body["model_config"]["max_input_tokens"] == 180000)
+check("model_config ctx from official catalog (cn 1000000)",
+      body["model_config"]["max_input_tokens"] == 1000000)
 check("model_config is_vl from official catalog",
       body["model_config"]["is_vl"] is True)
 check("chat_context.text follows latest user prompt",

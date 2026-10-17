@@ -321,7 +321,7 @@ _INTL_JSON = r'''
     "is_default": true,
     "is_new": true,
     "price_factor": 0.2,
-    "max_input_tokens": 180000,
+    "max_input_tokens": 1000000,
     "is_free": true,
     "is_editable": true,
     "context_config": {
@@ -383,7 +383,7 @@ _INTL_JSON = r'''
     "is_new": true,
     "price_factor": 0.0,
     "original_price_factor": 0.1,
-    "max_input_tokens": 180000,
+    "max_input_tokens": 1000000,
     "is_free": true,
     "is_editable": true,
     "context_config": {
@@ -912,7 +912,7 @@ _CN_JSON = r'''
     "is_default": false,
     "is_new": true,
     "price_factor": 0.2,
-    "max_input_tokens": 180000,
+    "max_input_tokens": 1000000,
     "minimal_version": {
       "vsc": "999.999.999"
     },
@@ -977,7 +977,7 @@ _CN_JSON = r'''
     "is_new": true,
     "price_factor": 0.0,
     "original_price_factor": 0.1,
-    "max_input_tokens": 180000,
+    "max_input_tokens": 1000000,
     "minimal_version": {
       "vsc": "999.999.999"
     },
@@ -1021,7 +1021,7 @@ _CN_JSON = r'''
     "is_default": false,
     "is_new": true,
     "price_factor": 0.1,
-    "max_input_tokens": 180000,
+    "max_input_tokens": 1000000,
     "is_sensitive": true,
     "is_editable": true,
     "context_config": {
@@ -1078,7 +1078,7 @@ _CN_JSON = r'''
     "is_default": false,
     "is_new": true,
     "price_factor": 0.04,
-    "max_input_tokens": 180000,
+    "max_input_tokens": 1000000,
     "is_sensitive": true,
     "is_editable": true,
     "context_config": {
@@ -1135,7 +1135,7 @@ _CN_JSON = r'''
     "is_default": false,
     "is_new": true,
     "price_factor": 0.1,
-    "max_input_tokens": 180000,
+    "max_input_tokens": 1000000,
     "is_sensitive": true,
     "context_config": {
       "1M": {
@@ -1549,8 +1549,32 @@ def _warn(msg):
         pass
 
 
-STATIC_INTL_MODELS = _load_snapshot("qoder_catalog_intl.json", _INTL_JSON)
-STATIC_CN_MODELS = _load_snapshot("qoder_catalog_cn.json", _CN_JSON)
+def _align_context_floor(models):
+    """官方 context_config 声明 1M 档的模型，max_input_tokens 拉齐 1000000。
+
+    官方快照自相矛盾：context_config 明确提供 1M/400K/200K 三档（1M 是能力
+    上界），max_input_tokens 却多为 180000；同族 Qwen3.7 系在 intl 快照本就
+    是 1000000。实测背书：Qwen3.8-Flash 输入 883298、DeepSeek-Flash 输入
+    979013 均成功（上游总 token 硬顶 ~88.4 万 = 1M 档 in+out 总额减输出）。
+    例外：dmodel（DeepSeek-V4-Pro）CN 快照特意标 96000 且无实测反证，保留
+    官方值。MiniMax-M2.7 的 context_config 只有 200K 档，规则自动跳过。
+    _refresh_catalog.py 重新导出快照带回旧值时，本规则在加载时再次拉齐。
+    """
+    for m in models:
+        cfg = m.get("context_config") or {}
+        has_1m = any(isinstance(c, dict) and c.get("token_count") == 1000000
+                     for c in cfg.values() if isinstance(c, dict))
+        if (has_1m and m.get("key") != "dmodel"
+                and isinstance(m.get("max_input_tokens"), int)
+                and 0 < m["max_input_tokens"] < 1000000):
+            m["max_input_tokens"] = 1000000
+    return models
+
+
+STATIC_INTL_MODELS = _align_context_floor(
+    _load_snapshot("qoder_catalog_intl.json", _INTL_JSON))
+STATIC_CN_MODELS = _align_context_floor(
+    _load_snapshot("qoder_catalog_cn.json", _CN_JSON))
 STATIC_MODELS = STATIC_CN_MODELS   # 兼容旧名
 
 # 区域独占模型（官方双区清单差集）
