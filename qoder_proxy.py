@@ -197,7 +197,7 @@ from pathlib import Path
 # 10-17：.1_re = Qwen 系模型 max_input_tokens 180000 -> 1000000（官方
 # context_config 本就声明 1M 档；实测 Qwen3.8-Flash 输入 883298 成功、
 # 总顶 ~88.4 万；目录快照与内嵌副本同步，Kimi/GLM/DeepSeek 等不动）。
-VERSION = "2026.10.17.1_re"
+VERSION = "2026.10.19.1_re"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -1365,6 +1365,74 @@ def schedule_auto_refresh(account, reason, revive=False, delay=None):
 
     threading.Thread(target=_run, name="auto-refresh", daemon=True).start()
     return True
+
+
+# ---------------------------------------------------------------------------
+# 主动令牌刷新：expires_at 临近到期（默认提前 5 分钟）就续签，不等请求撞上
+# 401/403。背景（2026-10-17 实测风暴）：短时效令牌集中到期时，同一秒进来的
+# 多个请求会先吃一轮 403（账号冷却/换号/反应式刷新要 20s+ 才追上），表现为
+# Zcode "Turn execution failed"。反应式路径保留作兜底，这里把窗口提前关掉。
+# ---------------------------------------------------------------------------
+TOKEN_REFRESH_LEAD = float(os.environ.get("QD_TOKEN_REFRESH_LEAD") or 300)
+TOKEN_REFRESH_SCAN = float(os.environ.get("QD_TOKEN_REFRESH_SCAN") or 60)
+TOKEN_REFRESH_SCAN_MIN = 30.0
+
+
+def _token_refresh_due(now=None, pool=None):
+    """返回现在就该续签的账号：enabled、知道 expires_at、且距到期 < LEAD。
+
+    已过期（exp < now）同样纳入——反应式路径只会在请求失败后才刷，主动
+    扫描器应立刻补上。expires_at 未知（<=0）的跳过（无依据判断）。
+    """
+    lead = TOKEN_REFRESH_LEAD
+    if lead <= 0:
+        return []
+    now = now if now is not None else time.time()
+    pool = pool if pool is not None else POOL
+    due = []
+    try:
+        accounts = list(pool.accounts) if pool else []
+    except Exception:
+        return []
+    for account in accounts:
+        try:
+            if not getattr(account, "enabled", True):
+                continue
+            exp = float(getattr(account, "expires_at", 0) or 0)
+            if exp <= 0:
+                continue
+            if exp - now <= lead:
+                due.append(account)
+        except Exception:
+            continue
+    return due
+
+
+def _token_refresh_tick(now=None, pool=None):
+    """一轮主动刷新：对到期窗口内的账号复用 schedule_auto_refresh 节流。
+
+    delay=0：临近到期就立即续签，不等 20s。返回本轮真正排上的条数。
+    """
+    count = 0
+    for account in _token_refresh_due(now=now, pool=pool):
+        if schedule_auto_refresh(account, "proactive expiry", delay=0):
+            count += 1
+    if count:
+        log("proactive token refresh: %d account(s) inside expiry window, "
+            "renewing now (lead=%.0fs)" % (count, TOKEN_REFRESH_LEAD),
+            tag="accounts")
+    return count
+
+
+def _token_refresh_loop():
+    """常驻扫描线程（main() 启动）。异常永不杀死循环。"""
+    while True:
+        try:
+            time.sleep(max(TOKEN_REFRESH_SCAN_MIN, TOKEN_REFRESH_SCAN))
+            _token_refresh_tick()
+        except Exception as exc:
+            log("proactive token refresh loop error: %s" % str(exc)[:160],
+                level="WARN", tag="accounts")
 
 
 def load_persisted_realm():
@@ -4729,12 +4797,14 @@ def friendly_upstream_error(code, detail):
                 % detail[:300],
                 "content_policy_rejected")
     # 2) 上游模型排队（10605：模型容量不足，所有账号会同错；非凭证问题）
+    # type 用 Zcode 客户端错误分类白名单值（no_capacity -> provider_overloaded，
+    # 可自动重试；自有命名会被归成 unknown、整回合判死）
     qw = _queue_wait_seconds(detail) if code_i == 403 else None
     if qw:
         return ("上游模型排队中 (HTTP 403/10605)：该模型当前容量不足，"
                 "约 %d 秒后可用，请稍后重试（换模型或换区域可立即绕开）。"
                 "上游详情：%s" % (qw, detail[:200]),
-                "upstream_queued")
+                "no_capacity")
     # 2.5) 上游超上下文上限（估算漏压的兜底已自动加压重试过仍超）
     if _is_context_overflow(detail):
         return ("会话超过该模型的上下文上限 (HTTP %s)：网关已自动压缩并"
@@ -4755,12 +4825,20 @@ def friendly_upstream_error(code, detail):
                 "换用 Flash 级模型即可绕开；持续需要收费模型则需订阅"
                 " qoder.com/pricing。上游详情：%s" % detail[:200],
                 "upstream_paid_wall")
+    if code_i == 429:
+        # 频控/排队类：Zcode 白名单 service_unavailable -> server_error（可重试），
+        # 消息里保留 "rate limit" 关键词作消息级分类兜底。
+        return ("upstream rate limit (HTTP 429)：账号/模型当前被限流，网关已"
+                "自动换号仍不可用，请稍后重试或换模型。上游详情：%s"
+                % (detail[:200] or "(无详情)"),
+                "service_unavailable")
     if _is_transient_upstream(code_i, detail) or (
             "provider_error" in detail and "invalid_" not in detail):
+        # type 用 Zcode 白名单值（upstream_unavailable -> server_error，可重试）
         return ("上游瞬时故障 (HTTP %s)：网关已对同账号自动重试仍失败，"
                 "请稍后重试。上游详情：%s"
                 % (code_i, detail[:300] or "(无详情)"),
-                "upstream_transient_error")
+                "upstream_unavailable")
     return ("upstream %s: %s" % (code_i, detail)), "upstream_error"
 
 
@@ -8747,10 +8825,17 @@ class Handler(BaseHTTPRequestHandler):
                                 try:
                                     # 亲和绑定的号此刻被自己占着（信号量），
                                     # open_upstream 会自然轮转到其他号。
-                                    cur2, account, _ = open_upstream(
-                                        payload, session_key=session_key,
-                                        target_realm=req_realm,
-                                        usage_ctx=usage_ctx)
+                                    # 重开也必须走心跳：压缩+信号量等待可达
+                                    # 60s+，中途无字节会让 dsml-proxy(8791)
+                                    # 的 8s 读超时把流掐死（2026-10-18 实测
+                                    # "cannot read from timed out object"）。
+                                    cur2, account, _ = \
+                                        self._open_upstream_with_heartbeat(
+                                            payload, session_key=session_key,
+                                            target_realm=req_realm,
+                                            usage_ctx=usage_ctx)
+                                    if cur2 is None:
+                                        return  # 错误帧已写出（含可重试 type）
                                 except Exception as rex:
                                     log("chat stall reopen failed: %s"
                                         % str(rex)[:160], level="WARN",
@@ -8777,10 +8862,15 @@ class Handler(BaseHTTPRequestHandler):
                                     level="WARN", tag="chat")
                                 time.sleep(attempts)
                                 try:
-                                    cur2, account, _ = open_upstream(
-                                        payload, session_key=session_key,
-                                        target_realm=req_realm,
-                                        usage_ctx=usage_ctx)
+                                    # 同 stall 路径：重开走心跳，避免重开期间
+                                    # 对客户端静默 >8s 被 dsml-proxy 掐流。
+                                    cur2, account, _ = \
+                                        self._open_upstream_with_heartbeat(
+                                            payload, session_key=session_key,
+                                            target_realm=req_realm,
+                                            usage_ctx=usage_ctx)
+                                    if cur2 is None:
+                                        return  # 错误帧已写出（含可重试 type）
                                 except Exception as rex:
                                     log("chat reopen failed: %s"
                                         % str(rex)[:160], level="WARN")
@@ -9011,6 +9101,14 @@ def main(argv=None):
     from qoder_scheduler import Scheduler
     SCHEDULER = Scheduler(POOL)
     SCHEDULER.start()
+    # 主动令牌刷新（到期前沿提前续签，消除 403 集中到期窗口）。
+    log("token-refresher: proactive expiry renewal every %.0fs, lead %.0fs "
+        "(QD_TOKEN_REFRESH_SCAN / QD_TOKEN_REFRESH_LEAD)"
+        % (max(TOKEN_REFRESH_SCAN_MIN, TOKEN_REFRESH_SCAN),
+           TOKEN_REFRESH_LEAD),
+        tag="accounts")
+    threading.Thread(target=_token_refresh_loop, name="token-refresher",
+                     daemon=True).start()
 
     if not POOL.accounts:
         # 永不静默采用本机客户端登录：先报告扫描结果，由用户在看板确认导入。

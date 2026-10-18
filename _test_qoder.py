@@ -634,8 +634,22 @@ _m, _t = P.friendly_upstream_error(418,
     '{"code":"provider_error","message":"Error in upstream response"}')
 check("friendly: 418 provider_error -> Chinese retry guidance",
       "上游瞬时故障" in _m and "请稍后重试" in _m, _m[:60])
-check("friendly: err_type tagged transient",
-      _t == "upstream_transient_error", _t)
+check("friendly: err_type tagged transient (Zcode 白名单值 -> server_error 可重试)",
+      _t == "upstream_unavailable", _t)
+_m429, _t429 = P.friendly_upstream_error(429, '{"code":"1101","message":"qpm limit"}')
+check("friendly: 429 -> service_unavailable（可归类）且消息含 rate limit 关键词",
+      _t429 == "service_unavailable" and "rate limit" in _m429, (_t429, _m429[:50]))
+_mq, _tq = P.friendly_upstream_error(403,
+    '{"code":"10605","message":"model is queued","retryAfterSeconds":30}')
+check("friendly: 10605 排队 -> no_capacity（provider_overloaded，可重试）",
+      _tq == "no_capacity" and "排队" in _mq, (_tq, _mq[:40]))
+_m504, _t504 = P.friendly_upstream_error(
+    504, "upstream produced no data for 180s")
+check("friendly: 看门狗 504 静默 -> 白名单可重试 type",
+      _t504 == "upstream_unavailable", _t504)
+_mpw, _tpw = P.friendly_upstream_error(403, '{"code":"112","pricingUrl":"x"}')
+check("friendly: 付费墙保持确定性 type（不诱导无效重试）",
+      _tpw == "upstream_paid_wall", _tpw)
 _m2, _t2 = P.friendly_upstream_error(400,
     '{"code":"provider_error","details":"invalid_parameter_error Range"}')
 check("friendly: client param error NOT reframed as transient",
@@ -5050,6 +5064,71 @@ except Exception:
 check("#63-C3e 设置保存路径会打一次 quota guard flip (settings) 日志（接线存在性检查）",
       "quota guard flip (settings)" in _src45,
       _src45.count("quota guard flip"))
+
+print()
+print("[45] proactive token refresh (到期前沿提前续签，消除 403 风暴窗口)")
+
+
+class _PrAccount(object):
+    def __init__(self, uid, exp, enabled=True):
+        self.uid = uid
+        self.expires_at = exp
+        self.enabled = enabled
+        self.refresh_calls = 0
+        self.last_error = "prev error"
+
+    def refresh(self):
+        self.refresh_calls += 1
+        return True
+
+    def clear_error(self):
+        self.last_error = ""
+
+
+class _PrPool(object):
+    def __init__(self, accounts):
+        self.accounts = accounts
+
+
+_NOW45 = 1_000_000.0
+_a_due45 = _PrAccount("near-exp", _NOW45 + 120)          # lead 内
+_a_far45 = _PrAccount("far", _NOW45 + 86400)             # 窗口外
+_a_dead45 = _PrAccount("disabled", _NOW45 + 10, enabled=False)
+_a_unknown45 = _PrAccount("no-expiry", 0)
+_a_gone45 = _PrAccount("expired", _NOW45 - 30)           # 已过期也纳入
+_pool45 = _PrPool([_a_due45, _a_far45, _a_dead45, _a_unknown45, _a_gone45])
+_due45 = P._token_refresh_due(now=_NOW45, pool=_pool45)
+check("#45-1 到期窗口内 + 已过期 纳入；窗口外/停用/未知 跳过",
+      [a.uid for a in _due45] == ["near-exp", "expired"],
+      [a.uid for a in _due45])
+_orig_lead45 = P.TOKEN_REFRESH_LEAD
+P.TOKEN_REFRESH_LEAD = 0.0
+check("#45-2 lead<=0 关闭主动刷新（完全退回反应式）",
+      P._token_refresh_due(now=_NOW45, pool=_pool45) == [])
+P.TOKEN_REFRESH_LEAD = _orig_lead45
+_sched45 = []
+_orig_sched45 = P.schedule_auto_refresh
+P.schedule_auto_refresh = lambda account, reason, revive=False, delay=None: (
+    _sched45.append((account.uid, reason, delay)) or True)
+try:
+    _n45 = P._token_refresh_tick(now=_NOW45, pool=_pool45)
+    check("#45-3 tick 对到期窗口账号逐个走 schedule_auto_refresh(delay=0)",
+          _n45 == 2 and [(u, r, d) for u, r, d in _sched45]
+          == [("near-exp", "proactive expiry", 0),
+              ("expired", "proactive expiry", 0)], (_n45, _sched45))
+finally:
+    P.schedule_auto_refresh = _orig_sched45
+# 真实节流：同账号 60s 内第二次排不上（防线程风暴）
+_throttle45 = _PrAccount("throttle-uid", _NOW45)
+_orig_now45 = P.time.time
+P.time.time = lambda: _NOW45
+try:
+    _ok1 = P.schedule_auto_refresh(_throttle45, "proactive expiry", delay=0)
+    _ok2 = P.schedule_auto_refresh(_throttle45, "proactive expiry", delay=0)
+finally:
+    P.time.time = _orig_now45
+check("#45-4 复用反应式节流：同账号窗口内只排一次（tick 循环不会刷爆上游）",
+      _ok1 and not _ok2, (_ok1, _ok2))
 
 print()
 print("SUMMARY: TOTAL %d checks, %d passed, %d failed, %d skipped"
