@@ -32,3 +32,7 @@ python/
 
 # ---- 安装器产物（本地 ISCC 输出，CI 会重建）----
 /installer-out/
+
+# ---- 上游临时目录 ----
+.tmp_*
+_acc/
