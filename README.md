@@ -1,7 +1,7 @@
 # Qoder2API-Hub Desktop — Qoder 双区多账号网关 · 开箱即用桌面客户端
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-1.0.4_R-2496ED?style=flat-square" alt="Version 1.0.4_R">
+  <img src="https://img.shields.io/badge/Release-1.0.5_R-2496ED?style=flat-square" alt="Version 1.0.5_R">
   <img src="https://img.shields.io/badge/Desktop-Win_x64_·_Win_ARM64_·_macOS_·_Linux-8A2BE2?style=flat-square" alt="Desktop Platforms">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
@@ -542,6 +542,11 @@ python _verify_models.py --base http://127.0.0.1:8790
 >   天然不撞。历史号对应：`2026.10.07` ≈ 2026.10.7.1_upstream（上游 v1.2.18）、
 >   `2026.10.08` ≈ 2026.10.8.1_re（上下文压缩）；更早的「网关 1.2.18/1.2.19/
 >   1.2.20」是 fork 旧连号（1.2.18 与上游撞车才改制），仅为历史记录。
+
+### v1.0.5_R — 桌面版：随网关 2026.10.16.3–2026.10.19.2 发布
+
+随上一条目发布的桌面版——首次搭载流稳定性批次（静默看门狗 / 预连接心跳补齐 / 主动令牌续签 / 错误帧重试语义）与上游 v1.4.2–v1.5.2 并入（含已确认接受的 #37 fail-closed 破坏性变更）。
+发布说明见 [Releases](https://github.com/Kepler16f/qoder2api-hub-desktop/releases/tag/v1.0.5_R)。
 
 ### 网关 2026.10.16.3–2026.10.19.2 — 稳定化 + 并入上游 v1.4.2–v1.5.2
 
