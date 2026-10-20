@@ -543,6 +543,16 @@ python _verify_models.py --base http://127.0.0.1:8790
 >   `2026.10.08` ≈ 2026.10.8.1_re（上下文压缩）；更早的「网关 1.2.18/1.2.19/
 >   1.2.20」是 fork 旧连号（1.2.18 与上游撞车才改制），仅为历史记录。
 
+### 网关 2026.10.20.1_upstream — 并入上游 v1.5.3–v1.5.5
+
+- **#51 DSML 回读补齐**：chat / Anthropic 流式出口新增 DSML 缓冲层（此前仅 Responses 有），模型直吐 `<|DSML|invoke ...>` 不再漏成正文；三形态（闭标签+数组 / 完整 DSML / marker+杂字+数组）各分帧下零泄漏；非流式 chat 同步补回退。
+- **#51 后续 · 信封层排队等待**：上游 HTTP 200 建流后以 SSE 信封投递 `403 {isQueued, retryAfterSeconds}` 时，信封层同样识别排队——按 `retryAfterSeconds+1` 等待、允许 `QUEUE_MAX_ROUNDS` 轮（此前信封层按普通 403 直接冷却换号）；普通 403 行为与「已吐字节不重开」不变。
+- **#52 网络错误可读化**：连接被拒（10061）/超时（10060）/重置（10054）翻成点名目标地址 + 三步排查的可操作中文（账号「测试」按钮同享）。
+- **#50 分离启动 + 精确停止**：`start-qoder-proxy.bat` 改 Start-Process 隐藏窗口分离启动，新增 `stop-qoder-proxy.bat` 按 PID 文件 + 命令行校验精确停止；服务端新增 `--pid-file`。（桌面壳「生命周期即窗口」不受影响）
+- **#55 Anthropic system 前缀缓存稳定**：`messages` 内 system 不再合并进顶层 system（默认 inline：就地降级为 user、位置不变，内容不丢）——修上游 prompt 缓存命中从 92% 掉到 14.7% 的问题；旧行为可用 `QD_ANTHROPIC_MSG_SYSTEM=merge|drop` 回退；`usage.jsonl` 指纹新增 `sys_src` / `n_msg_system`。
+- **#49 后续**：DeepSeek 并入结构化工具历史白名单（实测 1283 次调用 0 降级）；`_tool_ids_ok` 守卫保留，INTL 仍不在 auto 范围。
+- **#53 智能体一键配置修复**：Key 下拉原先 value 恒为空串导致「一键配置」根本发不出请求（自上游 v1.4.0 起存在）；改为 option value 用 key id + 点击时经 `/settings/reveal?id=` 取明文。fork 侧账号测试失败路径同步接入 #52 的 `_friendly_net_error`。
+
 ### v1.0.5_R — 桌面版：随网关 2026.10.16.3–2026.10.19.2 发布
 
 随上一条目发布的桌面版——首次搭载流稳定性批次（静默看门狗 / 预连接心跳补齐 / 主动令牌续签 / 错误帧重试语义）与上游 v1.4.2–v1.5.2 并入（含已确认接受的 #37 fail-closed 破坏性变更）。
@@ -718,6 +728,45 @@ python _verify_models.py --base http://127.0.0.1:8790
 - **能红证据**：把实现改成「先 `fetch_credits()` 再返回」→ 命门断言必红（变异下桩被调 **3** 次 = 3 个账号各一次）；
 - **鉴权矩阵**：有效 key 200 / 无效 key 401 / 无凭据 401 / 面板会话 200 / 未设 key 放行 200（**全部 0 次 fetch**）；
 - **边界**：空池 / `POOL=None` / 无 credits 账号 / 部分 credits 全绿。
+
+### v1.5.5
+
+**🐛 问题修复**
+
+- **Anthropic 入口把动态 system 抬进缓存前缀，命中率 92% → 14.7%**（#55）：`system_prompt_of` 会把 `messages` 里的 system 合并进最前面的 system，而客户端（Claude Desktop/Code）恰恰把**每轮都变**的内容放在那里（当前时间、工具清单、skills、context 用量）。合并后前缀逐轮不同，上游缓存从第 0 字节就失配。
+  现在默认 **inline**：`messages` 内 system **就地降级成一条 user**（内容不丢、位置不变），顶层 system 保持字节稳定；旧行为保留为 `QD_ANTHROPIC_MSG_SYSTEM=merge`，另有 `drop`。
+- **指纹看不出来源**（#55）：`usage.jsonl` 新增 `sys_src`（`top` / `top+inline` / `top+msg` / `none`）与 `n_msg_system`，下次这类问题不必翻代码。
+- **智能体一键配置根本发不出请求**（#53，PR #54 by WCX0221）：`/settings` 只回掩码、从不回明文 `key`，而下拉用 `k.key` 做 option value → 所有 option 值都是空串 → 点「一键配置」只弹「请先选择 API Key」。现在 option value 用 key **id**，点击时经 `/settings/reveal?id=` 取一次明文（与设置页复制 Key 同一路径）。
+
+**⚙️ 行为变更**
+
+- **DeepSeek 进入结构化工具历史白名单**（#49 后续）：报告者在真实长会话（Anthropic 入口、1,283 次工具调用）验证 **0 降级**，同环境开启前基线 0.30%。结构化直传后模型看不到 `LEAK_MARKER` 文本格式，从根上消除复述。`_tool_ids_ok` 守卫仍在（id 不齐备自动回退文本化），INTL 仍不在 auto 范围。
+
+**验证**：全量 **40 suites / 1392 checks / 0 failed**（新增 `_test_issue55_system_prefix.py` 17 条 + PR 自带 `_test_agents_panel.js` 20 条）。
+
+### v1.5.4
+
+**🐛 问题修复**
+
+- **信封层排队（10605 / RESOURCE_LIMIT）没有等待**（#51 后续）：上游会先以 HTTP 200 建流、再在 SSE 信封里投递 `403 {isQueued:true, retryAfterSeconds:30, subCode:RESOURCE_LIMIT}`。v1.5.3 之前只在 **HTTP 层**做了排队等待，信封层仍按普通 403 冷却换号，换不到就把 403 直接丢给客户端（表现为 `request error: status=403 … 10605`）。
+  现在信封层同样识别排队：`should_retry_envelope` 对排队信号允许比瞬时重试更多轮（最多 `QUEUE_MAX_ROUNDS`），重开前按 `retryAfterSeconds+1` 等待；非流式聚合循环也留出了排队轮次；普通 403 的重试轮次**不变**。
+- **排队失败给可读文案**：10605 / RESOURCE_LIMIT 不再是一段嵌套 JSON，而是「上游排队中…已按 retryAfterSeconds 等待并重试，仍拿不到可用资源，请稍后重试」。
+
+**验证**：全量 **38 suites / 1353 checks / 0 failed**（新增 8 条：嵌套 detail 解析、信封排队识别、重试轮次、等待时长、普通 403 不变、已吐字节不重开、文案映射、聚合轮次）。
+
+### v1.5.3
+
+**🐛 问题修复**
+
+- **DeepSeek 原生 DSML 在 chat / Anthropic 流式里完全没有回读**（#51）：此前只有 Responses 路径有 DSML 解析，模型直接吐 `<|DSML|invoke name=...>` 时整段协议漏成正文（截图三例：闭标签+数组、完整 DSML 块、marker+杂字+数组）。现在流式出口新增一层 DSML 缓冲：遇到 DSML 就压住到流末统一解析，成功则补发散文 + `tool_calls` + `finish=tool_calls`；解析不出则原样透传并记 WARN。非流式 chat 侧也补了同样的回退。三种形态在 1/8/64/整段分帧下都能恢复、零泄漏。
+- **闭标签/杂字形态的解析容错**：允许 `</|DSML|...>` 前导闭标签、允许 marker 后跟杂字（如 `">`) 再进数组、允许数组开头的 `[` 丢失（取首个 `{` 到末个 `}` 重新成组）；严格校验（name 非空且命中声明、arguments 合法）一律保留。
+- **连接被拒绝只显示裸异常**（#52）：`<urlopen error [WinError 10061] ...>` 现在翻成可操作中文——点名目标地址、并给出三步排查（服务/端口、环境变量代理是否还在跑、地址是否写错）；10060 超时与 10054 重置同样处理。
+
+**✨ 新增功能**
+
+- **关掉窗口不再停服 + `stop-qoder-proxy.bat`**（#50）：`start-qoder-proxy.bat` 改为 `Start-Process` 分离启动（隐藏窗口、日志落 `qoder-proxy.log`），关掉启动窗口服务继续跑；新增 `stop-qoder-proxy.bat` 按 `qoder-proxy.pid` **精确停止**（先校验目标进程命令行含 `qoder_proxy.py`，绝不误杀其它 python）。服务端新增 `--pid-file`，启动写 PID、退出自动删除。
+
+**验证**：全量 **38 suites / 1345 checks / 0 failed**（新增 `tests/_test_issue50_51_52.py` 25 条）。
 
 ### v1.5.2
 
