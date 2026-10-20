@@ -203,7 +203,7 @@ from pathlib import Path
 # 信封层排队等待、#52 网络错误中文可读化、#50 分离启动 + stop.bat/--pid-file、
 # #53 智能体配置 Key id+reveal 修复、#55 anthropic system 前缀缓存稳定性 +
 # DeepSeek 入结构化工具历史白名单）。
-VERSION = "2026.10.20.1_upstream"
+VERSION = "2026.10.20.2_re"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -5842,13 +5842,19 @@ def friendly_upstream_error(code, detail):
                 "加压重试仍超限。请压缩/清理会话历史，或换更大窗口的模型。"
                 "上游详情：%s" % (code_i, detail[:250]),
                 "context_overflow")
-    # 2.6) 上游日限额（110：当日计费用量超限；短冷却后自动重试）
+    # 2.6) 上游日限额（110：账号×模型当日计费配额；同号多个模型连撞则
+    # 视为账号当日耗尽）
     if code_i == 403 and _is_daily_quota_exceeded(detail):
-        return ("账号当日用量已达上限 (HTTP 403/110)：Billing daily count "
-                "exceeded，与 token 无关。网关已短冷却该账号 60 秒后自动"
-                "重试（实测有时 1 分钟即恢复）；其他账号会自动接替。如"
-                "持续超限，需减少单日请求量。上游详情：%s" % detail[:200],
-                "daily_quota_exceeded")
+        # quota_limit -> Zcode 白名单 quota_exhausted：归类干净（不再是
+        # unknown 判死乱报错）。网关已把该号的该模型冷却到计费日翻转并
+        # 换号/换模型继续；客户端层面重试无益（同组合当日必然再撞）。
+        return ("上游当日计费配额已用尽 (HTTP 403/110)：Billing daily count "
+                "exceeded——按账号×模型统计当日计费量（与 token/凭证无关；"
+                "实测未超限账号同模型可用）。网关已把该号的该模型冷却到计费"
+                "日翻转（每日 10:00 UTC+8 口径）并自动换号/换模型继续；该号"
+                "两个以上模型连撞时整号冷却。可减少单账号单模型用量或换模型。"
+                "上游详情：%s" % detail[:200],
+                "quota_limit")
     # 3) 上游付费墙（112：该**模型**对 Free 计划收费；与 credits 余额无关）
     if code_i == 403 and _is_paid_wall(detail):
         return ("该模型对 Free 计划收费 (HTTP 403/112)：与账号剩余额度无关"
@@ -5871,6 +5877,47 @@ def friendly_upstream_error(code, detail):
                 % (code_i, detail[:300] or "(无详情)"),
                 "upstream_unavailable")
     return ("upstream %s: %s" % (code_i, detail)), "upstream_error"
+
+
+def _daily_reset_window(now=None):
+    """下一个计费日翻转 (epoch 秒, 人类可读)——110 冷却挂到这里。
+
+    翻转口径与配额护栏/402 停放同源（qoder_accounts.next_checkin_window，
+    每日 10:00 UTC+8，issue #20）。
+    """
+    try:
+        return qoder_accounts.next_checkin_window(now=now)
+    except Exception:
+        return int(time.time()) + 3600.0, "1h（窗口计算失败回退）"
+
+
+def _apply_110_cooldown(account, model):
+    """110（当日计费配额）处置，2026-10-20 全天取证定稿：
+
+    · 配额按**账号×模型（计费档位）**计日——1344f 的 auto 撞 110 时它的
+      Qwen3.8-Flash 照样成功（18:41 双证）；
+    · 首撞先挂**模型级**长冷却到翻转（同一 (号,模型) 当日必然再撞，短冷却
+      只会白付探测——今日 112 次风暴的放大器）；
+    · 同一账号挂到翻转的模型冷却 >= 2 个 → 视为该号当日整体耗尽（共享
+      总量成分），**升级账号级**冷却到翻转，不再逐个模型试错；
+    · 全程不刷 token（配额与凭证无关）、不拉黑 enable（换区/次日自愈）。
+
+    返回生效范围描述（进日志）。
+    """
+    _reset, _when = _daily_reset_window()
+    if not model:
+        # 模型未知（罕见）：保守按账号级，避免同号同模型无限再撞。
+        account.note_error("daily billing quota (HTTP 403/110): account "
+                           "daily count", until=_reset)
+        return "ACCOUNT-level (model unknown) cooldown until " + _when
+    account.note_error("daily billing quota (HTTP 403/110): model daily "
+                       "count", model=model, until=_reset)
+    escalated = sum(1 for _m, t in getattr(account, "model_cooldowns", {})
+                    .items() if t >= _reset - 60) >= 2
+    if escalated:
+        account.cooldown_until = max(account.cooldown_until, _reset)
+        return ("ACCOUNT-level (2+ models exhausted) cooldown until " + _when)
+    return "MODEL-level ('%s') cooldown until %s" % (model, _when)
 
 
 def _to_int_status(status):
@@ -5916,6 +5963,15 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
             level="WARN", tag="chat")
         schedule_auto_refresh(account, "envelope 429")
     elif status_int in (401, 403):
+        if status_int == 403 and _is_daily_quota_exceeded(detail):
+            # 110 处置统一走 _apply_110_cooldown（模型级起步、两模型连撞
+            # 升级账号级；不刷令牌）；会话已在函数开头 unbind，上层
+            # reopen/下一请求自然换号换模型。
+            _scope46e = _apply_110_cooldown(account, model)
+            log("account %s billing daily quota (110) via envelope - %s, "
+                "rotating" % ((getattr(account, "uid", "") or "")[:8],
+                               _scope46e), level="WARN", tag="chat")
+            return
         dead = qoder_accounts.session_dead(detail)
         # 10605 排队与 112 付费墙都是**模型级**信号（同账号同刻可复现
         # auto=112 而 qfmodel=10605 排队），冷却挂在 model 上、不拉黑账号
@@ -5997,7 +6053,11 @@ def should_retry_envelope(exc, emitted_bytes, attempt):
         return False
     status_int = _to_int_status(getattr(exc, "status", 502))
     detail = getattr(exc, "detail", "") or ""
-    # 401/403 (含 10605 排队被拒) 与 429 在未吐出字节前均允许通过 reopen 换号重试
+    # 401/403 (含 10605 排队被拒、110 日限额) 与 429 在未吐出字节前均允许
+    # 通过 reopen 换号重试——110 是**账号×模型**级配额（2026-10-20 实测：
+    # 新账号同模型可用、同账号别的模型可用），信封先 unbind 再重开即可轮转
+    # 到未超限的号；配合下面两处对 110 的模型级长冷却，同一 (号,模型) 组合
+    # 不会被反复撞，换号重开不是白付费而是唯一出路。
     if status_int in (401, 403, 429):
         return True
     return _is_transient_upstream(status_int, detail)
@@ -6370,19 +6430,14 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
                 continue
             if exc.code in (401, 403):
                 if exc.code == 403 and _is_daily_quota_exceeded(detail):
-                    # 110 日限额：**账号级**——当日计费用量超限。用户实测
-                    # 有时 1 分钟后就恢复（上游计数器/窗口抖动），短冷却
-                    # 60 秒后自动重试；持续超限则反复短冷却（不锁死账号），
-                    # 换号继续（其他号未超限时仍可服务）
+                    # 110 处置见 _apply_110_cooldown（模型级起步、两个模型
+                    # 连撞升级账号级；短冷却才是风暴放大器）。
                     if session_key and POOL:
                         POOL.affinity.unbind(session_key)
-                    account.note_error(
-                        "daily quota exceeded (HTTP 403/110): billing daily "
-                        "count limit, short cooldown", cooldown=60,
-                        single_account=(total <= 1))
-                    log("account %s daily quota exceeded (110) - short "
-                        "cooldown 60s, rotating"
-                        % account.uid[:8], level="WARN", tag="chat")
+                    _scope46 = _apply_110_cooldown(account, model)
+                    log("account %s daily billing quota (110) on '%s' - %s, "
+                        "rotating" % (account.uid[:8], model, _scope46),
+                        level="WARN", tag="chat")
                     last_error = exc
                     continue
                 if exc.code == 403 and _is_paid_wall(detail):
@@ -9358,7 +9413,8 @@ class Handler(BaseHTTPRequestHandler):
         ok, problem = qoder_anthropic.validate_request(payload)
         if not ok:
             return self._error(400, problem, "invalid_request_error")
-        req_realm = self._request_realm() or CURRENT_REALM
+        req_realm_expl = self._request_realm()
+        req_realm = req_realm_expl or CURRENT_REALM
         model_hint = payload.get("model") or "auto"
         model_key = qoder_catalog.resolve_upstream_key(model_hint, realm=req_realm)
         # 传 supported 档位表，否则 effort_from_anthropic 会静默丢弃思考档位。
@@ -9390,7 +9446,7 @@ class Handler(BaseHTTPRequestHandler):
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
             upstream, account, _ = open_upstream(
-                chat_req, session_key=session_key, target_realm=req_realm,
+                chat_req, session_key=session_key, target_realm=req_realm_expl,
                 usage_ctx=usage_ctx)
             # #26：记录实际出口（自动路由后可能与 req_realm 不同）→ 响应头可见
             self.realm_used = usage_ctx.get("realm") or req_realm
@@ -9517,7 +9573,8 @@ class Handler(BaseHTTPRequestHandler):
         holder = {"usage": None, "custom_names": custom_names,
                   "allowed_names": _tool_names_from_payload(chat_req)}
         try:
-            req_realm = self._request_realm() or CURRENT_REALM
+            req_realm_expl = self._request_realm()
+            req_realm = req_realm_expl or CURRENT_REALM
             usage_ctx = {}          # P1-3：推理档位审计出参（下传给 open_upstream）
             blocked = self._model_precheck(chat_req.get("model"), req_realm)
             if blocked:
@@ -9529,7 +9586,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._sse_begin()
                 upstream, account, _ = self._open_upstream_with_heartbeat(
                     chat_req, session_key=session_key,
-                    target_realm=req_realm, usage_ctx=usage_ctx)
+                    target_realm=req_realm_expl, usage_ctx=usage_ctx)
                 if upstream is None:
                     return  # 错误已作为 SSE 帧写入流中
                 self.realm_used = usage_ctx.get("realm") or req_realm
@@ -9537,7 +9594,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 upstream, account, _ = open_upstream(
                     chat_req, session_key=session_key,
-                    target_realm=req_realm, usage_ctx=usage_ctx)
+                    target_realm=req_realm_expl, usage_ctx=usage_ctx)
                 # #26：记录实际出口（自动路由后可能与 req_realm 不同）→ 响应头可见
                 self.realm_used = usage_ctx.get("realm") or req_realm
                 self.realm_reason = usage_ctx.get("realm_reason") or ""
@@ -9628,7 +9685,7 @@ class Handler(BaseHTTPRequestHandler):
                                     # build_qoder_body 只读 messages -> 空会话。
                                     cur2, account, _ = open_upstream(
                                         chat_req, session_key=session_key,
-                                        target_realm=req_realm,
+                                        target_realm=req_realm_expl,
                                         usage_ctx=usage_ctx)
                                 except Exception as rex:
                                     log("responses stall reopen failed: %s"
@@ -9664,7 +9721,7 @@ class Handler(BaseHTTPRequestHandler):
                                     # build_qoder_body 只读 messages -> 空会话。
                                     cur2, account, _ = open_upstream(
                                         chat_req, session_key=session_key,
-                                        target_realm=req_realm,
+                                        target_realm=req_realm_expl,
                                         usage_ctx=usage_ctx)
                                 except Exception as rex:
                                     log("responses reopen failed: %s"
@@ -9846,7 +9903,8 @@ class Handler(BaseHTTPRequestHandler):
             % (model, effort, want_stream,
                len(payload.get("messages") or [])))
         try:
-            req_realm = self._request_realm() or CURRENT_REALM
+            req_realm_expl = self._request_realm()
+            req_realm = req_realm_expl or CURRENT_REALM
             usage_ctx = {}          # P1-3：推理档位审计出参（下传给 open_upstream）
             blocked = self._model_precheck(model, req_realm)
             if blocked:
@@ -9862,13 +9920,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._sse_begin()
                 upstream, account, _ = self._open_upstream_with_heartbeat(
                     payload, session_key=session_key,
-                    target_realm=req_realm, usage_ctx=usage_ctx)
+                    target_realm=req_realm_expl, usage_ctx=usage_ctx)
                 if upstream is None:
                     return  # 错误已作为 SSE 帧写入流中
             else:
                 upstream, account, _ = open_upstream(
                     payload, session_key=session_key,
-                    target_realm=req_realm, usage_ctx=usage_ctx)
+                    target_realm=req_realm_expl, usage_ctx=usage_ctx)
             # #26：记录实际出口（自动路由后可能与 req_realm 不同）→ 响应头可见
             self.realm_used = usage_ctx.get("realm") or req_realm
             self.realm_reason = usage_ctx.get("realm_reason") or ""
@@ -9962,7 +10020,7 @@ class Handler(BaseHTTPRequestHandler):
                                     cur2, account, _ = \
                                         self._open_upstream_with_heartbeat(
                                             payload, session_key=session_key,
-                                            target_realm=req_realm,
+                                            target_realm=req_realm_expl,
                                             usage_ctx=usage_ctx)
                                     if cur2 is None:
                                         return  # 错误帧已写出（含可重试 type）
@@ -9997,7 +10055,7 @@ class Handler(BaseHTTPRequestHandler):
                                     cur2, account, _ = \
                                         self._open_upstream_with_heartbeat(
                                             payload, session_key=session_key,
-                                            target_realm=req_realm,
+                                            target_realm=req_realm_expl,
                                             usage_ctx=usage_ctx)
                                     if cur2 is None:
                                         return  # 错误帧已写出（含可重试 type）

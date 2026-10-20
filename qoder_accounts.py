@@ -1713,6 +1713,11 @@ class Account(object):
             self.model_cooldowns[model] = time.time() + wait
             return wait
         actual_cooldown = 3 if single_account else cooldown
+        if until is not None:
+            # 绝对截止时刻（如 110 日配额冷却到计费日翻转）：优先级同 model
+            # 分支——long 冷却到点自动恢复，single_account 压缩不适用于
+            # "当日必然再撞"的确定性配额（压短只会反复白付探测）。
+            actual_cooldown = max(1.0, float(until) - time.time())
         self.cooldown_until = time.time() + actual_cooldown
         return actual_cooldown
 
@@ -1964,6 +1969,13 @@ class Account(object):
         if not token:
             self.last_error = "refresh returned no token"
             return False
+        now_ts = int(time.time())
+        if exp and exp <= now_ts:
+            # 实测（2026-10-20）：CN device 族刷新响应回显**旧的** expiresAt
+            # （过去时刻），照写会让 ready()/主动刷新永远判过期、每次选号同步
+            # 刷一次令牌（风暴源）。按 24h 保守重估；临近到期由主动续签线程
+            # 再刷。
+            exp = now_ts + 86400
         self.access_token = token
         self.refresh_token = refresh
         self.expires_at = exp or self.expires_at

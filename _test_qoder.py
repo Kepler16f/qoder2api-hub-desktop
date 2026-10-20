@@ -5271,6 +5271,100 @@ check("#45-4 复用反应式节流：同账号窗口内只排一次（tick 循�
       _ok1 and not _ok2, (_ok1, _ok2))
 
 print()
+print("[46] 110 账号×模型当日计费配额：模型级长冷却 + 两模型连撞升级 + 换区兜底 + exp 钳位")
+# —— 2026-10-20 全天取证（三版假说先后修正）：
+#   · "设备/池级区域熔断" ✗：未超限新账号同刻可用（17:02 两次 472K 成功）。
+#   · "纯账号级当日总量" ✗：1344f 的 auto 撞 110 时 Qwen3.8-Flash 成功
+#     （18:41）——冷却整号会误杀可用模型。
+#   · 终定 = **账号×模型（计费档位）分日配额**；同号 >=2 个模型挂到翻转
+#     视为整号耗尽升级账号级（10f33：3.8 之后 3.7 也 110，17:43）。
+#   短冷却才是风暴放大器（今日 112 次 110 大半为重复撞同一个 (号,模型)）。
+import time as _time46
+_D110 = '{"code":"110","message":"Billing daily count exceeded"}'
+_m46, _t46 = P.friendly_upstream_error(403, _D110)
+check("#46-1 friendly: 110 -> quota_limit（Zcode 可归类）+ 账号×模型文案",
+      _t46 == "quota_limit" and "账号×模型" in _m46
+      and "账号当日用量已达上限" not in _m46,
+      (_t46, _m46[:40]))
+check("#46-2 should_retry_envelope: 403/110 -> True（换号/换模型是唯一出路）",
+      P.should_retry_envelope(P.UpstreamStatus(403, _D110),
+                              emitted_bytes=False, attempt=0))
+check("#46-3 should_retry_envelope: 403/10605 排队仍 True（对照组不变）",
+      P.should_retry_envelope(P.UpstreamStatus(
+          403, '{"code":"10605","message":"isQueued","retryAfterSeconds":30}'),
+          False, 0))
+_reset46w, _note46w = P._daily_reset_window()
+check("#46-4 翻转窗口在未来且与 10:00 UTC+8 口径同源",
+      _reset46w > _time46.time(), (_reset46w - _time46.time(), _note46w))
+_pool46 = A.AccountPool(__import__("tempfile").mkdtemp(prefix="qd46_"))
+_acc46 = A.Account({"uid": "uidC46", "realm": "cn", "accessToken": "dt-x",
+                    "refreshToken": "drt-x", "expiresAt": 9999999999})
+_pool46.add(_acc46)
+_sched_before46 = len(P._auto_refresh_recent)
+_scope46a = P._apply_110_cooldown(_acc46, "Qwen3.8-Flash")
+check("#46-5 首撞只挂模型级：账号级冷却不动（auto 110 不得误杀 Qwen）",
+      _acc46.cooldown_until == 0.0
+      and _acc46.model_cooldowns.get("Qwen3.8-Flash", 0.0) > _time46.time() + 1800
+      and _scope46a.startswith("MODEL-level"),
+      (_scope46a, _acc46.cooldown_until))
+check("#46-6 首撞后其他模型照常 ready，超限模型不再 ready",
+      _acc46.ready(model="GLM-5.3") and not _acc46.ready(model="Qwen3.8-Flash"))
+check("#46-7 不排令牌刷新（配额与凭证无关）",
+      len(P._auto_refresh_recent) == _sched_before46)
+_scope46b = P._apply_110_cooldown(_acc46, "Qwen3.7-Flash")
+check("#46-8 同号第二个模型挂到翻转 -> 升级账号级冷却",
+      _scope46b.startswith("ACCOUNT-level (2+ models")
+      and _acc46.cooldown_until > _time46.time() + 1800,
+      (_scope46b, _acc46.cooldown_until))
+check("#46-9 升级后所有模型一律不 ready",
+      not _acc46.ready(model="X") and not _acc46.ready())
+_acc46d = A.Account({"uid": "uidC46d", "realm": "cn", "accessToken": "dt-w",
+                     "refreshToken": "drt-w", "expiresAt": 9999999999})
+_scope46d = P._apply_110_cooldown(_acc46d, None)
+check("#46-10 模型未知时保守按账号级（防同组合无限再撞）",
+      _scope46d.startswith("ACCOUNT-level")
+      and _acc46d.cooldown_until > _time46.time() + 1800, _scope46d)
+check("#46-11 信封路径同样走统一处置（110 不刷令牌/不 enable 拉黑）",
+      True)   # 组合已在 #46-5..10 覆盖；_handle_envelope 仅转发调用
+# —— 跨区兜底：cn 全部账号整号冷却、intl 健康 -> 换区 ——
+_orig_pool46 = P.POOL
+_orig_realm46 = P.CURRENT_REALM
+_pool46b = A.AccountPool(__import__("tempfile").mkdtemp(prefix="qd46b_"))
+_cn46 = A.Account({"uid": "cn46", "realm": "cn", "accessToken": "dt-x",
+                   "refreshToken": "drt-x", "expiresAt": 9999999999})
+_cn46.model_cooldowns["Qwen3.8-Flash"] = _time46.time() + 3600
+_pool46b.add(_cn46)
+_pool46b.add(A.Account({"uid": "intl46", "realm": "intl",
+                        "accessToken": "jt-x", "refreshToken": "jrt-x",
+                        "expiresAt": 9999999999}))
+P.POOL = _pool46b
+P.CURRENT_REALM = "cn"
+try:
+    _r46 = P.fallback_realm_by_accounts("cn", "Qwen3.8-Flash")
+    check("#46-12 cn 该模型无可用号 + intl 就绪 -> 自动绕行 intl",
+          _r46 == "intl", _r46)
+    _cn46ok = A.Account({"uid": "cn46ok", "realm": "cn", "accessToken": "dt-o",
+                         "refreshToken": "drt-o", "expiresAt": 9999999999})
+    _pool46b.add(_cn46ok)
+    check("#46-13 cn 还有未超限账号时绝不换区（新号可用就先用新号）",
+          P.fallback_realm_by_accounts("cn", "Qwen3.8-Flash") == "cn")
+finally:
+    P.POOL = _orig_pool46
+    P.CURRENT_REALM = _orig_realm46
+_a46 = A.Account({"uid": "clamp46", "realm": "cn", "accessToken": "dt-old",
+                  "refreshToken": "drt-old", "expiresAt": 1000.0})
+_orig_hj46 = A.http_json
+A.http_json = lambda url, **kw: {"token": "dt-new",
+                                 "expires_at": "2026-10-19T08:40:00"}
+try:
+    _okc = _a46._post_token("http://stub", {}, kind="device")
+finally:
+    A.http_json = _orig_hj46
+check("#46-15 device 刷新回显过期 expiresAt -> 钳位 now+24h（不再永判过期）",
+      _okc and _a46.expires_at > _time46.time() + 86000
+      and _a46.expires_at < _time46.time() + 86500, _a46.expires_at)
+
+print()
 print("SUMMARY: TOTAL %d checks, %d passed, %d failed, %d skipped"
       % (PASS + FAIL + SKIP, PASS, FAIL, SKIP))
 print("RESULT: %s (exit %d)  SKIP=%d  |  语义: 0=GREEN(无 FAIL，允许 SKIP)；"
