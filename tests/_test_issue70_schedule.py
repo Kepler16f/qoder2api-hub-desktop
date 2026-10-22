@@ -56,7 +56,13 @@ _s._fired = {}
 _occ = _s._occurrences(0)
 check("#70 当天排程点包含签到与保活", len(_occ) == 2, [o[1] for o in _occ])
 _now = time.time()
-_s._fired = {ts: True for _k, _l, ts in _occ if ts <= _now}
+# fired 标记必须覆盖 _next_target 的完整扫描域（昨天/今天/明天）：
+# 只标记今天的话，在服务时区当天 00:00-03:00 之间运行（CI 为 UTC，正好
+# 落在这个窗），前一日 22:00 距今不足 3h、属可回补候选，断言会误判失败。
+_cand70 = []
+for _off in (-1, 0, 1):
+    _cand70.extend(_s._occurrences(_off))
+_s._fired = {ts: True for _k, _l, ts in _cand70 if ts <= _now}
 check("#70 已触发过的点不会被重复触发", _s._next_target() is None)
 _s._fired = {}
 _due = _s._next_target()

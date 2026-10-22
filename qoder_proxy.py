@@ -213,7 +213,10 @@ from pathlib import Path
 # 一键更新整块未采纳：qoder_updater.py、/update/plan、/update/apply、看板
 # 「一键更新」入口全部剔除——桌面发行版的更新走 Inno 安装包，内嵌网关自拉
 # 上游 tarball 会把 fork 的文件换成上游原版）。
-VERSION = "2026.10.22.1_upstream"
+# 10-22：.2_re = #70 排程测试防重前提修正——fired 标记覆盖 _next_target 的
+# 完整扫描域（-1/0/+1 三天候选）；只标今天时在 UTC 凌晨（CI 正好落在该窗）
+# 前一日 22:00 距今不足 3h 回补窗内被正确判为待补跑，断言误判失败。
+VERSION = "2026.10.22.2_re"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
