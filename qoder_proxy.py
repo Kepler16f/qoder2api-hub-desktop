@@ -38,6 +38,9 @@ import socket
 import ssl
 import sys
 import threading
+
+# 哨兵：区分"客户端未给 enable_thinking"与"显式给了 false"
+_MISSING = object()
 import collections
 import fnmatch
 import time
@@ -216,7 +219,7 @@ from pathlib import Path
 # 10-22：.2_re = #70 排程测试防重前提修正——fired 标记覆盖 _next_target 的
 # 完整扫描域（-1/0/+1 三天候选）；只标今天时在 UTC 凌晨（CI 正好落在该窗）
 # 前一日 22:00 距今不足 3h 回补窗内被正确判为待补跑，断言误判失败。
-VERSION = "2026.10.22.2_re"
+VERSION = "2026.10.22.3_re"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -3484,6 +3487,9 @@ def normalize_reasoning_effort(effort, meta):
     if not e:
         return None, ""
     if e in _EFFORT_OFF:
+        # 关闭类取值 → 下发 "none"（让上游真正关思考）。注意：必须下发
+        # 该值而非返回 None——返回 None 会被 build_qoder_body 吞掉、上游
+        # 跑默认档（开思考），这就是此前"none 关不掉思考"的根因。
         return "none", ""
     tc = (meta or {}).get("thinking_config")
     if not isinstance(tc, dict):
@@ -5332,6 +5338,13 @@ def structured_tool_history_enabled(model="", model_key="", realm="",
 # 只在极端情况下才兜底丢弃最老轮。
 # ---------------------------------------------------------------------------
 PROMPT_TOKEN_BUDGET_DEFAULT = 700000    # 估算 token 软上限（留 ~18 万输出缓冲）
+# 思考模型未显式给 max_tokens 时，网关补的输出上限：思考先烧预算，留足
+# 余量让正文写出来（实测不开这档时 out≈200/90K in → 正文被饿死；BASEPROMPT
+# 默认 32768 对思考模型仍偏小，思考烧完后正文所剩无几）。保底下限须明显大于
+# BASEPROMPT 的 32768。可调；0/None 表示不补（交给上游默认）。客户端显式给的
+# max_tokens 一律尊重。
+QODER_REASONING_MODEL_MAX_TOKENS = int(
+    os.environ.get("QD_REASONING_MODEL_MAX_TOKENS") or 81920)
 _HISTORY_KEEP_LIGHT = 1200               # 档A：单侧保留字符（全部历史轮）
 _HISTORY_KEEP_HEAVY = 350                # 档B：单侧保留字符（最老的一半轮）
 _HISTORY_SUMMARY_CHARS = 160             # 档C：单行摘要字符数（最老的四分之一轮）
@@ -5763,14 +5776,22 @@ def build_qoder_body(payload, account, model_key, realm=None,
         body["image_urls"] = images
     body["chat_context"] = cc
 
-    # parameters：max_tokens / reasoning_effort
+    # parameters：max_tokens / reasoning_effort / 思考开关透传
     params = body.get("parameters") or {}
     max_tokens = payload.get("max_tokens") or payload.get("max_completion_tokens")
     if max_tokens:
+        # 客户端显式给的 max_tokens：一律尊重，网关不改（用户要求）。
         try:
             params["max_tokens"] = int(max_tokens)
         except (TypeError, ValueError):
             pass
+    else:
+        # 客户端没给 max_tokens：思考模型（Qwen3.8 系等）会先把预算烧在
+        # reasoning_content 上，正文所剩无几（实测 out≈200 / in≈90K → 正文
+        # 被饿死）。给思考模型补一个较大的输出上限，让思考烧完后正文仍有
+        # 空间；非思考模型按上游默认（不补，避免越权改行为）。
+        if catalog_meta.get("is_reasoning") and QODER_REASONING_MODEL_MAX_TOKENS:
+            params["max_tokens"] = QODER_REASONING_MODEL_MAX_TOKENS
     # 提取与 usage 记账共用同一实现（requested_effort），避免两处口径漂移
     effort = requested_effort(payload)
     if effort:
@@ -5780,6 +5801,10 @@ def build_qoder_body(payload, account, model_key, realm=None,
                 % (note, model_key or model, supported_efforts(catalog_meta)), tag="chat")
         if norm:
             params["reasoning_effort"] = norm
+    # 思考开关透传（仅透传，不钳制、不越权改）：客户端显式传
+    # reasoning_effort=none 就原样下发（关思考）；其余 effort 值由上方
+    # normalize 处理。enable_thinking 顶层字段上游不认且实测干扰关思考，
+    # 故网关不再处理它（客户端要关思考用 reasoning_effort=none 即可）。
     body["parameters"] = params
 
     # tools：客户端给了就用客户端的（custom freeform 已降级），否则置空，

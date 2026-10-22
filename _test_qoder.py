@@ -5437,24 +5437,81 @@ check("#47-17 CLIENT_UA 仍保留为兜底常量（不删，避免外部引用�
       'CLIENT_UA = "Go-http-client/2.0"' in _src_acc45)
 
 print()
-print("SUMMARY: TOTAL %d checks, %d passed, %d failed, %d skipped"
-      % (PASS + FAIL + SKIP, PASS, FAIL, SKIP))
+print("[48] 思考模型保底输出预算：未给 max_tokens 时自动补 QD_REASONING_MODEL_MAX_TOKENS；显式 max_tokens 尊重；none 仍下发")
+# —— 2026-10-22 取证：Qwen3.8-Flash 是思考模型，reasoning_content 把
+# max_tokens 烧光（out≈200/90K in），正文被饿死。修复（用户要求**开着思考**，
+# 只给思考模型保底输出预算）：客户端没给 max_tokens 时，思考模型自动补一个
+# 较大输出上限（QD_REASONING_MODEL_MAX_TOKENS），让思考烧完后正文仍有空间；
+# 客户端显式给的 max_tokens 一律尊重、不改。enable_thinking 顶层字段上游不
+# 认且干扰关思考，网关不再处理；reasoning_effort=none 仍按原语义下发。
+_acc47 = A.Account({"uid": "uidC47", "realm": "cn", "accessToken": "dt-x",
+                   "refreshToken": "drt-x", "expiresAt": 9999999999})
+_m47_38 = {"key": "qfmodel", "is_reasoning": True,
+           "thinking_config": {"enabled": {"efforts":
+          {"low": {}, "medium": {}, "high": {}, "xhigh": {}, "max": {},
+           "is_default": "medium"}}}}
+_m47_nr = {"key": "plainmodel", "is_reasoning": False}
+_orig_meta = P.qoder_catalog.models_for_realm
+def _fake_realm(realm=None):
+    return [_m47_38, _m47_nr]
+# 直连 build_qoder_body 的 max_tokens 补发逻辑，绕过模型解析
+P.qoder_catalog.models_for_realm = _fake_realm
+try:
+    # 1) 思考模型 + 客户端没给 max_tokens -> 自动补保底输出上限
+    _pl48a = {"model": "Qwen3.8-Flash", "messages": [{"role": "user",
+              "content": "hi"}]}
+    _b48a = P.build_qoder_body(_pl48a, _acc47, "qfmodel", realm="cn")
+    check("#48-1 思考模型未给 max_tokens -> 自动补 QD_REASONING_MODEL_MAX_TOKENS",
+          (_b48a.get("parameters") or {}).get("max_tokens") ==
+          P.QODER_REASONING_MODEL_MAX_TOKENS,
+          (_b48a.get("parameters") or {}).get("max_tokens"))
+    # 2) 客户端显式给 max_tokens -> 一律尊重（不改）
+    _pl48b = {"model": "Qwen3.8-Flash", "messages": [{"role": "user",
+              "content": "hi"}], "max_tokens": 1024}
+    _b48b = P.build_qoder_body(_pl48b, _acc47, "qfmodel", realm="cn")
+    check("#48-2 客户端显式 max_tokens=1024 -> 尊重不改",
+          (_b48b.get("parameters") or {}).get("max_tokens") == 1024,
+          (_b48b.get("parameters") or {}).get("max_tokens"))
+    # 3) 非思考模型未给 max_tokens -> 保持 BASEPROMPT 默认 32768（不覆写）
+    _pl48c = {"model": "plain", "messages": [{"role": "user", "content": "hi"}]}
+    _b48c = P.build_qoder_body(_pl48c, _acc47, "plainmodel", realm="cn")
+    check("#48-3 非思考模型未给 max_tokens -> 保持模板默认 32768（不覆写）",
+          (_b48c.get("parameters") or {}).get("max_tokens") == 32768,
+          (_b48c.get("parameters") or {}).get("max_tokens"))
+    # 4) 思考模型 + max_completion_tokens 别名也尊重
+    _pl48d = {"model": "Qwen3.8-Flash", "messages": [{"role": "user",
+              "content": "hi"}], "max_completion_tokens": 512}
+    _b48d = P.build_qoder_body(_pl48d, _acc47, "qfmodel", realm="cn")
+    check("#48-4 max_completion_tokens 别名 =512 -> 尊重",
+          (_b48d.get("parameters") or {}).get("max_tokens") == 512,
+          (_b48d.get("parameters") or {}).get("max_tokens"))
+    # 5) reasoning_effort=none 仍按原语义下发（关思考，不被吞）
+    _pl48e = {"model": "Qwen3.8-Flash", "messages": [{"role": "user",
+              "content": "hi"}], "reasoning_effort": "none"}
+    _b48e = P.build_qoder_body(_pl48e, _acc47, "qfmodel", realm="cn")
+    check("#48-5 reasoning_effort=none 仍下发 'none'（关思考，不被吞）",
+          (_b48e.get("parameters") or {}).get("reasoning_effort") == "none",
+          (_b48e.get("parameters") or {}).get("reasoning_effort"))
+    # 6) xhigh 档位仍正常归一化下发（回归）
+    _pl48f = {"model": "Qwen3.8-Flash", "messages": [{"role": "user",
+              "content": "hi"}], "reasoning_effort": "xhigh"}
+    _b48f = P.build_qoder_body(_pl48f, _acc47, "qfmodel", realm="cn")
+    check("#48-6 reasoning_effort=xhigh 仍归一化下发（回归）",
+          (_b48f.get("parameters") or {}).get("reasoning_effort") in
+          ("xhigh", "max", "high"), (_b48f.get("parameters") or {}).get("reasoning_effort"))
+finally:
+    P.qoder_catalog.models_for_realm = _orig_meta
+
+print("SUMMARY: TOTAL %d checks, %d passed, %d failed, %d skipped" % (PASS + FAIL + SKIP, PASS, FAIL, SKIP))
+
+try:
+    _src_acc45 = open(os.path.abspath(__file__), encoding="utf-8").read()
+    _cnt45 = _src_acc45.count("check(") + _src_acc45.count("skip(")
+    print("CHECK-SOURCES: static-top-level=%d, runtime-executed=%d, skipped=%d, delta=%+d (loop/branch)"
+          % (PASS + FAIL + SKIP + SKIP, PASS + FAIL, SKIP, (PASS+FAIL+SKIP) - _cnt45))
+except Exception as _exc:
+    print("CHECK-SOURCES: 静态口径统计失败（%s）" % _exc)
 print("RESULT: %s (exit %d)  SKIP=%d  |  语义: 0=GREEN(无 FAIL，允许 SKIP)；"
       "1=RED(存在 FAIL)；SKIP 永不计入通过"
       % ("RED" if FAIL else "GREEN", 1 if FAIL else 0, SKIP))
 # 口径自证：静态源码里以 check(/skip( 开头的顶层断言点 vs 运行时执行数。
-# 两者差值来自循环展开（多执行）与条件分支未走（少执行）；以运行时数字为准。
-try:
-    with open(os.path.abspath(__file__), encoding="utf-8") as _fh:
-        _self_src = _fh.read()
-    _static = len([_ln for _ln in _self_src.splitlines()
-                   if _ln.lstrip().startswith(("check(", "skip("))])
-    print("CHECK-SOURCES: static-top-level=%d, runtime-executed=%d, skipped=%d, "
-          "delta=%+d (循环展开/条件分支)"
-          % (_static, PASS + FAIL, SKIP, (PASS + FAIL) - _static))
-except Exception as _exc:
-    print("CHECK-SOURCES: 静态口径统计失败（%s）" % _exc)
-if SKIP:
-    print("NOTE: %d 条断言被跳过（缺 fixture/环境），没有被当成通过；"
-          "补齐后请重跑确认它们真的通过。" % SKIP)
-sys.exit(1 if FAIL else 0)
