@@ -46,7 +46,7 @@ APP_TITLE = "Qoder2API-Hub"
 # 桌面发行版版本：跟 GitHub release tag 走（发新版时同步 bump 这里），
 # 线格式 1.0.x_R（R=本仓库桌面发行线，与上游 tag 永不撞名）。检查更新按它
 # 对比本仓库 Releases；网关本体 VERSION 是另一条线（日期.序号_upstream/_re）。
-APP_VERSION = "1.0.5_R"
+APP_VERSION = "1.0.6_R"
 DEFAULT_PORT = 8790
 LOG_NAME = "desktop-gateway.log"
 CONFIG_NAME = "desktop.json"
