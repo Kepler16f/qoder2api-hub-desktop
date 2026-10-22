@@ -46,11 +46,18 @@
 
 ![网关总览](docs/img/dashboard.png)
 
-**模型清单** —— 与官方桌面版同源：官方模型名、峰谷价、上下文多窗口、思考档位、能力徽标：
+## 特性
 
-![模型清单](docs/img/models.png)
+- **三种协议**：OpenAI Chat Completions、Responses API（Codex）、Anthropic Messages（Claude Code）
+- **双区多账号**：国内版 / 国际版独立账号池与出口，按模型自动选区；账号轮询、会话亲和、故障冷却换号
+- **免客户端登录**：OAuth 设备授权、PAT 导入，或直接导入本机官方客户端已登录的凭证
+- **模型与官方同源**：动态拉取官方清单，含峰谷价、上下文窗口、思考档位和禁用原因
+- **签到与保活**：自动领取每日 Credits 活动，定时刷新 Token
+- **防风控**：出站身份形态对齐官方客户端，可选的单号并发闸门与请求节奏控制，`/health` 提供排队 / 限流 / 拒绝信号遥测
+- **Web 看板**：账号、用量与性能指标、请求流水、限额护栏、智能体一键配置
+- **零依赖**：只用 Python 标准库（COSY 签名、AES / RSA 都是纯 Python 实现），另提供 amd64 / arm64 Docker 镜像
 
-**数据指标看板** —— Token 消耗透视、TTFT 首字延迟、生成速度与缓存命中率：
+## 快速开始
 
 ![数据指标看板](docs/img/metrics.png)
 
@@ -141,372 +148,51 @@
 **方式一：官方预构建镜像（推荐）**。每个版本会自动构建并推送多架构（amd64 / arm64）镜像到 GHCR，升级只要 `pull`：
 
 ```bash
-# 1. 拉取并启动
-docker compose pull
-docker compose up -d
-
-# 2. 查看网关日志
-docker compose logs -f
+git clone https://github.com/shuishuipingan/qoder2api-hub.git
+cd qoder2api-hub
 ```
 
-**方式二：从源码自行构建**。把 `docker-compose.yml` 里的 `image:` 注释掉、改用 `build: .`：
+然后选一种方式启动：
 
-```bash
-docker compose up -d --build
-```
-
-或直接 `docker run`：
-
-```bash
-docker run -d --name qoder-proxy --restart unless-stopped \
-  -p 8790:8790 -v $(pwd)/accounts:/app/accounts -v $(pwd)/usage:/app/usage \
-  -e API_KEY=your_secret_key ghcr.io/shuishuipingan/qoder2api-hub:latest
-```
-
-> **镜像与版本入口**：[**GHCR 包页面**](https://github.com/shuishuipingan/qoder2api-hub/pkgs/container/qoder2api-hub)（列出全部可用 tag、架构与拉取命令）· [**Releases**](https://github.com/shuishuipingan/qoder2api-hub/releases)（每个版本的变更说明）。
->
-> 可用 tag：**`latest`** · **`1.3`**（跟随最新 1.3.x）· **具体版本**（如 `1.3.3`）· **`sha-<短提交>`**（钉死某次构建）。镜像为 **linux/amd64 + linux/arm64** 双架构。
->
-> 提示：GitHub 仓库**首页侧栏**未必列出容器包 —— 用上面那个包页面链接即可，或直接 `docker pull ghcr.io/shuishuipingan/qoder2api-hub:latest`。
-
-```
-
-- **持久化目录**：`./accounts`（账号凭证及出口设置）与 `./usage`（请求流水与指标快照）；
-- **配置参数**：环境变量 `API_KEY`、`PORT`（监听端口，默认 8790）、`HOST`（监听地址，默认 127.0.0.1；容器内如需对外暴露设为 0.0.0.0）。
-
-> **设备身份稳定性（issue #18 实测 + v1.2.13 起根治）**：容器里的机器身份是**「容器级」**的——默认 `bridge` 网络下**重启即换**（含 `docker compose restart` 与宿主机重启后自动拉起），任何网络模式下**重建即换**。若你依赖「每台设备每日限领」这类按设备去重的规则，**只要 `accounts/` 是挂载卷，v1.2.13 起默认就已根治**（见下 ①）。注意：**推理 / API 链路不受影响**，它用的是按账号 UID 派生的身份。
->
-> **① 机器身份落盘缓存（v1.2.13 起默认启用 —— 根治「重建 / 升级必换」）**
-> 网关会把官方组件**首次输出的**身份缓存到 `accounts/machine_identity.json`，之后**优先复用**：重建、升级、重启容器后设备身份**保持不变**。
->
-> - **前提**：`accounts/` **必须是挂载卷**（不挂卷时缓存写在容器内部、随容器消亡，等于没缓存）；
-> - 缓存的是**官方组件自己的输出**，不是伪造；
-> - ⚠️ **更正（v1.2.16，据 issue #18 的实测）**：组件**会**落状态文件 —— 它在 `$HOME/.config/.locale_cfg`（350 B）里存一个**随机种子**，身份由「该种子 + 机器证据 + 容器证据」共同决定。**「想换身份」本质上就是换这个种子**（我们之前「组件不落状态文件」的说法是错的）；
-> - **机制（三输入模型）**：`identity = f(种子[, $HOME/.config/.locale_cfg], 机器证据[DMI / CPU / …], 容器证据[/proc/mounts 的 overlay 行、网卡 MAC])` —— 这解释了两件事：**同一容器内身份恒定**（种子不变，实测 69 分钟 24 次采样无变化），而**重建容器会换**（overlay 行变，compose 层盖不住）；
-> - **想主动换身份**：删除 `accounts/machine_identity.json`（或启动时设 `QD_MACHINE_IDENTITY_RESET=1` 跑一次）；
-> - **不想启用**：`QD_MACHINE_IDENTITY_CACHE=off`（回到旧行为）；
-> - **想定期轮换**：`QD_MACHINE_IDENTITY_CACHE_TTL=<秒>`（默认 `0`＝不过期）。到期后会**清掉组件种子并取一个新身份**（**真的换**，不是重读一遍同一个值），重建后身份也随之改变；
-> - **三条会自动「换身份」的路径**：① 服务端不认当前身份时的**自愈**（`campaigns()` 判 `showCampaign=false`）；② **`QD_MACHINE_IDENTITY_RESET=1`**（或直接删缓存文件）；③ **TTL 到期**。**其余路径一律不碰种子** —— 否则「重建不换」会被自己削弱；
-> - 若服务端某天不再接受该身份，既有**自愈**会在活动列表被判「未认可」时刷新并**更新缓存**（日志有 WARN 提示）；
-> - ⚠️ 该文件代表**物理机器的身份**，**不要跨机器共享 `accounts/`**；顺带一提，组件不可用时（如 alpine 缺兼容层）现在也能**继续用真身份**，而不是退化成派生假身份。
->
-> **② 固定网卡 MAC（可选）** —— 如果你**不想**启用落盘缓存、或希望组件调用本身也稳定：
->
-> **① 固定网卡 MAC（推荐，代价最小）** —— 留在默认 bridge 网络、**保留 `ports:` 映射**：
-> ```yaml
-> services:
->   qoder-proxy:
->     mac_address: "02:42:ac:11:00:77"
->     ports: ["8790:8790"]
-> ```
->
-> 📌 **v1.2.13 起本方案已非必需**：只要 `accounts/` 是挂载卷，落盘缓存就连「重建/升级」都覆盖了（见上面 ①）。保留这一条是给「不挂载 `accounts/`」或「希望组件调用本身也稳定」的场景。
-> ⚠️ 上面那串 MAC **只是示例，请换成你自己生成的**，别照抄——macvlan 网络或同一宿主机跑多个实例时会撞 MAC：
-> ```bash
-> printf '02:42:%02x:%02x:%02x:%02x\n' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256))
-> ```
-> 若你的 Docker 拒绝 service 级 `mac_address`（官方文档提到 Engine ≥ v25 可能拒绝；实测 Docker 29.6.1 与 29.7.2 均接受），改用 `networks.<网络名>.mac_address`。
->
-> **② `network_mode: host`（备选）** —— 彻底共享宿主网络栈，适合宿主机端口冲突、或确实需要容器直接占用宿主端口时；代价是不能用 `ports:` 映射，且**切换前请确认目标端口在宿主机上空闲**，否则容器会启动失败。
->
-> **机制（两输入模型）**：`identity = f(每容器独有的量, 容器网卡 MAC)` —— bridge 下容器停止会重建 veth、MAC 随之改变，而身份同时依赖这两者；固定 MAC 即可让 `stop/start` 后身份逐字节不变。**两条路都只解决「重启」这一类**：**重建容器仍会换**（由「每容器独有的量」决定，compose 层无法覆盖）。
->
-> 以上已在 **amd64 与 arm64**、真实官方镜像 + 真实 compose 下验证（issue #18 的作者与我们的独立复现）。
-
----
-
-## 二、核心特性详解
-
-### 1. 请求链路（COSY 签名推理）
-
-**瞬时故障韧性（双层）**：上游把自己的 provider 故障包装成 `418/5xx + provider_error` 抛回，或对 `qoder.sh` 出现 TLS/连接抖动（`SSL: UNEXPECTED_EOF...`）时：
-- **连接层**（urlopen 时刻的 HTTP/传输错误）：同账号快速重试 2 次（1s/2s 退避）；
-- **流内信封层**（关键形态：上游先 HTTP200 建流、再在 SSE 信封里投 `statusCodeValue=418`——表现为 access log 记 200 而业务错 418）：在**尚未向客户端写出任何上游字节**前重开上游重试 2 次（chat 流式/非流式 + Responses 全覆盖），流式客户端全程无感。
-
-重试仍失败才**短冷却（15s，单账号池实际 3s）换号**——不因上游的锅罚账号 60 秒；**短错误冷却期间（≤10s）后续请求改为「等待续上」而非报错**，且 `429 usage exceeds frequency limit` **只在上游真频控时出现**（账号错误冷却不再被误标为频控）。客户端参数错误（`invalid_parameter_error` 等）与**上游内容安全审核拒绝**（`InternalError.Algo.DataInspectionFailed: Input text data may contain inappropriate content`）**绝不重试**、快速失败——后者返回中文解释（`content_policy_rejected`：确定性拒绝、重试无效，请检查/缩短输入），由调用方修改输入而非等待。耗尽后其余瞬时错误客户端收到中文友好提示（`upstream_transient_error`）；错误详情经 `qoder_detail` 挂载保留 400 字节完整送达日志（含内层 `details`）。
-
-**HTTP 帧层与保活（治“一直重连/连不上”）**：
-
-- **流式响应使用 HTTP/1.1 `Transfer-Encoding: chunked`** 并以 `0\r\n\r\n` 正确收尾，**不再发 `Connection: close`**：同一个 keep-alive 连接可连续复用（实测同连接连发 5 次流式全部成功）。此前裸写字节 + `close` 会让连接池型客户端复用已半关闭的连接，表现为反复重连。
-- **SSE 心跳保活**：上游首字延迟实测可达 **40–71 秒**（`xhigh` + 2–3 万 token 长上下文），等待期间网关每 5 秒发送一个 SSE 注释帧 `: ping`（客户端规范要求忽略），避免客户端/中间代理空闲超时断连重连。可用环境变量 `QD_SSE_HEARTBEAT` 调整间隔（秒，`0` 关闭）。
-- **探活端点**：`GET /ping`（以及 `/healthz`、`/livez`、`/readyz`）返回纯文本 `pong`，**不需要面板密码或 API Key、不查账号池**——供客户端/脚本判活用；此前返回 404 会被判成网关不可用而反复重连。完整状态仍看 `GET /health`。
-
-- **出口代理（零代码）**：网关用标准库发请求，代理由**环境变量**决定——HTTPS_PROXY / HTTP_PROXY / ALL_PROXY（任一设置即生效），**没设则直连**（不继承 Windows 系统注册表代理，原因见下条）；**需要换出口（例如国际版走代理）时，设置环境变量就行，不必改配置**；容器里用 -e HTTPS_PROXY=... 传入。
-  - **Windows 系统代理与「首次请求固化」（#27 修复）**：Python 的 urllib 在 Windows 上会**连带读 WinINET 注册表**里的系统代理（不只是环境变量），且默认 opener 会在**进程首次请求时把当时的代理配置固化**——如果网关启动时你的代理工具开着（如 Clash，127.0.0.1:7897）、之后又关掉它，长驻进程会一直去连那个已无人监听的端口（WinError 10061），token 刷新与全部模型调用全挂，直到重启网关。**本仓现行策略**：出站统一走自建 opener（_opener_for_request），**代理只看环境变量、忽略注册表，且每请求现读**（无固化——开关代理对下一次请求立即生效）。
-  - **受影响的人怎么办**：如果你平时**靠系统代理才能上网**（且从没设过代理环境变量）——升级后需要显式设置一次：Windows 执行 setx HTTPS_PROXY http://127.0.0.1:7897（端口换成你自己的代理工具），然后重启网关；只想本地直连的**无需任何操作**。**TUN / fake-ip 型代理**（Clash 等）在网络层透明转发，**无需任何设置**、行为不变。
-  - 若你用的是 **fake-ip 模式的透明代理**（Clash 等），网关已内置 `_FAKEIP_NETS` 把 fake-ip 网段视为有效，**不会**因为 DNS 把域名解析成内网地址而拒绝请求。
-  - 说明：我们**没有**做「按账号绑定不同出口」那套（每账号独立代理槽 + 出口情报）—— 因为账号都由你本机导入、出口天然相同，实测也没有「上游按 IP 风控」的信号。**将来若真撞上按 IP 风控**，最小方案是给账号加一个可选 `proxy` 字段并让出站走 `ProxyHandler`（约 25 行）。
-
-- **积分汇总（只读，给下游轮询用）**：`GET /credits/summary` —— 走 **API-key 级鉴权**（`_key_ok`：API Key 或面板会话均可，未设 Key 时放行），**只返回本地已登记的 `credits`，绝不触发任何上游查询**（对照 `GET /accounts/credits`：那个会**逐号强制刷新**，适合作者手动点、不适合机器轮询）。
-  - 返回：`{ by_realm: {cn, intl}, totals: {remain, accounts}, accounts: [{uid, nickname, realm, credits_remain, credits_used, credits_size, registered_at}], note }`；
-  - **新鲜度**：数据来自签到链路写入的权威值与每次消耗的回写，所以它反映的是「**上次登记时的值**」，不是实时余额（字段名与 `note` 字段都在明示这一点）；
-  - 未登记过积分的账号（新号还没跑过）会**照常列出**，但 `credits_*` 与 `registered_at` 为 `null`、且不计入汇总；空池 / 无账号时返回空结构而非报错。
-
-**DeepSeek-Flash 偶发失败修复（issue #2）**：这族模型的多轮一致性与 `reasoning_content` 绑定，而旧实现有两处断点，导致"偶发失败、重试有时能过"：
-
-- **判定看的是客户端名字而不是上游模型**：旧逻辑只认名字前缀 `deepseek`，客户端按文档写「内部 key：`dfmodel`」时**整套兼容处理不会执行**。现按上游 key 判定（`is_deepseek_model`：`dmodel`/`dfmodel`/`DeepSeek-Flash`/展示 id「`dfmodel (DeepSeek-Flash)`」都命中）；
-- **补好的字段在真实请求路径上被丢掉**：`backfill_reasoning_content()` 写入 `reasoning_content` 后，`flatten_messages()` 压平会话时无条件丢弃该字段——即"兼容层写了但从没发出去"。现按目标模型保留（DeepSeek 族保留、其它模型不带，避免上游因未知字段拒答）。
-
-修复后已对国内版 `dfmodel` 实测：纯问答、展示名 `DeepSeek-Flash`、带 `reasoning_content` 的多轮历史、空 `reasoning_content`、`reasoning` 别名、工具调用历史、流式 27 帧全部 200 正常收尾。
-
-**客户端版本对齐（0.4.3 双区桌面端）**：协议常量按官方客户端当前版本逐项核对——
-
-- `cosy-version` = **1.1.64**（更新自旧 CLI 的 `0.1.43`；取自 0.4.3 内置 `qoder-agent-sdk`/`qoder-cn-agent-sdk` 的版本常量，实测模型列表与推理均正常）；
-- 国际版推理主机 = **`api1.qoder.sh`**（客户端 endpoint 缓存里的主选；`api2`/`api3` 为官方故障切换域名，网关同样按序切换，单个域名故障不再拖垮全部请求）；
-- 国内版主机 `gateway.qoder.com.cn`、双区 `openapi` 基址、`/algo/api/v2/service/pro/sse/agent_chat_generation`（推理）、`/algo/api/v2/model/list`（模型清单）、`/api/v1/deviceToken|jobToken/*`、`/api/v1/userinfo`、`/api/v2/quota/usage`、`/api/v2/user/plan`、`/sash/api/v1/me/*`（签到/活动平台）**均与新客户端一致**，无变化；
-- COSY RSA 公钥与新客户端内置 PEM **逐字节相同**；官方模型目录快照已用新版客户端缓存刷新（价格倍率/上下文/思考默认档等）。
-
-**思考档位（`reasoning_effort`）归一化**：官方上游字段就是 `parameters.reasoning_effort`（0.4.3 SDK 参数表里的 `reasoning_effort`，取值 `none`/`low`/`medium`/`high`/`xhigh`/`max`），但**每个模型的合法档位不同**，而**上游对不支持的档位不报错、直接忽略（回落到模型默认档）**——这就是"给 Qwen3.8-Flash 传档位没反应"的原因：
-
-| 模型 | 官方支持档位 | 默认 | 传 `medium`/`high` 会怎样 |
-|---|---|---|---|
-| `qfmodel`（Qwen3.8-Flash） | `low` / `medium` / `xhigh` | `medium` | `medium` 生效；`high` 不在表内 → 被忽略 |
-| `qmodel_38max`（Qwen3.8-Max） | `low` / `medium` / `xhigh` | `medium` | 同上 |
-| `dfmodel`（DeepSeek-Flash） | `low` / `high` / `max` | `max` | `medium`/`xhigh` 都不在表内 → 被忽略（实测输出与默认档一致） |
-| `qmodel`（Qwen3.7-Plus） | 无档位（仅开/关） | — | 任何档位都被忽略（只有 `none` 能关掉思考） |
-
-网关现在按**官方目录里该模型的档位表**归一化（`normalize_reasoning_effort()`）：命中原样透传；未命中取"最近的合法档位"（同距时偏向该模型默认档，如 `dfmodel` 的 `medium→high`、`xhigh→max`，`qfmodel` 的 `high→medium`、`max→xhigh`），并在日志标注；模型**有 thinking_config 但无档位表**时不再下发无效档位（只保留 `none`）；模型**完全没有 thinking_config**（如路由器 `auto`）则原样透传，不做猜测。`/v1/models` 的 `reasoning_efforts` / `reasoning_default_effort` 字段即为该模型的合法档位与默认档。另兼容 `reasoning.effort` 与 `thinking.effort/level` 三种客户端写法。
-
-```
-客户端 OpenAI 请求
-  → build_qoder_body()   官方 baseprompt 模板 + 会话压平（system/工具/参数覆写）
-  → qoder_encode()       Qoder 自定义 Base64（标准 B64 三段轮转 + 字母表映射, '=' → '$'）
-  → COSY 签名            RSA(1024) 包裹 AES-128 会话密钥 → info(AES-CBC 身份)
-                         Bearer = COSY.{payloadB64}.{md5(payload\ncosyKey\ndate\nbody\npath)}
-  → POST {gateway}/algo/api/v2/service/pro/sse/agent_chat_generation?…&Encode=1
-  → SSE 信封解包          {"headers","body","statusCodeValue"} 嵌套帧 → 内层 OpenAI chunk
-  → 标准 OpenAI SSE / chat.completion 回给客户端
-```
-
-模型清单按**三源优先级**完全对齐官方（详见「核心特性 · 模型清单」）：
-
-```
-1) 动态接口  GET {gateway}/algo/api/v2/model/list?Encode=1   （COSY 签名，需账号，300s 缓存）
-2) 本机官方客户端目录 ~/.qoder*/.models/<uid>/catalog-v6      （QMC 解密，离线可用）
-3) 内置双区官方快照 qoder_catalog_intl.json / qoder_catalog_cn.json
-   （客户端更新后 `python _refresh_catalog.py` 一条命令重新导出并打印差异；
-    两个文件缺失时才回退 qoder_catalog.py 内嵌的冻结副本并打印 WARNING）
-```
-
-**双区清单不同**（源自本机官方客户端 catalog 的**全字段**忠实快照，chat 场景；`id` = 官方模型名，直接照抄即可）：
-
-- 🇨🇳 **国内版 (动态 14 条，全部开通)**：`Auto` · `Qwen3.8-Max` · `Qwen3.8-Flash` · `Qwen3.7-Max` · `Qwen3.7-Plus` · `Qwen3.7-Flash` · `DeepSeek-V4-Pro` (96K) · `DeepSeek-Flash` · `GLM-5.3` · `GLM-5.3-Flash` (1M) · `GLM-5.2` · `Kimi-K3` · `Kimi-K2.8-Preview` · `MiniMax-M2.7`
-- 🌐 **国际版 (动态 17 条；开通 2、未开通 15)**：`Qwen3.8-Max`、`Qwen3.8-Flash` 开放；其余（`Ultimate`/`Performance`/`Efficient`/`Sonus`/`Cantus`/`DeepSeek-V4-Pro`/`MiniMax-M3`/`Auto` 等）标注**官方原文**「需要升级或购买千问官方套餐开放」+ 上游 `disabled_message_key`（`codeSafeModelReason`），**不隐藏条目**（与桌面版此刻同一份清单）。
-
-**峰谷价（官方 `promotion` 字段）——低谷折扣模型共 3 个（双区一致），全部高亮**：
-
-| 模型 | 峰价 | 谷价 | 折扣（官方 badge） |
-|---|---|---|---|
-| `Qwen3.8-Max` (`qmodel_38max`) | 0.50x | 0.20x | 错峰 4 折 |
-| `Qwen3.7-Max` (`qmodel_latest`) | 0.50x | 0.10x | 错峰 2 折 |
-| `Qwen3.7-Plus` (`qmodel`) | 0.10x | 动态为准（快照 0.04x） | 错峰 4 折 |
-
-均为 22:00-08:00 窗口（`Qwen3.8-Flash` 另有限时免费 0.00x，原 `0.10x`）。`/v1/models` 与看板对**每个**促销模型输出 `price_factor_peak` / `price_factor_valley` / `off_peak{window_start,window_end,badge,description,discount_factor,timezone}` 与 **`off_peak_active_now`**（按官方时区 UTC+8 跨午夜窗口判定当前是否处于低谷）。判定顺序上 **promotion 分支优先于 0 价分支**——`is_free` 表示"含免费权益"而非 0 价（Qwen3.8-Max `is_free=true` 但价 0.20x），不会被错标成免费、也不会吞掉低谷高亮（单测有分支顺序回归断言）。
-
-**低谷时段视觉高亮**：看板在低谷窗口（22:00-08:00）内把价签切换为**亮绿发光高亮块**——大号谷价 +「● 低谷生效中」徽标 + 峰价红色删除线 + 时段/折扣文案；非低谷时段显示常规「峰 x → 谷 x」并提示「低谷自 22:00 起」。判定用后端字段 + 浏览器本地时间即时复算双保险，跨窗口自动切换。
-
-同 key 跨区也可能不同（`mmodel` 国际=MiniMax-M3、国内=MiniMax-M2.7）；上下文窗口、倍率、视觉/推理标志逐项取自官方条目（如国内 `dmodel` 96000、国际 `dmodel` 1000000）。请求侧接受 key / 展示 id「key (Name)」/ 人类可读别名 / 官方显示名任意形式；区域独占模型（国内 `q37fmodel`/`glm-5.2`、国际 `smodel`/`ultimate` 等）自动路由到归属出口。
-
-### 2. 稳定物理设备指纹隔离 (`derive_id`)
-
-双区域统一方案：以账号 UID + 业务盐单向 MD5 派生固定 `machineId` / `sessionId` / `machineType` / `machineToken`，COSY 签名头逐请求携带：
-
-- **同一账号长期稳定**：出站请求永远来自同一台虚拟物理设备，规避机器码漂移风控；
-- **多账号天然隔离**：不同账号机器码彼此独立，阻断跨账号关联检测。
-
-### 3. 每日签到、额度与 Pro 福利包（双区域 · 真实领取）
-
-**当前官方机制 = 活动平台领取**（`Account.campaign_checkin()`），网关直接完成领取：
-
-- **列表**：`GET /sash/api/v1/me/campaigns`（双区域通用）——**必须同时满足两层**，缺一层都会静默少活动：
-  1. **桌面端请求头**（`Cosy-ClientType: 10` + `Cosy-Version` + 机器头 + `UA: Qoder`）；缺了 → 服务端不报错、直接返回**空列表**；
-  2. **真实机器身份**（`Cosy-MachineToken/Type/Code`）——官方桌面端在拉活动前会 spawn 自带的风控桥 `resources/umid/runtime-info.exe prod --account-stdin`（stdin `{"account": <uid>}`）取真值；用派生假值时列表会**静默少掉设备定向活动**（「每日领取 100 Credits」即其中之一）。网关现在调用同一个官方二进制取真值（结果缓存 6h，`QD_NATIVE_IDENTITY=0` 可关闭），失败才回退派生值并在活动状态里标注 `identity=derived`；
-- **领取**：对 `claimStatus=CLAIMABLE` 且 `actionType=CLAIM_BENEFIT` 的活动 `POST /sash/api/v1/me/campaigns/{campaignId}/claim`（逆向自官方 `growth-page/activity-iframe` 页面 JS）。**官方幂等**：已领取返回 `{"status":"CLAIMED","replayed":true}`，不会重复发放；`GET …/{id}/reward` 可查发放状态；
-- **任务中心**：`daily_checkin` 行直接反映真实活动状态——可领取显示「可领取 100 Credits（act-…）—— 点『一键签到』自动领取」，已领取显示「今日已领取 +100 Credits，明日再来」；
-
-**官方活动与新人权益规则**（官方文档原文 + 实测，解释"为什么有的号有、有的没有"）：
-
-| 项目 | 国际版 | 国内版 |
+| 平台 | 启动 | 停止 |
 |---|---|---|
-| 每日 100 Credits | 文档写"每账号每轮限领一次"，**实际执行按"人"去重**（实测：绕过列表直接 claim 返回 `status=BLOCKED, failureCode=SAME_PERSON_ALREADY_CLAIMED`）——同一台机器上的多账号共享每轮一次的额度，被去重的号**列表里连活动都不显示**；每日 10:00（UTC+8）刷新，错过不补；奖励 30 天有效；**仅桌面端可领** | 规则同款（北京时间 10:00 刷新；实测多账号同样按人去重） |
-| 新人权益 | **14 天 Pro 试用 + 300 Credits**：首次登录桌面客户端时发放（要求最新版）；**虚拟机不参与**；**每个用户限一次，额外注册的试用账号会被冻结** | 新注册用户活动（如 09-30 起的「奶茶免单卡」）：桌面端完成新人任务后领取，每日限量先到先得 |
-| 月度基础额度 | Free 档 **0 Credits**（超额后自动切基础模型） | 体验版/试用按套餐发放（实测 Pro Trial 300/月） |
-| 风控 | 客户端原生桥（`runtime-info.exe`）回传机器身份 + **VM 检测**；活动列表按真实机器身份定向下发，伪造/缺失会被静默过滤。**注意误报**：`runtime-info` 的 `isVm` 对**所有账号返回同一个值**（纯机器指纹，与账号无关），且在**开了 VBS/内核隔离的实体机**上会误报为 VM——Windows 11 默认开启 VBS/HVCI 后系统本身跑在 Hyper-V 之上（`systeminfo` 显示"已检测到虚拟机监控程序"），实体机（如华硕游戏本）也被判 `isVm=true (Hyper-V, 77%)`；由于官方条款"VM 不参与新人试用"，这会连带挡掉新号 300 | 同款原生桥与 VM 检测 |
+| Windows | 双击 `start-qoder-proxy.bat`（后台运行，日志写入 `qoder-proxy.log`） | `stop-qoder-proxy.bat` |
+| Linux / macOS | `chmod +x *.sh && ./start-qoder-proxy.sh`（前台运行） | `Ctrl+C` |
+| Docker | `docker compose up -d` | `docker compose down` |
 
-> 因此「注册了几个号都没有新人 300 / 没有签到活动」的常见原因：① 跑在**虚拟机/云桌面**里（新人 300 明确不参与，活动也可能被风控过滤）；② **同用户批量注册**——第一个号拿走试用后，其余号会被冻结（无试用、无 300）；③ 只注册了网页账号、**没登录过最新版桌面客户端**（300 在首次登录客户端时发）；④ 每日活动**每账号每轮限领一次**，错过当天窗口不补领。
-- **旧 sash 接口**（`/sash/api/v1/me/daily-check-in/*`）仅在仍开放时作为兜底并附一行历史状态；能力运行时探测（404/405/410 记「本区域无此接口」，6 小时后自动重探）。实测国内版 `status=DISABLED`、国际版全 404；
-- **额度体系**：`/api/v2/quota/usage` 聚合基础额度 + 赠送/签到额度；`/api/v2/user/plan` 套餐名（Pro Trial 等）；
-- **Pro 福利包**：一次性 +1800 积分，`eligibility → claim` 两步走（端点 404 时视为活动未开放）；
-- **看板「签到与福利中心」**：连续签到天数、积分余额、福利包状态卡片 + 任务行表格，支持单账号/批量；国内版与国际版账号都会列出。
+启动后：
 
-**券/兑换码类活动（如「奶茶免单卡」act-20260928-620）与多账号逻辑**
+- **API**：`http://127.0.0.1:8790/v1`
+- **看板**：`http://127.0.0.1:8790/`，默认密码 `admin`，首次登录后请到「设置」修改
 
-- **任务需在官方客户端完成**（例如桌面端「站点」发布 AI 站点 → `sites_first_use`）：网关不代做任务，只在**条件满足后自动领取**——整点巡检（09:00/21:00）或点「一键签到」立即尝试；服务端名额发完时按官方口径**次日 10:00 后自动重试**；
-- **服务端按「人」去重**：同一设备/身份下的多个账号共用一张券（先到先得），后领的账号会收到 `SAME_PERSON_ALREADY_CLAIMED`——网关记为「同人已领取」并**冷却 6 小时**（不重复 POST、不刷日志、也不算失败），冷却状态写入账号文件；
-- **兑换码按账号分别保存**：领取成功后写入该账号的 `campaignCodes`（落盘，重启不丢）；任务中心为该类活动单独成行（奖励列显示「兑换码 ×1」），按账号回显兑换码，`/tasks` 的 `summary.codes` 同样按账号输出；
-- 其它状态与官方前端一致：`ACHIEVEMENT_NOT_COMPLETED`（需先完成任务）、`CAMPAIGN_NOT_ACTIVE`（活动未开始/已结束）、`RISK_BLOCKED`（风控拦截）都会如实显示中文原因；上游只返回 `CLAIMED` 但还没给码时标记「兑换码发放确认中」。
+在看板「账号」页点 **+ 添加账号 (OAuth)**，到浏览器里完成授权，账号就加好了。
 
-### 4. 后台常驻定时调度器 (Scheduler)
+> Docker 以局域网模式启动，会强制使用 API Key。首次启动时自动生成，用 `docker compose logs qoder-proxy | grep -i "api key"` 查看。
+> 局域网共享、改端口、出口代理见[部署](docs/deployment.md)。
 
-- **每日 09:00 & 21:00**：全量自动签到（补签未签账号）+ 额度快照刷新；
-- **每日 22:00**：集中 Token 保活 —— `drt-` → `deviceToken/refresh`，`jrt-` → `jobToken/refresh`，失败回落 PAT 重新交换；
-- 任意巡检中对剩余寿命不足 4 小时的 Token 提前刷新；
-- **会话死亡识别**：上游 `TOKEN_EXPIRE` / `12153` / `Offline user session not found` → 自动停用账号并标注需重新登录。
+## 接入客户端
 
-### 5. 凭证家族与生命周期
-
-```
-accessToken:   dt- (OAuth 设备流, ~30天)  或 jt- (PAT 交换, 24小时)
-refreshToken:  drt- (~1年, 旋转)          或 jrt- (48小时)
-personalToken: pt- (长期兜底, 看板导入)
-```
-
-刷新按 `refreshToken` 前缀路由，PAT 永不覆盖活跃 OAuth 会话，只做最终兜底；`access token` 轮换后 COSY 会话自动重建。
-
----
-
-## 三、账号添加与管理
-
-打开看板 `http://127.0.0.1:8790/`，在「账号」区域操作：
-
-### 方式零：扫描本机已登录凭证（推荐，双区）
-1. 点击 **「扫描本地凭证」**（只读，不写入）；
-2. 弹窗分区域列出检测到的凭证：
-   - **桌面 App**：`%APPDATA%\com.qoder[.cn].app.stable\auth.v1.dat`
-     （Chromium `v10` 布局，`Local State` 的 os_crypt 密钥经 DPAPI 解出后 AES-256-GCM 解密）
-   - **Qoder CLI**：`~/.qoder[.cn]/.auth/user[.{profile}]`
-     （AES-128-CBC，key = `machine_id` 前 16 字符）
-3. 点击对应行的 **「导入」**（或启动时日志只会提示发现 N 条、绝不静默采用）。
-
-### 方式一：OAuth 设备授权（推荐，免客户端）
-1. 点击 **「+ 添加账号 (OAuth)」**；
-2. 选择登录区域（国内版 / 国际版），点击弹出的官方授权链接；
-3. 浏览器完成登录授权（PKCE S256），网关自动轮询取回 `dt-`/`drt-` 并入池。
-
-### 方式二：PAT 导入
-1. 在 Qoder 网页版「设置 → Personal Access Token」创建 `pt-` 令牌；
-2. 看板点击 **「🔑 导入 PAT」**，选择区域并粘贴；
-3. 网关自动交换 `jt-`/`jrt-`、拉取账号身份入池。
-
-### 方式三：JSON 导入 / 导出
-- 支持全量/单账号导出（可选带密钥）、Dry-Run 预检导入、覆盖同 UID；
-- 兼容本网关导出格式、账号数组、单个账号对象。
-
----
-
-## 三·五、智能体一键配置
-
-看板「智能体配置」页可检测本机已装的 AI 客户端，一键把它们的配置指向本网关：**改前自动备份、byte-exact 还原、多文件两阶段写入**（任一失败整体回滚）。纯标准库的文本级 YAML / TOML / JSON 编辑器，只增量插入或更新 `qoder-proxy` 那一段，绝不重排或抹掉你的注释、缩进与其它 provider 配置。
-
-| 客户端 | 写入位置 | 协议 |
-| --- | --- | --- |
-| Claude Code | `~/.claude/settings.json` | 原生 Anthropic Messages（自动剥 `/v1`） |
-| Codex CLI | `~/.codex/config.toml`、`~/.codex/auth.json` | Responses API |
-| OpenCode | `~/.config/opencode/opencode.json` | OpenAI 兼容（`@ai-sdk/openai-compatible`） |
-| DSH (DeepSeek Harness) | `~/.dsh/settings.yaml`、`~/.dsh/.credentials.yaml` | OpenAI 兼容 |
-| Crush (Charm) | `~/.config/crush/crush.json` | OpenAI 兼容 |
-
-- **模型表自动预填**：写入时顺带从网关拉取 `/v1/models`（含上下文窗口），也验证 Key（401 = Key 被拒）；
-- **可回滚**：备份存 `accounts/agent-backups/<客户端>/`（每文件保留最新 10 份），「还原」byte-exact 回到接入前，网关新建的文件会被清理；
-- **密钥安全**：API Key 只写进客户端自己的本地配置；网关侧 state 只存 sha256 指纹，不存明文；
-- **写配置是 loopback-only**：一键配置改的是**网关所在机器**的文件——远程访问、容器部署下入口按设计隐藏。
-
-**客户端装在别的机器（网关跑在服务器 / NAS）**：用自带的配置器 CLI，它在客户端所在机器上运行、只通过 HTTP 从网关取模型表：
-
-```bash
-# 1. 取配置器（免面板鉴权的公开只读端点）
-curl -fsSL http://<网关地址>:8790/agents/cli -o qoder_agents.py
-
-# 2. 一条命令接入（Python 3.9+；Key 在「设置」页生成）
-python qoder_agents.py list                                        # 本机装了哪些客户端
-python qoder_agents.py apply --client dsh --base-url http://<网关>:8790 --key sk-xxxx
-python qoder_agents.py restore --client dsh                        # 随时 byte-exact 还原
-```
-
-## 四、客户端配置与接入
-
-### OpenAI 兼容客户端 (Chatbox / NextChat / Cherry Studio / Kelivo 等)
-- **API 接口地址 (Base URL)**：`http://127.0.0.1:8790/v1`（局域网为 `http://<局域网IP>:8790/v1`）
-- **API Key**：
-  - 本机单机模式（未配置 Key 且未开 LAN）：可留空或填任意字符；
-  - 已配置 Key 或 LAN 模式：在看板「设置」添加或复制已绑定出口的 Key。
-- **模型名称**：填 `/v1/models` 列出的 **`id`（官方模型名，如 `Qwen3.8-Max`）** —— 这是唯一需要记的值；`upstream_key`（缩写 key）、人类别名（`qwen3.8-max`）与官方本地化名也全部可解析。
-
-### Codex CLI / Claude Code (Responses API)
-```bash
-export OPENAI_BASE_URL="http://127.0.0.1:8790/v1"
-export OPENAI_API_KEY="你在看板设置中添加并绑定的API_Key"
-```
-custom freeform 工具（`apply_patch`）自动降级为 function 工具出站、入站还原为 `custom_tool_call`，Codex 工具回路完整可用。
-
----
-
-## 五、看板与接口一览
-
-访问 `http://127.0.0.1:8790/` 即可使用集成看板，核心接口：
-
-| 方法 | 路径 | 说明 |
+| 客户端 | Base URL | 协议 |
 |---|---|---|
-| GET | / | Web 用量与任务监控看板 |
-| POST | /v1/chat/completions | 标准 Chat Completions 接口 |
-| POST | /v1/responses | Responses API 协议接口 |
-| GET | /v1/models | 模型列表（动态拉取 + 静态兜底，含能力与规格宣告） |
-| GET | /credits/summary | **API-key 级**鉴权的只读积分汇总（**只回本地登记值、不触发任何上游查询**）——给下游集成轮询用，见下方说明 |
-| GET | /tasks | 签到状态、连续天数、福利包资格与额度快照 |
-| POST | /tasks/run | 触发批量每日签到与领奖 |
-| POST | /tasks/travel | 批量领取 Pro 福利包 |
-| GET | /agents | 本机客户端探测与接入状态（需面板会话） |
-| GET | /agents/models | 网关模型清单（智能体配置页预填用） |
-| GET | /agents/cli | 配置器 CLI 源码（公开只读，远程机器直接 curl 取用） |
-| POST | /agents/apply | 一键写入客户端配置并备份原件（面板会话 + loopback） |
-| POST | /agents/restore | 一键还原客户端至接入前（byte-exact） |
-| GET | /scheduler | 定时调度器运行状态与排程日志 |
-| POST | /scheduler/trigger | 手动立即执行后台巡检保活 |
-| POST | /accounts/login/start | 发起 OAuth 设备授权 |
-| POST | /accounts/import/pat | 导入 PAT 令牌 |
-| POST | /accounts/checkin | 手动签到（单个/全部） |
+| OpenAI 兼容客户端（Cherry Studio、Chatbox、NextChat 等） | `http://127.0.0.1:8790/v1` | Chat Completions |
+| Codex CLI | `http://127.0.0.1:8790/v1` | Responses API |
+| Claude Code | `http://127.0.0.1:8790`（不带 `/v1`） | Anthropic Messages |
 
----
-
-## 六、开发与测试
+- **模型名**：填 `/v1/models` 返回的 `id`，也就是官方模型名，例如 `Qwen3.8-Max`
+- **API Key**：在看板「设置」中生成。本机运行且没有配置任何 Key 时，可以留空
 
 ```bash
-# 离线确定性测试（482 项断言：AES-128/256 向量与官方 fixture KAT、QMC/凭证解密、
-# 自定义 B64、COSY 签名、双区官方目录全字段（峰谷价/多窗口/思考档位/展示 id/解析）、
-# 独占路由、签到能力运行时探测与 DISABLED 归一化、活动平台归一化、DeepSeek
-# reasoning_content 回填与 flatten 保留、请求体、信封解包、custom 工具转译、
-# 本机凭证扫描）
-python _test_qoder.py
-
-# 全量套件（29 个：Python + 前端 JS；--jobs 限并发，--logs 把每套件完整
-# 日志落在可见目录而不是临时目录，CI 与本地同一条命令）
-python tests/run_all.py --jobs 4 --logs suite-logs
-
-# 测试跑完后确认套件没把 checkout 弄脏（CI 的第二道门）
-python scripts/check_clean_checkout.py
-
-# 直接启动
-python qoder_proxy.py --port 8790
-
-# 签到/活动链路体检（含**本机虚拟化状态**：官方风控桥 vmInfo + 本机交叉校验，中文输出；
-# 只读；--uid 只看某账号；--no-local 跳过虚拟化检查）
-python _diag_campaign.py
-
-# 客户端更新后刷新官方模型快照（解密本机客户端目录缓存 → 双区 JSON 快照，
-# 并打印价格/上下文/思考档位的变化摘要；--dry-run 只看差异不写文件）
-python _refresh_catalog.py
-
-# 端到端模型库/能力清单验证（网关运行中执行；逐模型对比官方"此刻"数据：
-# id/enable/峰谷价/上下文窗口/思考档位/官方介绍/禁用原因/不编造字段/低谷判定）
-#   基准 = 官方动态接口优先（与桌面版选择器同源），本机目录按字段兜底
-python _verify_models.py --base http://127.0.0.1:8790
-#   断言数随所选基准而变（双区 JSON 快照基准 = 347 项；本机 catalog-v6 基准约 307 项）；
-#   退出码 0=全部一致；1=存在差异（打印逐条 FAIL 明细）；2=网关不可达
+curl http://127.0.0.1:8790/v1/chat/completions \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "Qwen3.8-Flash", "messages": [{"role": "user", "content": "你好"}]}'
 ```
 
-模块结构：
+Claude Code、Codex CLI、OpenCode、DSH、Crush 可以在看板「智能体配置」页一键写入配置，写入前会自动备份，随时可还原。详见[客户端接入](docs/clients.md)。
 
-| 文件 | 职责 |
+## 文档
+
+| 文档 | 内容 |
 |---|---|
 | `qoder_proxy.py` | 主网关：HTTP 路由、COSY 数据面、双协议转换、用量统计、看板鉴权 |
 | `qoder_sign.py` | 自定义 Base64、纯库 AES-128/256 + GCM、RSA、DPAPI、QMC 解密、COSY 签名 |
@@ -542,6 +228,21 @@ python _verify_models.py --base http://127.0.0.1:8790
 >   天然不撞。历史号对应：`2026.10.07` ≈ 2026.10.7.1_upstream（上游 v1.2.18）、
 >   `2026.10.08` ≈ 2026.10.8.1_re（上下文压缩）；更早的「网关 1.2.18/1.2.19/
 >   1.2.20」是 fork 旧连号（1.2.18 与上游撞车才改制），仅为历史记录。
+
+### 网关 2026.10.22.1_upstream — 并入上游 v1.5.6–v1.6.1（含 fork 自有 2026.10.20.2_re）
+
+- **#59 出站体积护栏**：多模态请求不再把整份 Base64 重复塞进 `image_urls` / `chat_context.imageUrls`（体积 3 倍膨胀→超阿里云 SLB 30MB 被 RST→Broken pipe 被当瞬态重试→全池熔断）；编码后超 `QD_MAX_BODY_MB`（默认 29MB）在发请求**前**直接 413（`PayloadTooLarge`）。同批：#60 工具回声「引号未转义」抢救式解析、#58 模型清单磁盘缓存 + `/models/refresh`、#57 容器反代国际版告警。
+- **#65 请求级故障 / 延迟记账**：内容审核 / 参数非法 / 上游 413 这类换号无意义的错误新增 `_is_request_fault()`——不换号不冷却，原错误直接抛给客户端（fork 侧在该 raise 前补了账号信号量释放，防中循环 raise 绕过兜底）；全池同样失败不再逐号记账（熔断延迟到「同一请求换号成功」才落账），断网恢复后不再被熔断锁死。
+- **#71 / #69 排队语义治理**：上游排队超预算后返回 HTTP 403+10605 是**模型级**排队——不再冷账号、不解绑会话亲和、不判死单号池；计数按**请求**计预算（不再 N 账号×6 轮拖 3N 分钟）；排队耗尽且另一区同模型有就绪账号时**跨区 failover**；最终统一 `429 + Retry-After`（fork 的 `last_queued` 信封机制退役，由上游 `last_queue_wait` 取代）。
+- **#72 残缺工具回声 fail-closed**：声明了 tools 却只回一个 marker 时不再静默吞掉按 `finish_reason=stop` 收尾（coding agent 会误判任务完成）——改抛 `EmptyToolEcho`，四条协议出口统一 fail-closed，type 走 Zcode 白名单 `invalid_tool_arguments` 可自动重试。
+- **#70 排程可配置 + 到点即补**：签到/保活时刻面板可改（支持 5 段 cron、账号间隔抖动、24 小时刻度圆环选择器）；旧实现靠每分钟轮询命中整点——时区偏差或巡检跨分钟就整段漏（修「签到无效」）；现每 15s 检查漏点、最多回补 3 小时。v1.6.1 修 `/scheduler/config` 404（漏注册在 `/accounts` 前缀路由里）。
+- **#67 组织共享池**：同组织多账号的共享额度在 `/credits/summary` 按 `organization_id` 去重（此前 5 号把 100 万乘成 400 万）；`cap: -1` 无限池显式语义、不再计入数字。
+- **#61 出站身份对齐**（存量号池注意）：UA 按区取官方 `QoderWork/1.1.64` / `Qoder/1.1.64`、请求 id 纯随机 32 位 hex、设备码改 UUIDv4 形状——上游会把每个已入池账号看做「换设备」，避免方法见其 v1.5.9 说明（`QD_DEVICE_ID_LEGACY=1`）。
+- **#62 / #63 / #66-#68 / #74**：Anthropic adaptive thinking 档位不再丢失（Claude Code 的 effort 四档正确映射）；Codex/MCP 的 `namespace`/`web_search` 工具类型上游前过滤；`dfmodel` 入结构化白名单 + marker 括号变体；模型文案快照重写 + `QD_OFFICIAL_TEXT` 覆盖；账号/API Key 备注（#69 持久化 + #74 回显修复）。
+- **一键更新未收录**：上游 v1.5.13 的 `qoder_updater.py` / `/update/plan` / `/update/apply` / 看板「一键更新」按钮整块剔除——`REPO` 硬编码上游仓库，内嵌网关自拉上游 tarball 会把 fork 的文件换成上游原版；桌面版的更新通道是 Inno 安装包（「检查更新」按 `APP_VERSION` 对比 fork tag）。
+- **#56 团队闸门原样收录**：`QD_TEAM_GUARD` 默认 `auto`（仅对团队/企业号生效）、`QD_TRAFFIC_GUARD` 默认关——与非团队号的 fork 信号量选号不叠加。
+- **fork 自有**：`2026.10.20.2_re`（110 号×模型当日计费配额分级处置、CN 设备族刷新回显过期 `expiresAt` 钳位 24h、三入口隐式区域不再拍平激活换区兜底、`friendly` 110→`quota_limit`）随本次一并带出。
+- **上游测试桩适配**：新并入套件（queue403 / issue59_followup / failure_families B9-B15）按 fork 传输层打桩惯例补 `UpstreamOpener._stub` 注入；`_test_qoder.py` 中上游 v1.5.9 的身份形态段重编为 [47]（与 fork [45] 令牌续签共位不撞号）。
 
 ### 网关 2026.10.20.1_upstream — 并入上游 v1.5.3–v1.5.5
 
