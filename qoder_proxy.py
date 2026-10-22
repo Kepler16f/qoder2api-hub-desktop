@@ -219,7 +219,7 @@ from pathlib import Path
 # 10-22：.2_re = #70 排程测试防重前提修正——fired 标记覆盖 _next_target 的
 # 完整扫描域（-1/0/+1 三天候选）；只标今天时在 UTC 凌晨（CI 正好落在该窗）
 # 前一日 22:00 距今不足 3h 回补窗内被正确判为待补跑，断言误判失败。
-VERSION = "2026.10.22.3_re"
+VERSION = "2026.10.22.4_re"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -3518,8 +3518,16 @@ def requested_effort(payload):
     """请求侧的**原始**思考档位（归一化之前），供 usage 记账与请求体构造共用。
 
     取值顺序与 build_qoder_body 下发给上游时完全一致（同源，避免两处漂移）：
-    reasoning_effort -> reasoning.effort -> thinking.effort / thinking.level。
+    reasoning_effort -> reasoning.effort -> thinking.effort / thinking.level
+    -> output_config.effort。
     仅做提取，不做任何归一化或猜测；空值返回 None。
+
+    output_config.effort：Claude Code 对第三方模型发
+    `thinking={"type":"adaptive"}` + `output_config={"effort":...}`，本地代理
+    （cc-switch 等）把这类请求转成 /v1/chat/completions 时 output_config 会
+    原样带过来——此前 OpenAI 入口不认它，指定强度被静默丢弃
+    （client_effort=None、固定跑模型默认档）。与 Anthropic 入口
+    effort_from_anthropic 的口径保持一致。
     """
     if not isinstance(payload, dict):
         return None
@@ -3529,6 +3537,9 @@ def requested_effort(payload):
     if not effort and isinstance(payload.get("thinking"), dict):
         # 兼容 thinking.effort / thinking_level 风格客户端
         effort = (payload.get("thinking") or {}).get("effort")             or (payload.get("thinking") or {}).get("level")
+    if not effort and isinstance(payload.get("output_config"), dict):
+        # Claude Code adaptive thinking：强度在 output_config.effort
+        effort = (payload.get("output_config") or {}).get("effort")
     return effort or None
 
 

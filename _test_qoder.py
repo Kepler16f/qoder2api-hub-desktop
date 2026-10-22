@@ -5502,6 +5502,25 @@ try:
 finally:
     P.qoder_catalog.models_for_realm = _orig_meta
 
+# [49] OpenAI 入口思考档位提取：output_config.effort（ccswitch/Claude Code）
+# —— cc-switch 把 Claude Code 请求转成 /v1/chat/completions 时，强度写在
+# output_config.effort + thinking={"type":"adaptive"}。此前 OpenAI 入口的
+# requested_effort 不认 output_config -> 指定强度静默丢弃（client_effort=
+# None、固定跑模型默认档）。与 Anthropic 入口 effort_from_anthropic 口径对齐。
+check("#49-1 output_config.effort=low -> 提取到",
+      P.requested_effort({"output_config": {"effort": "low"}}) == "low")
+check("#49-2 thinking adaptive + output_config.effort=max -> 提取到 max",
+      P.requested_effort({"thinking": {"type": "adaptive"},
+                          "output_config": {"effort": "max"}}) == "max")
+check("#49-3 reasoning_effort 优先于 output_config（优先级回归）",
+      P.requested_effort({"reasoning_effort": "high",
+                          "output_config": {"effort": "low"}}) == "high")
+check("#49-4 无 output_config 时不受影响（None）",
+      P.requested_effort({"messages": []}) is None)
+check("#49-5 output_config 非 dict/空 effort -> None（不猜测）",
+      P.requested_effort({"output_config": "low"}) is None
+      and P.requested_effort({"output_config": {}}) is None)
+
 print("SUMMARY: TOTAL %d checks, %d passed, %d failed, %d skipped" % (PASS + FAIL + SKIP, PASS, FAIL, SKIP))
 
 try:
