@@ -30,9 +30,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("ACCOUNTS_DIR",
                       os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    "_acc"))
-os.environ.setdefault("USAGE_DIR",
+# 用量目录跟账号目录一起隔离：本文件会被 tests/_test_legacy.py 用 subprocess
+# 起进程跑，环境变量名写错（曾写成 "USAGE_DIR"）会让隔离静默失效，测试流量
+# 全落进线上 usage/usage.jsonl —— 看板上多出一堆「账号=-、Key=历史行未记录」
+# 的失败行。目录与 tests/run_all.py 清理的 _acc/usage 保持一致。
+os.environ.setdefault("QD_PROXY_USAGE_DIR",
                       os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                   "_use"))
+                                   "_acc", "usage"))
 # 离线测试不拉起客户端原生二进制（活动平台的机器身份桥）；测试里显式关闭
 os.environ.setdefault("QD_NATIVE_IDENTITY", "0")
 
@@ -1190,6 +1194,11 @@ def fake_campaigns(url, **kw):
                            "placements": [{"type": "usage_panel"}]}]}
 
 
+# 测试隔离：5.6 的 fake-status-404 经 checkin() 的 intl fallback（活动领取
+# 系统 campaign_checkin）会把 PATH_CAMPAIGNS 标成「端点缺失」并进程内缓存
+# 6h——那是**桩环境下**产生的结论（stub raise 404），不清理会挡住 5.7 第一个
+# campaigns 桩（fresh 调用直接撞 cached 404）。
+_A._OPENAPI_404.clear()
 _A.http_json = fake_campaigns
 camp = _acc_camp.campaigns()
 _A.http_json = _orig_hj

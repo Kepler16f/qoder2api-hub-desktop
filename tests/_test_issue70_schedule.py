@@ -56,14 +56,16 @@ _s._fired = {}
 _occ = _s._occurrences(0)
 check("#70 当天排程点包含签到与保活", len(_occ) == 2, [o[1] for o in _occ])
 _now = time.time()
-# fired 标记必须覆盖 _next_target 的完整扫描域（昨天/今天/明天）：
-# 只标记今天的话，在服务时区当天 00:00-03:00 之间运行（CI 为 UTC，正好
-# 落在这个窗），前一日 22:00 距今不足 3h、属可回补候选，断言会误判失败。
-_cand70 = []
-for _off in (-1, 0, 1):
-    _cand70.extend(_s._occurrences(_off))
-_s._fired = {ts: True for _k, _l, ts in _cand70 if ts <= _now}
-check("#70 已触发过的点不会被重复触发", _s._next_target() is None)
+# issue #87：原断言只看「今天已过去的点」，CI 在 00:0x UTC 跑时今天的点全是
+# 未来 -> _fired 为空 -> 必然红（时间依赖的 flake）。这里把所有今天点都标记
+# 为已触发，再断言「不会重复返回同一个时间戳」（允许跨天滚动）。
+# （fork 曾以「fired 覆盖 -1/0/+1 三天全域」独立修过同题——2026.10.22.2_re；
+# 上游本提交语义等价且更简，收敛取上游版。）
+_occ_ts = {ts for _k, _l, ts in _occ}
+_s._fired = {ts: True for ts in _occ_ts}
+_nxt70 = _s._next_target()
+check("#70 已触发过的点不会被重复触发",
+      _nxt70 is None or _nxt70[2] not in _occ_ts, _nxt70)
 _s._fired = {}
 _due = _s._next_target()
 check("#70 过点未触发会立即补一次（回补窗口 3h）",

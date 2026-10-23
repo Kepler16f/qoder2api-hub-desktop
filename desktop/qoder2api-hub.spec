@@ -38,12 +38,18 @@ if sys.platform == "win32":
         if os.path.isfile(p):
             datas.append((p, os.path.join("assets", "webview2")))
 
-# UMID 原生组件（存在才打；放 binaries 保留执行位，POSIX 运行必需）
+# UMID 原生组件（存在才打；放 binaries 保留执行位，POSIX 运行必需）。
+# 上游 #75 起 Windows 语义 = runtime-info.exe + sgsdk.dll 同目录（缺 dll 不认），
+# 所以两个都打——提取脚本 _install_umid.py 本就产出这个二元组。
 binaries = []
 umid_name = "runtime-info.exe" if sys.platform == "win32" else "runtime-info"
 umid_path = os.path.join(ROOT, "umid", umid_name)
 if os.path.isfile(umid_path):
     binaries.append((umid_path, "umid"))
+if sys.platform == "win32":
+    umid_dll = os.path.join(ROOT, "umid", "sgsdk.dll")
+    if os.path.isfile(umid_dll):
+        binaries.append((umid_dll, "umid"))
 
 if sys.platform == "win32":
     icon = os.path.join(HERE, "assets", "qoder2api.ico")
