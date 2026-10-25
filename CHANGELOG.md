@@ -9,6 +9,23 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.7.6
+
+**🐛 问题修复**
+
+- **排队耗尽后 `RateLimited.status` AttributeError，200 的 SSE 被硬截断**（#100）：`visible_queue_acquire` 放弃时会把排队异常归一化成 `RateLimited`（只有 `http_error/detail/wait`，**没有 `.status`**），而 `/v1/responses` 与 chat 的 pump 收尾路径直接读 `pump_exc.status` —— 于是 200 已经发出去、流里一个字节都没补，客户端只看到连接被截断。
+  新增 `_exc_http_status(exc, default)` 统一取状态：`UpstreamStatus/Queued -> .status`、`RateLimited -> 429`、`HTTPError -> .code`，取不到才回落默认值；responses 与 chat 两处收尾都改为走它，并且仍按协议发终态事件（`response.failed` / `data: {error}` + `[DONE]`）。
+
+- **`max_tokens` 超上游上限直接透 400**（#101）：官方清单没有 `maxOutputTokens`，客户端只能踩坑试出来。现在把上游那句 `Range of max_tokens should be [1, N]` 当**学习信号**：
+  - `learn_max_output_limit()` 解析 `N`，按 `(区域, 模型)`（同时记客户端名与解析后的上游 key）落盘到 `usage/max-output-limits.json`，7 天 TTL；
+  - `build_qoder_body()` 在组装请求时就 clamp（含 `/v1/responses` 的 `max_output_tokens`），并打 WARN；
+  - `/v1/models` 补上 `max_output_tokens` / `max_completion_tokens`，客户端可自行预判；
+  - 记录点接在 `record_error`，任何入口命中该错误都会学到。
+
+  语义：第一次超限仍会收到上游 400（网关靠它才知道 N），**之后同一模型自动压到上限**。
+
+**验证**：新增 `tests/_test_issue100_101.py`（22 条：状态提取四类异常、两处收尾的源码守卫、上限解析/落盘/重载/clamp 生效与不生效、请求体实测 clamp、`/v1/models` 补字段）；全量 **77 suites / 2127 checks / 0 failed**。
+
 ## v1.7.5
 
 **🔄 跟进官方桌面端新版（CN 0.4.3 / intl 0.4.8）**

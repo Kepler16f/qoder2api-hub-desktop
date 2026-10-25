@@ -239,7 +239,11 @@ from pathlib import Path
 # 排队可见分支；官方积分消耗 credits-summary/heatmap + intl 第二活动入口；
 # opt-in 前缀会话亲和（qoder_session_cache，memory/Redis 后端）。
 # 上游同一区间发到 VERSION 1.7.5，本 fork 继续用日期制版本号。
-VERSION = "2026.10.26.1_upstream"
+# 10-26：.2_upstream = 追加上游 #100/#101（0426c33，v1.7.6）——visible_queue_
+# acquire 放弃时归一化成 RateLimited（无 .status）不再 AttributeError 截断 200 流；
+# 从上游 'Range of max_tokens should be [1, N]' 学习每 (区域,模型) 输出上限并落盘
+# （7 天 TTL），组包时 clamp，/v1/models 补 max_output_tokens。
+VERSION = "2026.10.26.2_upstream"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -881,6 +885,11 @@ def record_error(model, status, message, elapsed_ms=None,
     失败行带上账号/Key，才能看出「是哪个号在失败、是不是某个 Key 的客户端在
     打」；此前失败行这三项恒为空，面板只能显示成「历史行未记录 Key」。
     """
+    try:
+        # issue #101：从 400 文本里学输出上限（下一次请求直接 clamp）
+        learn_max_output_limit(message, model)
+    except Exception:
+        pass
     row = {
         "at": time.time(),
         "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -3476,6 +3485,11 @@ def model_entry(mid, meta, realm=None):
     # 最大输出：官方（catalog/动态接口）均无此字段——不输出、不展示（用户
     # 已确认不再测量该值）。
     max_out = meta.get("maxOutputTokens") or meta.get("max_output_tokens")
+    if not max_out:
+        try:
+            max_out = max_output_limit(mid, realm)
+        except Exception:
+            max_out = None
     if max_out:
         item["max_output_tokens"] = max_out
         item["max_completion_tokens"] = max_out
@@ -6200,6 +6214,12 @@ def build_qoder_body(payload, account, model_key, realm=None,
     # parameters：max_tokens / reasoning_effort / 思考开关透传
     params = body.get("parameters") or {}
     max_tokens = payload.get("max_tokens") or payload.get("max_completion_tokens")
+    # issue #101：已知该模型的上游输出上限时先 clamp（学到的或 catalog 带的）
+    if max_tokens:
+        max_tokens, _mt_clamped = clamp_max_tokens(
+            max_tokens, model_key or model, realm)
+        if _mt_clamped:
+            payload["_qd_max_tokens_clamped"] = True
     if max_tokens:
         # 客户端显式给的 max_tokens：一律尊重，网关不改（用户要求）。
         try:
@@ -7045,6 +7065,143 @@ def _envelope_queue_action(exc, realm, model, state):
     if q > QUEUE_WAIT_MAX_SECS:
         return "giveup", "", q
     return "wait", "", min(q + 1, QUEUE_WAIT_MAX_SECS)
+
+
+# ---------------------------------------------------------------------------
+# 上游输出上限（max_tokens）学习缓存（issue #101）
+#
+# 官方 catalog 里没有 maxOutputTokens，客户端只能踩坑试出来：超过上限时上游回
+#   400 invalid_parameter_error: Range of max_tokens should be [1, 131072]
+# 这里从错误文本里解析 N，按 (realm, model) 记住并持久化，之后请求直接 clamp
+# （并在 /v1/models 暴露 max_output_tokens），客户端不必再猜。
+# ---------------------------------------------------------------------------
+_MAX_OUT_LIMITS = {}          # (realm, model) -> (limit, ts)
+_MAX_OUT_LIMIT_TTL = 7 * 86400
+_MAX_TOKENS_RANGE_RE = re.compile(
+    r"Range of max_tokens should be \[1,\s*(\d+)\]", re.I)
+
+
+def _max_out_limits_path():
+    return os.path.join(USAGE_DIR, "max-output-limits.json")
+
+
+def _load_max_out_limits():
+    path = _max_out_limits_path()
+    if _MAX_OUT_LIMITS or not os.path.exists(path):
+        return
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        for key, val in (data or {}).items():
+            if not isinstance(val, dict):
+                continue
+            realm, _, model = key.partition("|")
+            lim = int(val.get("limit") or 0)
+            if lim > 0:
+                _MAX_OUT_LIMITS[(realm, model)] = (lim, float(val.get("at") or 0))
+    except Exception as exc:
+        log("load max-output-limits failed: %s" % exc, level="WARN", tag="chat")
+
+
+def _save_max_out_limits():
+    try:
+        os.makedirs(USAGE_DIR, exist_ok=True)
+        data = {}
+        for (realm, model), (lim, ts) in _MAX_OUT_LIMITS.items():
+            data["%s|%s" % (realm, model)] = {"limit": int(lim), "at": ts}
+        with open(_max_out_limits_path(), "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        log("save max-output-limits failed: %s" % exc, level="WARN", tag="chat")
+
+
+def learn_max_output_limit(detail, model="", realm=None):
+    """从上游 400 文本里学「该模型输出上限」，返回学到的 N（没学到返回 None）。"""
+    text = str(detail or "")
+    m = _MAX_TOKENS_RANGE_RE.search(text)
+    if not m:
+        return None
+    try:
+        limit = int(m.group(1))
+    except (TypeError, ValueError):
+        return None
+    if limit <= 0:
+        return None
+    realm = realm or CURRENT_REALM
+    keys = [(realm, model or "")]
+    try:
+        up = qoder_catalog.resolve_upstream_key(model, realm=realm)
+        if up and up != model:
+            keys.append((realm, up))
+    except Exception:
+        pass
+    prev = _MAX_OUT_LIMITS.get(keys[0])
+    if prev and prev[0] == limit:
+        return limit
+    for key in keys:
+        _MAX_OUT_LIMITS[key] = (limit, time.time())
+    _save_max_out_limits()
+    log("learned max_tokens limit for %s/%s = %d (clamping from now on)"
+        % (realm, model or "?", limit), level="WARN", tag="chat")
+    return limit
+
+
+def _resolve_upstream_key_safe(model, realm=None):
+    try:
+        return qoder_catalog.resolve_upstream_key(model, realm=realm) or ""
+    except Exception:
+        return ""
+
+
+def max_output_limit(model, realm=None):
+    """已学到的输出上限（含 catalog 自带的 maxOutputTokens），没有则 None。"""
+    realm = realm or CURRENT_REALM
+    _load_max_out_limits()
+    for cand in (model or "", _resolve_upstream_key_safe(model, realm)):
+        hit = _MAX_OUT_LIMITS.get((realm, cand))
+        if hit and time.time() - hit[1] < _MAX_OUT_LIMIT_TTL:
+            return hit[0]
+    try:
+        meta = catalog_meta_for(model, realm) if model else {}
+    except Exception:
+        meta = {}
+    for k in ("maxOutputTokens", "max_output_tokens", "max_output"):
+        v = (meta or {}).get(k)
+        if isinstance(v, int) and v > 0:
+            return v
+    return None
+
+
+def clamp_max_tokens(value, model, realm=None):
+    """把请求里的 max_tokens 压到已知上限以内（返回 (value, clamped?)）。"""
+    try:
+        val = int(value)
+    except (TypeError, ValueError):
+        return value, False
+    limit = max_output_limit(model, realm)
+    if limit and val > limit:
+        log("max_tokens %d > upstream limit %d for %s - clamped"
+            % (val, limit, model or "?"), level="WARN", tag="chat")
+        return limit, True
+    return val, False
+
+def _exc_http_status(exc, default=502):
+    """从任意异常里取一个 HTTP 状态码（issue #100）。
+
+    异常族有三套字段名：
+      · UpstreamStatus / UpstreamQueued -> .status
+      · RateLimited                    -> .http_error（**没有** .status）
+      · urllib.error.HTTPError         -> .code
+    取不到就回落 default —— 之前 _handle_responses / chat 直接读 exc.status，
+    排队耗尽后拿到 RateLimited 就 AttributeError，把 200 的流硬生生截断。
+    """
+    if isinstance(exc, RateLimited):
+        return 429
+    for attr in ("status", "http_error", "code"):
+        v = getattr(exc, attr, None)
+        if isinstance(v, int):
+            return v
+    return default
 
 
 def _as_rate_limited_for_queue(exc, model=""):
@@ -11911,26 +12068,27 @@ class Handler(BaseHTTPRequestHandler):
                         except Exception:
                             pass
                 if pump_exc is not None:
-                    # pump_exc 可能是 UpstreamStatus 也可能是 TimeoutError
-                    # （上游静默看门狗）——统一取属性，防二次 AttributeError；
-                    # 字段补齐（stream/account/key_id，上游 #78 口径）。
-                    status = getattr(pump_exc, "status", None) or 504
+                    # issue #100：pump 出来的可能是 RateLimited（排队耗尽），
+                    # 它**没有** .status —— 统一经 _exc_http_status 取，别再裸读。
+                    # fork 保留 detail 的 getattr 兜底：这条路径的 pump_exc 也
+                    # 可能是 TimeoutError（上游静默看门狗），同样没有 .detail。
+                    _pst = _exc_http_status(pump_exc, 429)
                     detail = getattr(pump_exc, "detail", None) \
                         or str(pump_exc)[:200]
-                    record_error(model, status, detail,
+                    record_error(model, _pst, detail,
                                  elapsed_ms=int((time.time() - t_start) * 1000),
                                  stream=True,
                                  account=account.uid if account else None,
                                  key_id=self._key_id_for_usage())
                     msg, _ = friendly_upstream_error(
-                        _to_int_status(status), detail)
+                        _to_int_status(_pst), detail)
                     log("responses upstream status %s: %s"
-                        % (status, msg[:200]), level="ERROR",
+                        % (_pst, msg[:200]), level="ERROR",
                         tag="chat")
                     # Responses 协议靠终态事件收尾：只关流会让客户端一直等。
                     try:
                         self._sse_write(_responses_failed_frame(
-                            holder, _to_int_status(status), msg))
+                            holder, _to_int_status(_pst), msg))
                     except Exception:
                         pass
                     self._sse_end()
@@ -12412,22 +12570,23 @@ class Handler(BaseHTTPRequestHandler):
                             pass
                 if pump_exc is not None:
                     exc = pump_exc
+                    # issue #100：同上——RateLimited 没有 .status
+                    _cst = _exc_http_status(exc, 429)
                     wall = int((time.time() - t_start) * 1000)
                     # pump_exc 可能是 UpstreamStatus（有 status/detail）也可能是
-                    # TimeoutError（上游静默看门狗）等普通异常——统一取属性，
-                    # 避免 504 路径上 AttributeError 把线程悄悄带走（无日志）；
-                    # 字段补齐（stream/account/key_id，上游 #78 口径）。
-                    status = getattr(exc, "status", None) or 504
+                    # TimeoutError（上游静默看门狗）等普通异常——detail 统一
+                    # getattr 兜底，避免 504 路径上 AttributeError 把线程悄悄
+                    # 带走（无日志）；字段补齐（stream/account/key_id，上游 #78）。
                     detail = getattr(exc, "detail", None) or str(exc)[:200]
-                    record_error(model, status, detail, elapsed_ms=wall,
+                    record_error(model, _cst, detail, elapsed_ms=wall,
                                  stream=True,
                                  account=account.uid if account else None,
                                  key_id=self._key_id_for_usage())
                     msg, etype = friendly_upstream_error(
-                        _to_int_status(status), detail)
+                        _to_int_status(_cst), detail)
                     err = json.dumps({"error": {
                         "message": msg, "type": etype,
-                        "code": status}}, ensure_ascii=False)
+                        "code": _cst}}, ensure_ascii=False)
                     try:
                         self._sse_write(("data: %s\n\n" % err).encode("utf-8"))
                         self._sse_write(b"data: [DONE]\n\n")
