@@ -1,7 +1,7 @@
 # Qoder2API-Hub Desktop — Qoder 双区多账号网关 · 开箱即用桌面客户端
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-1.0.6_R-2496ED?style=flat-square" alt="Version 1.0.6_R">
+  <img src="https://img.shields.io/badge/Release-1.0.7_R-2496ED?style=flat-square" alt="Version 1.0.7_R">
   <img src="https://img.shields.io/badge/Desktop-Win_x64_·_Win_ARM64_·_macOS_·_Linux-8A2BE2?style=flat-square" alt="Desktop Platforms">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
@@ -228,6 +228,11 @@ Claude Code、Codex CLI、OpenCode、DSH、Crush 可以在看板「智能体配�
 >   天然不撞。历史号对应：`2026.10.07` ≈ 2026.10.7.1_upstream（上游 v1.2.18）、
 >   `2026.10.08` ≈ 2026.10.8.1_re（上下文压缩）；更早的「网关 1.2.18/1.2.19/
 >   1.2.20」是 fork 旧连号（1.2.18 与上游撞车才改制），仅为历史记录。
+
+### v1.0.7_R — 桌面版：随网关 2026.10.22.3_re–2026.10.26.1_upstream 发布
+
+随上一条目发布的桌面版——核心是**思考模型保正文**（未给 max_tokens 时思考模型自动补 81920 输出上限，正文不再被 reasoning 饿死）与 **Claude Code 思考强度送达**（ccswitch 经 OpenAI 入口的 adaptive thinking effort 不再被静默丢弃）；并入上游 v1.6.2–v1.7.5 共 42 提交（#87/#99 排队可见、#89 启动防双开识别垂死实例、#90 企业账号判定统一、#75 UMID 原生身份对齐并补打 sgsdk.dll、#76/#83 自动换区修复、官方积分消耗 heatmap、v1.7.1 看板重做、opt-in 前缀会话亲和）。一键更新未收录（桌面更新走安装包）。
+发布说明见 [Releases](https://github.com/Kepler16f/qoder2api-hub-desktop/releases/tag/v1.0.7_R)。
 
 ### v1.0.6_R — 桌面版：随网关 2026.10.20.2_re–2026.10.22.2_re 发布
 
