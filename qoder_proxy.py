@@ -412,6 +412,13 @@ USAGE_LOG = os.path.join(USAGE_DIR, "usage.jsonl")
 USAGE_SUMMARY = os.path.join(USAGE_DIR, "usage-summary.json")
 DASHBOARD_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "dashboard.html")
+# Locale packs are plain JSON files dropped into i18n/: the folder listing *is* the
+# registry, so adding a language never touches code and never needs a restart.
+I18N_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "i18n")
+# The route is unauthenticated (the login gate itself needs translating), so the
+# requested name is matched against this allowlist before it ever reaches the
+# filesystem. Anchored at both ends and .json-only: no separator, no "..", no NUL.
+I18N_FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,31}\.json$")
 USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "reasoning_tokens",
                 "cached_tokens", "total_tokens", "credit",
                 # issue #22：折扣时段对账要用的原价积分（数值，参与聚合）。
@@ -9026,6 +9033,10 @@ class Handler(BaseHTTPRequestHandler):
                                "invalid_request_error")
         if path in ("/", "/dashboard", "/ui"):
             return self._dashboard()
+        if path == "/i18n/manifest":
+            return self._i18n_manifest()
+        if path.startswith("/i18n/"):
+            return self._i18n_pack(path[len("/i18n/"):])
         if path == "/panel/status":
             # 不带 token 也要回答：看板需要先知道是否显示登录页。
             info = {
@@ -9619,6 +9630,108 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(500, "dashboard.html unavailable: %s" % exc)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    # ---- locale packs ----------------------------------------------------
+    # i18n/<code>.json is the whole registry: the folder listing decides which
+    # languages the panel offers, so a new locale is a file drop, not a code
+    # change. Files are re-read per request (like _dashboard) so a dropped or
+    # edited pack takes effect without restarting the gateway.
+
+    @staticmethod
+    def _i18n_tiers_ok(data):
+        """True when every tier is an object of string -> string.
+
+        The frontend's load() applies the same rule, but validating only there
+        would let a broken pack show up in the language dropdown and then do
+        nothing when picked — a silent no-op is the worst failure shape for a
+        feature whose whole promise is "missing key falls back quietly".
+        Rejecting here makes a malformed pack invisible, which is consistent.
+        """
+        for tier in ("messages", "patterns", "fragments"):
+            value = data.get(tier)
+            if value is None:
+                continue
+            if not isinstance(value, dict):
+                return False
+            for key, item in value.items():
+                if not isinstance(item, str):
+                    return False
+        return True
+
+    @staticmethod
+    def _i18n_read(name):
+        """Return (abs_path, body_bytes, parsed_dict) for a locale pack.
+
+        Raises ValueError for anything that is not a safe, well-formed pack:
+        the name is checked against the allowlist *before* the filesystem is
+        touched, and the resolved path must still live inside I18N_DIR so a
+        symlink planted in the folder cannot expose accounts/ or usage data.
+        """
+        if not name or not I18N_FILE_RE.match(name):
+            raise ValueError("invalid locale name")
+        abs_path = os.path.realpath(os.path.join(I18N_DIR, name))
+        root = os.path.realpath(I18N_DIR)
+        if os.path.dirname(abs_path) != root:
+            raise ValueError("locale path escapes the i18n folder")
+        try:
+            with open(abs_path, "rb") as fh:
+                body = fh.read()
+        except Exception:
+            raise ValueError("locale pack unreadable")
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except Exception:
+            raise ValueError("locale pack is not valid JSON")
+        if not isinstance(data, dict):
+            raise ValueError("locale pack must be a JSON object")
+        if not Handler._i18n_tiers_ok(data):
+            raise ValueError("locale tiers must be string->string objects")
+        return abs_path, body, data
+
+    def _i18n_manifest(self):
+        packs = []
+        try:
+            names = sorted(os.listdir(I18N_DIR))
+        except Exception:
+            names = []       # no i18n/ folder yet is a normal state, not an error
+        for name in names:
+            if not I18N_FILE_RE.match(name):
+                continue
+            try:
+                _, _, data = self._i18n_read(name)
+            except ValueError as exc:
+                log("i18n: skipping %s (%s)" % (name, exc))
+                continue
+            meta = data.get("@locale")
+            meta = dict(meta) if isinstance(meta, dict) else {}
+            # The filename is the authority on the code: a pack that claims to
+            # be "en" while filed as de.json would otherwise be fetched by a
+            # name that does not match what the panel then loads.
+            meta["code"] = name[:-len(".json")]
+            meta.setdefault("name", meta["code"])
+            meta.setdefault("order", 100)
+            meta.setdefault("dir", "ltr")
+            try:
+                meta["order"] = int(meta["order"])
+            except Exception:
+                meta["order"] = 100
+            packs.append(meta)
+        packs.sort(key=lambda p: (p.get("order", 100), p.get("code", "")))
+        return self._json(200, {"default": "zh", "packs": packs})
+
+    def _i18n_pack(self, name):
+        try:
+            _, body, _ = self._i18n_read(name)
+        except ValueError:
+            # 404, never the exception text: this body is rendered into a toast.
+            return self._error(404, "no such locale pack",
+                               "invalid_request_error")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
