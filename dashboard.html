@@ -1590,6 +1590,7 @@ window.initLangSystem();
             <th style="text-align:center;width:160px">模型能力</th>
             <th style="text-align:center;width:130px">上下文窗口</th>
             <th style="text-align:left">思考档位</th>
+            <th style="text-align:center;width:130px">上下文设置</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -2684,7 +2685,7 @@ function renderAvailableModels(){
     countEm.textContent = '(共 ' + MODELS_DATA.length + ' 个 · 开放 ' + openN + ' 个)';
   }
   if(!MODELS_DATA.length){
-    tb.innerHTML = '<tr><td colspan="5" class="empty">暂无可用模型</td></tr>';
+    tb.innerHTML = '<tr><td colspan="6" class="empty">暂无可用模型</td></tr>';
     return;
   }
   tb.innerHTML = MODELS_DATA.map(m => {
@@ -2834,12 +2835,30 @@ function renderAvailableModels(){
       idLines.push('<div style="margin-top:2px;font-size:11px;color:var(--dim);line-height:1.45" title="'
         + esc(m.description) + '">' + esc(m.description) + '</div>');
     }
+    // 6. 上下文设置（issue #106）：官方 context_config 档位下拉；选中值发往网关
+    //    settings.model_context，build_qoder_body 按它抬 max_input_tokens。
+    const ctxKey = (m.upstream_key && m.upstream_key !== m.id)
+      ? m.upstream_key : m.id;
+    const ctxLabels = (m.context_window_labels && m.context_window_labels.length)
+      ? m.context_window_labels : (m.context_windows || []);
+    const ctxCur = String((window.SETTINGS_MODEL_CONTEXT || {})[ctxKey]
+      || (window.SETTINGS_MODEL_CONTEXT || {})[m.id] || '');
+    const ctxSel = ctxLabels.length
+      ? '<select class="ctx-select" data-model="' + esc(ctxKey) + '"'
+        + ' onchange="saveModelContext(this.dataset.model, this.value)">'
+        + '<option value="">默认' + (m.context_window_default
+            ? (' (' + esc(m.context_window_default) + ')') : '') + '</option>'
+        + ctxLabels.map(l => '<option value="' + esc(l) + '"' + (ctxCur === String(l) ? ' selected' : '') + '>'
+            + esc(l) + '</option>').join('')
+        + '</select>'
+      : '<span style="color:var(--dim)">—</span>';
     return '<tr>'
       + '<td style="text-align:left">' + idLines.join('') + '</td>'
       + '<td style="text-align:center">' + credBadge + '</td>'
       + '<td style="text-align:center">' + capHtml + '</td>'
       + '<td style="text-align:center">' + ctx + '</td>'
       + '<td style="text-align:left">' + effort + '</td>'
+      + '<td style="text-align:center">' + ctxSel + '</td>'
       + '</tr>';
   }).join('');
 }
@@ -4717,7 +4736,11 @@ async function refreshInner(){
     '<table><thead><tr><th>时间</th><th>模型</th><th>账号</th><th style="text-align:left">Key</th><th style="text-align:left">档位</th><th style="text-align:center;width:72px">区域</th><th>模式</th><th>耗时</th><th>首字</th><th>速度</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th><th>总 token</th></tr></thead><tbody>'
     + rows.map(r => '<tr>'
         + '<td class="mono">' + esc((r.iso||'').replace('T',' ').slice(5)) + '</td>'
-        + '<td class="mono">' + esc(r.model) + '</td>'
+        + '<td class="mono">' + esc(r.model)
+      + (r.billed_model && r.billed_model !== r.model
+        ? ' <span class="badge bad" title="上游实际按 ' + esc(r.billed_model) + ' 计费（该模型对网关身份未开放或被回退，计费与限额按它算）">' + '计费→' +
+            esc(r.billed_model) + '</span>'
+        : '') + '</td>'
         + '<td class="mono" style="font-size:11px;color:var(--dim)">' + esc((r.account||'—').slice(0,8)) + '</td>'
         + '<td style="text-align:left">' + keyCell(r) + '</td>'
         + '<td style="text-align:left;white-space:nowrap">' + effortCell(r) + '</td>'
@@ -4919,9 +4942,21 @@ async function startDashboard(){
   ];
 }
 
+async function saveModelContext(model, label){
+  try{
+    const r = await postJSON('/settings/model-context', {model: model, label: label});
+    window.SETTINGS_MODEL_CONTEXT = r.model_context || {};
+    renderAvailableModels();
+    toast(label ? ('上下文已设为 ' + label + '（立即生效，新请求起）')
+               : '已恢复官方默认上下文', 'ok');
+  }catch(e){ toast('保存失败: ' + e.message, 'bad'); }
+}
+
 async function loadSettings(showToast){
   try {
     const data = await getJSON('/settings');
+    // issue #106：模型上下文档缓存给模型库表用（保存后也走这份）
+    window.SETTINGS_MODEL_CONTEXT = data.model_context || {};
     const wtBox = document.getElementById('setWebTools');
     if(wtBox) wtBox.checked = data.web_tools === true;
     const wtState = document.getElementById('setWebToolsState');

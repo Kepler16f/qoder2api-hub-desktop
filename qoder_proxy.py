@@ -62,7 +62,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.7"
+VERSION = "1.7.8"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -545,6 +545,13 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
     fields = _extract_usage(usage)
     if not fields:
         return None
+    # issue #105：上游可能**静默换模型计费**（实测把 kmodel_latest 记成 auto）。
+    # 只有换号时才多写一个键——旧行格式零变化，面板/统计按需显示。
+    _billed = str((usage or {}).get("model") or "")
+    if _billed and _billed != str(model or ""):
+        fields["billed_model"] = _billed
+        log("upstream billed a different model: requested=%s billed=%s"
+            % (model, _billed), level="WARN", tag="chat")
     row = {
         "at": time.time(),
         "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -2345,6 +2352,8 @@ def runtime_settings_view():
         "limits": qoder_settings.limits_data(ACCOUNTS_DIR),
         # 本地 web 工具开关（默认关）：这是唯一由模型驱动出网的能力
         "web_tools": web_tools_enabled(),
+        # issue #106：各模型上下文档（面板回显 + 客户端可查）
+        "model_context": _model_context_snapshot(),
         "web_tools_rounds": WEB_TOOLS_MAX_ROUNDS,
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
@@ -5518,6 +5527,13 @@ def build_qoder_body(payload, account, model_key, realm=None):
     mc["url"] = ""
     mc["source"] = "system"
     mc["max_input_tokens"] = catalog_meta.get("max_input_tokens") or 180000
+    # issue #106：官方清单默认 ~200K，但模型实际支持 1M 档——允许按请求/设置抬窗。
+    try:
+        _ctx = model_context_override(payload, model_key, model, r)
+        if _ctx:
+            mc["max_input_tokens"] = _ctx
+    except Exception as _exc:
+        log("context override failed: %s" % _exc, level="WARN", tag="chat")
     body["model_config"] = mc
 
     # chat_context 高亮与模型配置副本
@@ -6385,6 +6401,64 @@ def max_output_limit(model, realm=None):
             return v
     return None
 
+
+def _context_token_count(label, meta):
+    """把 1M/400K/200K 这类档位名解析成 token 数（对照官方 context_config）。"""
+    s = str(label or "").strip()
+    if not s:
+        return None
+    if s.isdigit():
+        return int(s)
+    cfg = (meta or {}).get("context_config") or {}
+    for k, v in cfg.items():
+        if str(k).strip().lower() == s.lower() and isinstance(v, dict):
+            try:
+                return int(v.get("token_count") or 0) or None
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def model_context_override(payload, model_key, model, realm):
+    """本请求实际生效的上下文覆盖（token 数），没有则 None。
+
+    优先级：请求头 X-QD-Context（入口写进 payload["_qd_context"]）
+            > 面板设置 model_context（按上游 key 与客户端模型名两查）。
+    超出官方 context_config 的档位会被忽略并打 WARN——上游不认的窗口发过去只会 400。
+    """
+    raw = (payload or {}).get("_qd_context")
+    source = "header"
+    if raw in (None, ""):
+        try:
+            table = qoder_settings.model_context(ACCOUNTS_DIR)
+        except Exception:
+            table = {}
+        raw = table.get(model_key) if model_key else None
+        if raw in (None, "") and model:
+            raw = table.get(model)
+        source = "settings"
+    if raw in (None, ""):
+        return None
+    meta = {}
+    try:
+        for m in qoder_catalog.models_for_realm(realm or CURRENT_REALM):
+            if m.get("key") == (model_key or model):
+                meta = m
+                break
+    except Exception:
+        meta = {}
+    tokens = _context_token_count(raw, meta)
+    if tokens is None:
+        log("context override %r (%s) not in official context_config for %s - ignored"
+            % (raw, source, model_key or model), level="WARN", tag="chat")
+    return tokens
+
+
+def _model_context_snapshot():
+    try:
+        return dict(qoder_settings.model_context(ACCOUNTS_DIR))
+    except Exception:
+        return {}
 
 def clamp_max_tokens(value, model, realm=None):
     """把请求里的 max_tokens 压到已知上限以内（返回 (value, clamped?)）。"""
@@ -8930,6 +9004,22 @@ class Handler(BaseHTTPRequestHandler):
                 or self._banned_model_error(model)
                 or self._key_model_error(model))
 
+    def _apply_context_header(self, target):
+        """把 X-QD-Context 请求头写进将传给 build_qoder_body 的 payload（#106）。
+
+        先无条件清掉 body 里的同名键：客户端不能靠伪造 _qd_context 提窗；
+        只有 HTTP 头能设置。值可为 1M/400K/200K（对照官方 context_config）
+        或正整数 token 数，非法值在 model_context_override 里统一忽略并告警。
+        """
+        try:
+            if isinstance(target, dict):
+                target.pop("_qd_context", None)
+                hdr = str(self.headers.get("X-QD-Context") or "").strip()[:12]
+                if hdr:
+                    target["_qd_context"] = hdr
+        except Exception:
+            pass
+
     def _request_realm(self, explicit=None):
         """Pick the upstream exit for this request.
 
@@ -10394,6 +10484,7 @@ class Handler(BaseHTTPRequestHandler):
         meta = catalog_meta_for(model_key, req_realm)
         chat_req = qoder_anthropic.messages_to_chat(
             payload, catalog_meta=meta, supported=supported_efforts(meta))
+        self._apply_context_header(chat_req)  # issue #106
         model = chat_req.get("model") or payload.get("model") or "auto"
         want_stream = bool(payload.get("stream"))
         session_key = extract_session_key(self.headers, chat_req)
@@ -10695,6 +10786,7 @@ class Handler(BaseHTTPRequestHandler):
         session_key = extract_session_key(self.headers, payload)
         custom_names = custom_tool_names(payload.get("tools"))
         chat_req = responses_to_chat(payload)
+        self._apply_context_header(chat_req)  # issue #106
         model = payload.get("model") or "auto"
         want_stream = bool(payload.get("stream"))
         t_start = time.time()
@@ -11057,6 +11149,30 @@ class Handler(BaseHTTPRequestHandler):
                 % (res.get("from"), res.get("to"), len(res.get("files") or []),
                    res.get("backup") or "-", restarted), tag="update")
             return self._json(200, dict(res, restarting=restarted))
+        if path == "/settings/model-context":
+            # issue #106：为某个模型设定上下文档（label="" 清除回到官方默认）
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            try:
+                body = self._read_payload()
+            except Exception as exc:
+                return self._error(400, "invalid json: %s" % exc,
+                                   "invalid_request_error")
+            model = str((body or {}).get("model") or "").strip()
+            label = (body or {}).get("label")
+            if not model:
+                return self._error(400, "model required", "invalid_request_error")
+            label = str(label).strip() if label not in (None, "") else ""
+            if label.isdigit():
+                label = int(label)
+            try:
+                table = qoder_settings.set_model_context(ACCOUNTS_DIR, model, label)
+            except Exception as exc:
+                return self._error(500, "save failed: %s" % exc)
+            log("model context set: %s -> %s" % (model, label or "(default)"),
+                tag="panel")
+            return self._json(200, {"ok": True, "model_context": table})
         if path == "/settings/web-tools":
             # 本地 web 工具开关（面板 UI）：默认关，开/关都立即生效
             if not self._panel_ok():
@@ -11173,6 +11289,7 @@ class Handler(BaseHTTPRequestHandler):
         fp = prompt_fingerprint(payload.get("messages"))
         t_start = time.time()
         effort = requested_effort(payload)   # 与 usage 记账、请求体构造同源
+        self._apply_context_header(payload)  # issue #106：X-QD-Context 抬窗
         log("chat: model=%s client_effort=%r stream=%s msgs=%d"
             % (model, effort, want_stream,
                len(payload.get("messages") or [])))
