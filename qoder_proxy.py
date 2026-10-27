@@ -6062,6 +6062,10 @@ def friendly_upstream_error(code, detail):
         return ("上游模型排队中（10605 / RESOURCE_LIMIT）：请稍后重试，"
                 "或换一个模型/区域。这不是你的 Key、账号或网络问题。"
                 "上游详情：%s" % (detail[:160] or "(无详情)"), "upstream_queued")
+    # issue #108：额度耗尽也走 403，但重试无效——让客户端看懂该充值/换号
+    if _quota_cooldown(detail)[0] == "exhausted":
+        return ("上游账号额度耗尽（112 / pricingUrl）：重试无效，请充值或启用其它账号。"
+                "上游详情：%s" % (detail[:160] or "(无详情)"), "quota_exhausted")
     # issue #64：版本过低是硬门控（官方客户端会自己升级，网关只能提示）
     if "430" in str(code):
         return ("客户端/网关版本过低（430）：上游要求升级后才能继续。"
@@ -6104,6 +6108,51 @@ def _to_int_status(status):
         return int(status)
     except Exception:
         return 502
+
+
+# issue #108：上游对「额度耗尽」/「每日计费上限」也回 403，与「凭证被拒」同码不同因：
+# 重试和 60s 冷却都不会变好，账号还会被反复挑中（每次白等 60-105s）。
+_QUOTA_112_COOLDOWN = 1800
+
+
+def _quota_cooldown(detail):
+    """额度类 403 的 (病因, 冷却秒数)；不是额度问题返回 ('', 0)。
+
+    112 额度耗尽 -> 30 分钟；110 每日次数上限 -> 到本地 0 点（封顶 6h，免得时区乱跳）。
+    detail 可能被套在字符串里（转义形态 \\"code\\":\\"112\\"），先去掉反斜杠再匹配。
+    """
+    s = str(detail or "").replace("\\", "")
+    if "pricingUrl" in s or re.search(r'"code"\s*:\s*"?112\b', s):
+        return "exhausted", _QUOTA_112_COOLDOWN
+    if "Billing daily count exceeded" in s or re.search(r'"code"\s*:\s*"?110\b', s):
+        now = time.time()
+        midnight = time.mktime(time.localtime(now)[:3] + (0, 0, 0, 0, 0, -1)) + 86400
+        # +1：向上取整到整秒，免得日志把 0 点显示成 23:59
+        return "daily", int(max(60, min(6 * 3600, midnight - now))) + 1
+    return "", 0
+
+
+def _note_quota_cooldown(account, status, detail, where):
+    """额度类 403：按病因冷却账号并打日志；返回 True 表示已处理（调用方应轮换）。
+
+    issue #108：配额不是凭证失效，所以不改 enabled、也不喂降权。冷却**刻意不传**
+    single_account——note_error 会把它压成 3s，单号池里 bug 会原样保留。
+    """
+    kind, cd = _quota_cooldown(detail)
+    if not kind or not account or not hasattr(account, "note_error"):
+        return False
+    actual = float(account.note_error(
+        "%s HTTP %s quota %s: %s" % (where, status, kind, str(detail)[:80]),
+        cooldown=cd) or 0)
+    note_risk("rejected", detail)
+    if kind == "exhausted":
+        what = "quota exhausted (112) - cooling 30min"
+    else:
+        what = "daily count limit (110) - cooling until %s" % time.strftime(
+            "%m-%d %H:%M", time.localtime(time.time() + actual))
+    log("account %s %s (%.0fs), rotating" % (account.uid[:8], what, actual),
+        level="WARN", tag="chat")
+    return True
 
 
 def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None):
@@ -6150,6 +6199,9 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
             % (account.uid[:8], float(actual or 0), retry_secs, total),
             level="WARN", tag="chat")
     elif status_int in (401, 403):
+        # issue #108：额度类 403 要的是长冷却 + 换号，不是「凭证被拒」的 60s
+        if _note_quota_cooldown(account, status_int, detail, "envelope"):
+            return
         dead = qoder_accounts.session_dead(detail)
         # 10605 排队冷却为模型级或账号级
         is_queue = "10605" in detail or "isQueued" in detail
@@ -7089,6 +7141,12 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                         % (exc.code, account.uid[:8], model,
                            int(time.time() - queue_start)),
                         level="WARN", tag="chat")
+                    last_error = exc
+                    continue
+                # issue #108：额度类 403 长冷却换号，不吃 single_account 的 3s clamp
+                if _note_quota_cooldown(account, exc.code, detail, "HTTP"):
+                    if session_key and POOL:
+                        POOL.affinity.unbind(session_key)
                     last_error = exc
                     continue
                 log("account %s rejected (HTTP %s), rotating"
