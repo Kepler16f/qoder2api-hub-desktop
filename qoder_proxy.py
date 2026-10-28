@@ -239,11 +239,11 @@ from pathlib import Path
 # 排队可见分支；官方积分消耗 credits-summary/heatmap + intl 第二活动入口；
 # opt-in 前缀会话亲和（qoder_session_cache，memory/Redis 后端）。
 # 上游同一区间发到 VERSION 1.7.5，本 fork 继续用日期制版本号。
-# 10-27：.1_upstream = 追加上游 #100/#101（0426c33，v1.7.6）——visible_queue_
+# 10-28：.1_upstream = 追加上游 #100/#101（0426c33，v1.7.6）——visible_queue_
 # acquire 放弃时归一化成 RateLimited（无 .status）不再 AttributeError 截断 200 流；
 # 从上游 'Range of max_tokens should be [1, N]' 学习每 (区域,模型) 输出上限并落盘
 # （7 天 TTL），组包时 clamp，/v1/models 补 max_output_tokens。
-VERSION = "2026.10.27.1_upstream"
+VERSION = "2026.10.28.1_upstream"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
