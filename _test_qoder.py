@@ -998,8 +998,14 @@ check("watchdog: stall rotation on TimeoutError present in both pumps",
       _src15.count("stall_retries < 1") >= 2,
       _src15.count("stall_retries < 1"))
 check("watchdog: pump error path no longer assumes .status (TimeoutError safe)",
-      'getattr(exc, "status", None) or 504' in _src15
-      and 'getattr(pump_exc, "status", None) or 504' in _src15)
+      # 上游 #100 起状态统一走 _exc_http_status（RateLimited 没有 .status；
+      # 它内部用 getattr 取属性，TimeoutError 同理）——比旧写法
+      # 「getattr(exc,'status',None) or 504」更完备：排队耗尽能正确判成 429
+      # 而不是被当成 504。detail 仍保留 getattr 兜底（TimeoutError 无 .detail）。
+      '_exc_http_status(pump_exc, 429)' in _src15
+      and '_exc_http_status(exc, 429)' in _src15
+      and 'getattr(pump_exc, "detail", None)' in _src15
+      and 'getattr(exc, "detail", None)' in _src15)
 
 # fork：chat completions 流式路径接预连接心跳（2026-10-16 实测：Zcode 经
 # dsml-proxy(8791) 转发，其对上游读超时 ~8.5s < 大请求建连 13-26s → 必掐；

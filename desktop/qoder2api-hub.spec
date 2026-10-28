@@ -29,6 +29,12 @@ datas = [
     (os.path.join(HERE, "assets", "qoder2api.ico"), "."),
 ]
 
+# 面板语言包（上游 #107 i18n）：网关运行时从 <exe 同级>/i18n/ 读 JSON 包，
+# 缺失则 /i18n/* 404、面板退回纯中文（不报错但功能缺失）——桌面版必须随包带上。
+_i18n_dir = os.path.join(ROOT, "i18n")
+if os.path.isdir(_i18n_dir):
+    datas.append((_i18n_dir, "i18n"))
+
 # Windows：WebView2 加载器（arm64 + x64 都带上，运行时按进程架构选）。
 # 加载器取自 NuGet Microsoft.Web.WebView2（重分发许可允许随应用分发）。
 if sys.platform == "win32":

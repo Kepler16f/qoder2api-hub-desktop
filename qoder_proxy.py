@@ -243,7 +243,11 @@ from pathlib import Path
 # acquire 放弃时归一化成 RateLimited（无 .status）不再 AttributeError 截断 200 流；
 # 从上游 'Range of max_tokens should be [1, N]' 学习每 (区域,模型) 输出上限并落盘
 # （7 天 TTL），组包时 clamp，/v1/models 补 max_output_tokens。
-VERSION = "2026.10.28.1_upstream"
+# 10-28：.2_upstream = 并入上游 v1.7.7-v1.7.8（#102 禁用与签到解耦、#103 DSH
+# credentials refs 引号化、#105 换模型计费可见、#106 上下文窗口可配置、#107
+# 面板 i18n（i18n/en.json + DOM 边界翻译层）、#108 额度类 403 快速失败；
+# 上游同一区间发到 VERSION 1.7.8，本 fork 继续用日期制版本号）。
+VERSION = "2026.10.28.2_upstream"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -593,6 +597,13 @@ USAGE_LOG = os.path.join(USAGE_DIR, "usage.jsonl")
 USAGE_SUMMARY = os.path.join(USAGE_DIR, "usage-summary.json")
 DASHBOARD_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "dashboard.html")
+# Locale packs are plain JSON files dropped into i18n/: the folder listing *is* the
+# registry, so adding a language never touches code and never needs a restart.
+I18N_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "i18n")
+# The route is unauthenticated (the login gate itself needs translating), so the
+# requested name is matched against this allowlist before it ever reaches the
+# filesystem. Anchored at both ends and .json-only: no separator, no "..", no NUL.
+I18N_FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,31}\.json$")
 USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "reasoning_tokens",
                 "cached_tokens", "total_tokens", "credit",
                 # issue #22：折扣时段对账要用的原价积分（数值，参与聚合）。
@@ -738,6 +749,13 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
         # 此处不再释放——避免与包装器双重 release 破坏信号量计数。
     if not fields:
         return None
+    # issue #105：上游可能**静默换模型计费**（实测把 kmodel_latest 记成 auto）。
+    # 只有换号时才多写一个键——旧行格式零变化，面板/统计按需显示。
+    _billed = str((usage or {}).get("model") or "")
+    if _billed and _billed != str(model or ""):
+        fields["billed_model"] = _billed
+        log("upstream billed a different model: requested=%s billed=%s"
+            % (model, _billed), level="WARN", tag="chat")
     row = {
         "at": time.time(),
         "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -2804,6 +2822,8 @@ def runtime_settings_view():
         "limits": qoder_settings.limits_data(ACCOUNTS_DIR),
         # 本地 web 工具开关（默认关）：这是唯一由模型驱动出网的能力
         "web_tools": web_tools_enabled(),
+        # issue #106：各模型上下文档（面板回显 + 客户端可查）
+        "model_context": _model_context_snapshot(),
         "web_tools_rounds": WEB_TOOLS_MAX_ROUNDS,
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
@@ -6189,6 +6209,13 @@ def build_qoder_body(payload, account, model_key, realm=None,
     mc["url"] = ""
     mc["source"] = "system"
     mc["max_input_tokens"] = catalog_meta.get("max_input_tokens") or 180000
+    # issue #106：官方清单默认 ~200K，但模型实际支持 1M 档——允许按请求/设置抬窗。
+    try:
+        _ctx = model_context_override(payload, model_key, model, r)
+        if _ctx:
+            mc["max_input_tokens"] = _ctx
+    except Exception as _exc:
+        log("context override failed: %s" % _exc, level="WARN", tag="chat")
     body["model_config"] = mc
 
     # chat_context 高亮与模型配置副本
@@ -6925,6 +6952,51 @@ def _to_int_status(status):
         return 502
 
 
+# issue #108：上游对「额度耗尽」/「每日计费上限」也回 403，与「凭证被拒」同码不同因：
+# 重试和 60s 冷却都不会变好，账号还会被反复挑中（每次白等 60-105s）。
+_QUOTA_112_COOLDOWN = 1800
+
+
+def _quota_cooldown(detail):
+    """额度类 403 的 (病因, 冷却秒数)；不是额度问题返回 ('', 0)。
+
+    112 额度耗尽 -> 30 分钟；110 每日次数上限 -> 到本地 0 点（封顶 6h，免得时区乱跳）。
+    detail 可能被套在字符串里（转义形态 \\"code\\":\\"112\\"），先去掉反斜杠再匹配。
+    """
+    s = str(detail or "").replace("\\", "")
+    if "pricingUrl" in s or re.search(r'"code"\s*:\s*"?112\b', s):
+        return "exhausted", _QUOTA_112_COOLDOWN
+    if "Billing daily count exceeded" in s or re.search(r'"code"\s*:\s*"?110\b', s):
+        now = time.time()
+        midnight = time.mktime(time.localtime(now)[:3] + (0, 0, 0, 0, 0, -1)) + 86400
+        # +1：向上取整到整秒，免得日志把 0 点显示成 23:59
+        return "daily", int(max(60, min(6 * 3600, midnight - now))) + 1
+    return "", 0
+
+
+def _note_quota_cooldown(account, status, detail, where):
+    """额度类 403：按病因冷却账号并打日志；返回 True 表示已处理（调用方应轮换）。
+
+    issue #108：配额不是凭证失效，所以不改 enabled、也不喂降权。冷却**刻意不传**
+    single_account——note_error 会把它压成 3s，单号池里 bug 会原样保留。
+    """
+    kind, cd = _quota_cooldown(detail)
+    if not kind or not account or not hasattr(account, "note_error"):
+        return False
+    actual = float(account.note_error(
+        "%s HTTP %s quota %s: %s" % (where, status, kind, str(detail)[:80]),
+        cooldown=cd) or 0)
+    note_risk("rejected", detail)
+    if kind == "exhausted":
+        what = "quota exhausted (112) - cooling 30min"
+    else:
+        what = "daily count limit (110) - cooling until %s" % time.strftime(
+            "%m-%d %H:%M", time.localtime(time.time() + actual))
+    log("account %s %s (%.0fs), rotating" % (account.uid[:8], what, actual),
+        level="WARN", tag="chat")
+    return True
+
+
 def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None):
     """信封层非 200（如 403 队列满/Token被拒、429 等）冷却该账号并解绑会话，触发下次选号轮换。"""
     if isinstance(exc, InvalidToolArguments):
@@ -6996,7 +7068,14 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
             cd = retry_secs if is_queue else 60
         actual = account.note_error("envelope HTTP %s: %s"
                                     % (status_int, detail[:80]),
-                                    cooldown=cd, single_account=(total <= 1),
+                                    cooldown=cd,
+                                    # 上游 #108 的洞见（此处吸收）：单号池里
+                                    # 「确定性耗尽」不能被 single_account 压成
+                                    # 3s（同一个收费模型被反复挑中、白等一轮）。
+                                    # 112 付费墙用绝对截止；排队(10605)是容量
+                                    # 问题、短暂可恢复，压缩仍按原语义。
+                                    single_account=(total <= 1
+                                                   and not is_paid),
                                     model=model if (is_queue or is_paid) else None)
         log("account %s rejected via envelope (HTTP %s, queue=%s, paidwall=%s), "
             "cooling for %.0fs (requested %d, realm_ready=%d) and rotating"
@@ -7171,6 +7250,64 @@ def max_output_limit(model, realm=None):
             return v
     return None
 
+
+def _context_token_count(label, meta):
+    """把 1M/400K/200K 这类档位名解析成 token 数（对照官方 context_config）。"""
+    s = str(label or "").strip()
+    if not s:
+        return None
+    if s.isdigit():
+        return int(s)
+    cfg = (meta or {}).get("context_config") or {}
+    for k, v in cfg.items():
+        if str(k).strip().lower() == s.lower() and isinstance(v, dict):
+            try:
+                return int(v.get("token_count") or 0) or None
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def model_context_override(payload, model_key, model, realm):
+    """本请求实际生效的上下文覆盖（token 数），没有则 None。
+
+    优先级：请求头 X-QD-Context（入口写进 payload["_qd_context"]）
+            > 面板设置 model_context（按上游 key 与客户端模型名两查）。
+    超出官方 context_config 的档位会被忽略并打 WARN——上游不认的窗口发过去只会 400。
+    """
+    raw = (payload or {}).get("_qd_context")
+    source = "header"
+    if raw in (None, ""):
+        try:
+            table = qoder_settings.model_context(ACCOUNTS_DIR)
+        except Exception:
+            table = {}
+        raw = table.get(model_key) if model_key else None
+        if raw in (None, "") and model:
+            raw = table.get(model)
+        source = "settings"
+    if raw in (None, ""):
+        return None
+    meta = {}
+    try:
+        for m in qoder_catalog.models_for_realm(realm or CURRENT_REALM):
+            if m.get("key") == (model_key or model):
+                meta = m
+                break
+    except Exception:
+        meta = {}
+    tokens = _context_token_count(raw, meta)
+    if tokens is None:
+        log("context override %r (%s) not in official context_config for %s - ignored"
+            % (raw, source, model_key or model), level="WARN", tag="chat")
+    return tokens
+
+
+def _model_context_snapshot():
+    try:
+        return dict(qoder_settings.model_context(ACCOUNTS_DIR))
+    except Exception:
+        return {}
 
 def clamp_max_tokens(value, model, realm=None):
     """把请求里的 max_tokens 压到已知上限以内（返回 (value, clamped?)）。"""
@@ -8050,7 +8187,11 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                     account.note_error(
                         "model paywalled (HTTP 403/112): Free plan, model "
                         "requires paid subscription", model=model,
-                        cooldown=3600, single_account=(total <= 1))
+                        # 上游 #108 的洞见（此处吸收）：单号池里「确定性耗尽」
+                        # 不能被 single_account 压成 3s——那会让同一个收费
+                        # 模型被反复挑中、每次白等一轮。改用绝对截止，
+                        # 语义与 fork 的 110 处置一致。
+                        until=time.time() + 3600)
                     log("account %s model paywalled (112) on '%s' - model "
                         "cooldown 1h, rotating"
                         % (account.uid[:8], model), level="WARN", tag="chat")
@@ -8073,6 +8214,12 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                         % (exc.code, account.uid[:8], model,
                            int(time.time() - queue_start)),
                         level="WARN", tag="chat")
+                    last_error = exc
+                    continue
+                # issue #108：额度类 403 长冷却换号，不吃 single_account 的 3s clamp
+                if _note_quota_cooldown(account, exc.code, detail, "HTTP"):
+                    if session_key and POOL:
+                        POOL.affinity.unbind(session_key)
                     last_error = exc
                     continue
                 log("account %s rejected (HTTP %s), rotating"
@@ -10039,6 +10186,22 @@ class Handler(BaseHTTPRequestHandler):
                 or self._banned_model_error(model)
                 or self._key_model_error(model))
 
+    def _apply_context_header(self, target):
+        """把 X-QD-Context 请求头写进将传给 build_qoder_body 的 payload（#106）。
+
+        先无条件清掉 body 里的同名键：客户端不能靠伪造 _qd_context 提窗；
+        只有 HTTP 头能设置。值可为 1M/400K/200K（对照官方 context_config）
+        或正整数 token 数，非法值在 model_context_override 里统一忽略并告警。
+        """
+        try:
+            if isinstance(target, dict):
+                target.pop("_qd_context", None)
+                hdr = str(self.headers.get("X-QD-Context") or "").strip()[:12]
+                if hdr:
+                    target["_qd_context"] = hdr
+        except Exception:
+            pass
+
     def _request_realm(self, explicit=None):
         """Pick the upstream exit for this request.
 
@@ -10147,6 +10310,10 @@ class Handler(BaseHTTPRequestHandler):
                                "invalid_request_error")
         if path in ("/", "/dashboard", "/ui"):
             return self._dashboard()
+        if path == "/i18n/manifest":
+            return self._i18n_manifest()
+        if path.startswith("/i18n/"):
+            return self._i18n_pack(path[len("/i18n/"):])
         if path == "/panel/status":
             # 不带 token 也要回答：看板需要先知道是否显示登录页。
             info = {
@@ -10746,6 +10913,108 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # ---- locale packs ----------------------------------------------------
+    # i18n/<code>.json is the whole registry: the folder listing decides which
+    # languages the panel offers, so a new locale is a file drop, not a code
+    # change. Files are re-read per request (like _dashboard) so a dropped or
+    # edited pack takes effect without restarting the gateway.
+
+    @staticmethod
+    def _i18n_tiers_ok(data):
+        """True when every tier is an object of string -> string.
+
+        The frontend's load() applies the same rule, but validating only there
+        would let a broken pack show up in the language dropdown and then do
+        nothing when picked — a silent no-op is the worst failure shape for a
+        feature whose whole promise is "missing key falls back quietly".
+        Rejecting here makes a malformed pack invisible, which is consistent.
+        """
+        for tier in ("messages", "patterns", "fragments"):
+            value = data.get(tier)
+            if value is None:
+                continue
+            if not isinstance(value, dict):
+                return False
+            for key, item in value.items():
+                if not isinstance(item, str):
+                    return False
+        return True
+
+    @staticmethod
+    def _i18n_read(name):
+        """Return (abs_path, body_bytes, parsed_dict) for a locale pack.
+
+        Raises ValueError for anything that is not a safe, well-formed pack:
+        the name is checked against the allowlist *before* the filesystem is
+        touched, and the resolved path must still live inside I18N_DIR so a
+        symlink planted in the folder cannot expose accounts/ or usage data.
+        """
+        if not name or not I18N_FILE_RE.match(name):
+            raise ValueError("invalid locale name")
+        abs_path = os.path.realpath(os.path.join(I18N_DIR, name))
+        root = os.path.realpath(I18N_DIR)
+        if os.path.dirname(abs_path) != root:
+            raise ValueError("locale path escapes the i18n folder")
+        try:
+            with open(abs_path, "rb") as fh:
+                body = fh.read()
+        except Exception:
+            raise ValueError("locale pack unreadable")
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except Exception:
+            raise ValueError("locale pack is not valid JSON")
+        if not isinstance(data, dict):
+            raise ValueError("locale pack must be a JSON object")
+        if not Handler._i18n_tiers_ok(data):
+            raise ValueError("locale tiers must be string->string objects")
+        return abs_path, body, data
+
+    def _i18n_manifest(self):
+        packs = []
+        try:
+            names = sorted(os.listdir(I18N_DIR))
+        except Exception:
+            names = []       # no i18n/ folder yet is a normal state, not an error
+        for name in names:
+            if not I18N_FILE_RE.match(name):
+                continue
+            try:
+                _, _, data = self._i18n_read(name)
+            except ValueError as exc:
+                log("i18n: skipping %s (%s)" % (name, exc))
+                continue
+            meta = data.get("@locale")
+            meta = dict(meta) if isinstance(meta, dict) else {}
+            # The filename is the authority on the code: a pack that claims to
+            # be "en" while filed as de.json would otherwise be fetched by a
+            # name that does not match what the panel then loads.
+            meta["code"] = name[:-len(".json")]
+            meta.setdefault("name", meta["code"])
+            meta.setdefault("order", 100)
+            meta.setdefault("dir", "ltr")
+            try:
+                meta["order"] = int(meta["order"])
+            except Exception:
+                meta["order"] = 100
+            packs.append(meta)
+        packs.sort(key=lambda p: (p.get("order", 100), p.get("code", "")))
+        return self._json(200, {"default": "zh", "packs": packs})
+
+    def _i18n_pack(self, name):
+        try:
+            _, body, _ = self._i18n_read(name)
+        except ValueError:
+            # 404, never the exception text: this body is rendered into a toast.
+            return self._error(404, "no such locale pack",
+                               "invalid_request_error")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _read_payload(self, max_bytes=MAX_PAYLOAD_BYTES, allow_list=False):
         """Parse the request body into a dict (or a list when allow_list)."""
         try:
@@ -11019,8 +11288,9 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 # 不再按区域过滤：签到能力运行时探测，接口不存在的账号会在
                 # 日志里给出明确原因（历史问题：国际版点签到完全没反应）。
-                targets = [a for a in POOL.accounts
-                           if a.enabled and a.access_token]
+                # issue #102：签到与「是否接推理」解耦——禁用但开了
+                # checkinWhenDisabled 的账号仍参与（凭证缺失的仍排除）
+                targets = [a for a in POOL.accounts if a.checkin_eligible()]
             if not targets:
                 return self._json(200, {"ok": False, "msg": "未找到可用账号（账号已禁用或缺少凭证）"})
             res = qoder_tasks.run_batch_checkin(targets, gap=1.0)
@@ -11044,8 +11314,9 @@ class Handler(BaseHTTPRequestHandler):
                                             "msg": "未找到指定的账号"})
                 targets = [target]
             else:
-                targets = [a for a in POOL.accounts
-                           if a.enabled and a.access_token]
+                # issue #102：签到与「是否接推理」解耦——禁用但开了
+                # checkinWhenDisabled 的账号仍参与（凭证缺失的仍排除）
+                targets = [a for a in POOL.accounts if a.checkin_eligible()]
             if not targets:
                 return self._json(200, {"ok": False, "msg": "未找到可用账号（账号已禁用或缺少凭证）"})
             res = qoder_tasks.run_batch_pro_claim(targets)
@@ -11093,6 +11364,18 @@ class Handler(BaseHTTPRequestHandler):
                 save_persisted_realm(new_realm)
             return self._json(200, {"ok": True, "current": CURRENT_REALM,
                                     "persisted": True})
+        if path == "/accounts/checkin-when-disabled":
+            # issue #102：禁用只表示不接推理流量；允许该账号在禁用期间照常签到
+            uid = payload.get("uid")
+            target = POOL.get(uid) if uid else None
+            if not target:
+                return self._json(200, {"ok": False, "msg": "未找到指定的账号"})
+            target.checkin_when_disabled = bool(payload.get("value"))
+            if target.path:
+                target.save(os.path.dirname(target.path))
+            return self._json(200, {"ok": True, "uid": target.uid,
+                                    "checkinWhenDisabled": target.checkin_when_disabled,
+                                    "accounts": account_views()})
         if path == "/accounts/checkin":
             # 账号面板的「每日签到」按钮：**只做每日签到领积分**——Credits 类活动
             # （如"每天领 100 Credits"，旧 sash 接口兜底），不领券/兑换码类活动，
@@ -11106,7 +11389,7 @@ class Handler(BaseHTTPRequestHandler):
             uid = payload.get("uid")
             targets = [POOL.get(uid)] if uid else list(POOL.accounts)
             targets = [a for a in targets
-                       if a is not None and a.enabled and a.access_token]
+                       if a is not None and a.checkin_eligible()]
             results = [None] * len(targets)
 
             def _one(idx, account):
@@ -11489,6 +11772,7 @@ class Handler(BaseHTTPRequestHandler):
         meta = catalog_meta_for(model_key, req_realm)
         chat_req = qoder_anthropic.messages_to_chat(
             payload, catalog_meta=meta, supported=supported_efforts(meta))
+        self._apply_context_header(chat_req)  # issue #106
         model = chat_req.get("model") or payload.get("model") or "auto"
         want_stream = bool(payload.get("stream"))
         session_key = extract_session_key(self.headers, chat_req)
@@ -11790,6 +12074,7 @@ class Handler(BaseHTTPRequestHandler):
         session_key = extract_session_key(self.headers, payload)
         custom_names = custom_tool_names(payload.get("tools"))
         chat_req = responses_to_chat(payload)
+        self._apply_context_header(chat_req)  # issue #106
         model = payload.get("model") or "auto"
         want_stream = bool(payload.get("stream"))
         t_start = time.time()
@@ -12183,6 +12468,30 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "uid": uid, "note": note})
         # 上游 /update/apply 未采纳——桌面发行版的更新通道是 Inno 安装包
         # （内嵌网关自拉上游 tarball 会把 fork 文件换成上游原版）。
+        if path == "/settings/model-context":
+            # issue #106：为某个模型设定上下文档（label="" 清除回到官方默认）
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            try:
+                body = self._read_payload()
+            except Exception as exc:
+                return self._error(400, "invalid json: %s" % exc,
+                                   "invalid_request_error")
+            model = str((body or {}).get("model") or "").strip()
+            label = (body or {}).get("label")
+            if not model:
+                return self._error(400, "model required", "invalid_request_error")
+            label = str(label).strip() if label not in (None, "") else ""
+            if label.isdigit():
+                label = int(label)
+            try:
+                table = qoder_settings.set_model_context(ACCOUNTS_DIR, model, label)
+            except Exception as exc:
+                return self._error(500, "save failed: %s" % exc)
+            log("model context set: %s -> %s" % (model, label or "(default)"),
+                tag="panel")
+            return self._json(200, {"ok": True, "model_context": table})
         if path == "/settings/web-tools":
             # 本地 web 工具开关（面板 UI）：默认关，开/关都立即生效
             if not self._panel_ok():
@@ -12299,6 +12608,7 @@ class Handler(BaseHTTPRequestHandler):
         fp = prompt_fingerprint(payload.get("messages"))
         t_start = time.time()
         effort = requested_effort(payload)   # 与 usage 记账、请求体构造同源
+        self._apply_context_header(payload)  # issue #106：X-QD-Context 抬窗
         log("chat: model=%s client_effort=%r stream=%s msgs=%d"
             % (model, effort, want_stream,
                len(payload.get("messages") or [])))

@@ -49,6 +49,10 @@ COPY qoder_proxy.py qoder_accounts.py qoder_catalog.py qoder_fingerprint.py \
 # 官方模型目录快照（运行时优先读取；缺失会回退 qoder_catalog.py 内嵌冻结副本）
 COPY qoder_catalog_intl.json qoder_catalog_cn.json ./
 
+# 面板语言包（#107）：运行时从 <app>/i18n/ 读取，缺失则 /i18n/* 返回 404、
+# 面板退回纯中文（功能降级但不报错）。目录清单即注册表。
+COPY i18n/ ./i18n/
+
 # UMID 原生组件（构建期提取；运行时 qoder_accounts.runtime_info_exe() 在
 # POSIX 下按 <repo>/umid/runtime-info 查找）。builder 提取失败时这里是空目录。
 COPY --from=umid-builder /build/umid /app/umid
