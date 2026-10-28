@@ -1108,6 +1108,31 @@ function load(pack){
   READY = !!(Object.keys(MSG).length || Object.keys(PAT).length || Object.keys(FRG).length);
   return READY;
 }
+
+/* 原生 alert/confirm/prompt 不经过 DOM，观察器永远看不到它们；这里给宿主对象
+ * 的三个方法包一层，只翻第一个字符串参数，其余参数与返回值原样透传。同一宿主
+ * 只包一次：重复调用返回 false，避免翻译被叠成两层（第二次会拿到英文再查表）。 */
+function installDialogI18n(win, translate){
+  if(!win || typeof translate !== 'function') return false;
+  if(win.__qdDialogI18n) return false;
+  var names = ['alert', 'confirm', 'prompt'];
+  var wrapped = 0;
+  for(var i = 0; i < names.length; i++){
+    var name = names[i];
+    if(typeof win[name] !== 'function') continue;
+    (function(fn){
+      win[name] = function(msg){
+        var args = Array.prototype.slice.call(arguments);
+        if(typeof args[0] === 'string') args[0] = translate(args[0]);
+        return fn.apply(win, args);
+      };
+    })(win[name]);
+    wrapped++;
+  }
+  if(!wrapped) return false;
+  try{ win.__qdDialogI18n = true; }catch(e){}
+  return true;
+}
 /* END-PURE-I18N-CORE */
 
 var API = { t: t, load: load, isReady: function(){ return READY; } };
