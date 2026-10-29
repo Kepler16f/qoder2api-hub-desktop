@@ -1,7 +1,7 @@
 # Qoder2API-Hub Desktop — Qoder 双区多账号网关 · 开箱即用桌面客户端
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-1.0.7_R-2496ED?style=flat-square" alt="Version 1.0.7_R">
+  <img src="https://img.shields.io/badge/Release-1.0.8_R-2496ED?style=flat-square" alt="Version 1.0.8_R">
   <img src="https://img.shields.io/badge/Desktop-Win_x64_·_Win_ARM64_·_macOS_·_Linux-8A2BE2?style=flat-square" alt="Desktop Platforms">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
@@ -229,9 +229,14 @@ Claude Code、Codex CLI、OpenCode、DSH、Crush 可以在看板「智能体配�
 >   `2026.10.08` ≈ 2026.10.8.1_re（上下文压缩）；更早的「网关 1.2.18/1.2.19/
 >   1.2.20」是 fork 旧连号（1.2.18 与上游撞车才改制），仅为历史记录。
 
-### v1.0.7_R — 桌面版：随网关 2026.10.22.3_re–2026.10.26.2_upstream 发布
+### v1.0.8_R — 桌面版：随网关 2026.10.28.2_upstream–2026.10.29.1_upstream 发布
 
-随上一条目发布的桌面版——核心是**思考模型保正文**（未给 max_tokens 时思考模型自动补 81920 输出上限，正文不再被 reasoning 饿死）与 **Claude Code 思考强度送达**（ccswitch 经 OpenAI 入口的 adaptive thinking effort 不再被静默丢弃）；并入上游 v1.6.2–v1.7.6 共 43 提交（#87/#99 排队可见、#89 启动防双开识别垂死实例、#90 企业账号判定统一、#75 UMID 原生身份对齐并补打 sgsdk.dll、#76/#83 自动换区修复、官方积分消耗 heatmap、v1.7.1 看板重做、opt-in 前缀会话亲和）。一键更新未收录（桌面更新走安装包）。
+随上一条目发布的桌面版——并入上游 v1.7.7–v1.7.9 共 26 提交：面板 **i18n 英文界面**（#107，语言包随发行出货，桌面区/局域网文案暂未入包、英文下中英混排）、**模型上下文窗口可配置**（#106，默认口径不动、显式选择才覆盖）、**账号表七列可排序**（#111，自然序/积分双口径/失败沉底）、#105 换模型计费可见、#102 禁用与签到解耦、#108 额度类 403 快速失败、#103 DSH 凭证引号修复。一键更新未收录（桌面更新走安装包）。
+发布说明见 [Releases](https://github.com/Kepler16f/qoder2api-hub-desktop/releases/tag/v1.0.8_R)。
+
+### v1.0.7_R — 桌面版：随网关 2026.10.22.3_re–2026.10.28.1_upstream 发布
+
+随上一条目发布的桌面版——核心是**思考模型保正文**（未给 max_tokens 时思考模型自动补 81920 输出上限，正文不再被 reasoning 饿死）与 **Claude Code 思考强度送达**（ccswitch 经 OpenAI 入口的 adaptive thinking effort 不再被静默丢弃）；并入上游 v1.6.2–v1.7.6 共 44 提交（#87/#99 排队可见、#89 启动防双开识别垂死实例、#90 企业账号判定统一、#75 UMID 原生身份对齐并补打 sgsdk.dll、#76/#83 自动换区修复、官方积分消耗 heatmap、v1.7.1 看板重做、opt-in 前缀会话亲和、#100/#101 排队收尾与 max_tokens 上限学习）。一键更新未收录（桌面更新走安装包）。
 发布说明见 [Releases](https://github.com/Kepler16f/qoder2api-hub-desktop/releases/tag/v1.0.7_R)。
 
 ### v1.0.6_R — 桌面版：随网关 2026.10.20.2_re–2026.10.22.2_re 发布
