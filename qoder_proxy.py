@@ -247,7 +247,10 @@ from pathlib import Path
 # credentials refs 引号化、#105 换模型计费可见、#106 上下文窗口可配置、#107
 # 面板 i18n（i18n/en.json + DOM 边界翻译层）、#108 额度类 403 快速失败；
 # 上游同一区间发到 VERSION 1.7.8，本 fork 继续用日期制版本号）。
-VERSION = "2026.10.28.2_upstream"
+# 10-29：.1_upstream = 并入上游 v1.7.9（#111 账号表七列可排序：自然序账号名/
+# 积分双口径（点击=剩余、Shift=已用）/失败沉底不随方向翻转/状态优先级/三态循环
+# + localStorage 持久化；后端零改动，上游同区间 VERSION 1.7.9，本 fork 继续日期制）。
+VERSION = "2026.10.29.1_upstream"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
