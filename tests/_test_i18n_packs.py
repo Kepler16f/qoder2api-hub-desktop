@@ -38,6 +38,49 @@ def squash(s):
 
 dash_sq = squash(dash)
 
+# ---------------------------------------------------------------------------
+# fork 豁免：两批文案在本 fork 刻意不与上游一致，它们在 dashboard.html 里
+# 没有对应源文本 → 引擎永远命不中（不会显示，但属于「死键」），会让上游自带
+# 的可达性门禁误判成「抄错的键」。
+#
+# ① 已剔除功能：上游「一键更新」整块未采纳（qoder_updater.py / /update/plan /
+#    /update/apply / 看板按钮——桌面发行版的更新通道是 Inno 安装包）。
+# ② fork 改写过格式：账号测试 toast 在 2026-10-09 批次统一成
+#    「✓ 测试通过 · model · 123ms」，上游仍是「测试通过 (123ms) [model]: …」。
+#
+# 处置原则：**不改上游的 i18n/en.json**（保持与上游零 diff，后续同步上游语言包
+# 时不会反复冲突），而是在本套件里显式豁免这批词条。豁免清单必须能自证：
+# 守卫确保①每条都带「一键更新」特征词，②每条豁免项**确实**在源码里找不到
+# （若上游将来改了措辞使它重新出现，豁免即过时，断言会提醒清理清单）。
+# ---------------------------------------------------------------------------
+FORK_EXEMPT_UPDATER_KEYS = {
+    "一键更新",
+    "更新中…",
+    "正在下载并校验新版本（通常几秒）…",
+    "等待新进程就绪…",
+    "重启中…",
+    "更新已完成，但自动刷新超时——请手动刷新页面。",
+}
+FORK_EXEMPT_UPDATER_PATTERNS = {
+    "更新失败：{0}",
+    "已更新 {0} → {1}，正在重启…",
+    "新进程已就绪（{0}），刷新中…",
+}
+# fork 改写过格式的文案（上游措辞与本 fork 的 toast 写法不同）
+FORK_EXEMPT_REWRITTEN_PATTERNS = {
+    "测试通过 ({0}ms) [{1}]: {2}",
+    "测试失败: {0}",
+}
+FORK_EXEMPT_KEYS = FORK_EXEMPT_UPDATER_KEYS
+FORK_EXEMPT_PATTERNS = (FORK_EXEMPT_UPDATER_PATTERNS
+                         | FORK_EXEMPT_REWRITTEN_PATTERNS)
+
+_UPDATER_KEYWORDS = ("更新", "重启", "新进程", "新版本", "下载")
+_bad_exempt = [k for k in FORK_EXEMPT_UPDATER_KEYS
+               if not any(w in k for w in _UPDATER_KEYWORDS)]
+check("fork 豁免清单只覆盖「一键更新」相关文案（否则会掩盖真死键）",
+      not _bad_exempt, _bad_exempt[:5])
+
 packs = sorted(n for n in (os.listdir(I18N_DIR) if os.path.isdir(I18N_DIR) else [])
                if n.endswith(".json"))
 
@@ -91,7 +134,8 @@ for name in packs:
     # 所以「在源码里」有两种形态：逐字出现，或折叠空白后出现在折叠过的源码里。
     # 第二种放宽只吃掉换行+缩进这一类抄写差异，抄错字仍然会被抓到。
     absent = [k for k in msgs
-              if k not in dash and squash(k) not in dash_sq]
+              if k not in dash and squash(k) not in dash_sq
+              and k not in FORK_EXEMPT_KEYS]
     check("%s 的每个 messages 键都能在 dashboard.html 里命中（抄错的键会静默失效）"
           % name, not absent, absent[:5])
     overlap = set(msgs) & set(tiers["fragments"])
@@ -126,11 +170,26 @@ for name in packs:
     # 剩下够长的每一段都得能在 dashboard.html 里找到，否则这条永远命不中。
     dead_pat = []
     for k in tiers["patterns"]:
+        if k in FORK_EXEMPT_PATTERNS:
+            continue
         parts = [p.strip() for p in re.split(r"\{\d+\}", k) if len(p.strip()) >= 4]
         if parts and not any(p in dash for p in parts):
             dead_pat.append(k)
     check("%s 的 pattern 片段能在源码里找到（找不到说明这条永远不会命中）"
           % name, not dead_pat, dead_pat[:3])
+
+    # 豁免清单不许腐烂：每条豁免都必须在源码里**真的找不到**（否则豁免已过时
+    # ——上游改了措辞后它重新有了源文本，就该把这条从清单里删掉）。
+    stale_exempt = []
+    for k in FORK_EXEMPT_KEYS:
+        if k in dash or squash(k) in dash_sq:
+            stale_exempt.append(k)
+    for k in FORK_EXEMPT_PATTERNS:
+        parts = [p.strip() for p in re.split(r"\{\d+\}", k) if len(p.strip()) >= 4]
+        if parts and any(p in dash for p in parts):
+            stale_exempt.append(k)
+    check("fork 豁免清单没有过时项（豁免项必须在源码里真的找不到）",
+          not stale_exempt, stale_exempt[:5])
 
 print("[packs] 语言码唯一")
 codes = [n[:-len(".json")] for n in packs if NAME_RE.match(n)]
