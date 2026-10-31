@@ -1,7 +1,7 @@
 # Qoder2API-Hub Desktop — Qoder 双区多账号网关 · 开箱即用桌面客户端
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-1.0.8_R-2496ED?style=flat-square" alt="Version 1.0.8_R">
+  <img src="https://img.shields.io/badge/Release-1.0.9_R-2496ED?style=flat-square" alt="Version 1.0.9_R">
   <img src="https://img.shields.io/badge/Desktop-Win_x64_·_Win_ARM64_·_macOS_·_Linux-8A2BE2?style=flat-square" alt="Desktop Platforms">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
@@ -228,6 +228,11 @@ Claude Code、Codex CLI、OpenCode、DSH、Crush 可以在看板「智能体配�
 >   天然不撞。历史号对应：`2026.10.07` ≈ 2026.10.7.1_upstream（上游 v1.2.18）、
 >   `2026.10.08` ≈ 2026.10.8.1_re（上下文压缩）；更早的「网关 1.2.18/1.2.19/
 >   1.2.20」是 fork 旧连号（1.2.18 与上游撞车才改制），仅为历史记录。
+
+### v1.0.9_R — 桌面版：随网关 2026.10.31.1_upstream 发布
+
+随上一条目发布的桌面版——并入上游 v1.7.10：**缓存命中不再恒读 0**（#112，上游各模型族的缓存字段统一搬进 OpenAI 标准位，prompt cache 命中率从此可信）、**计费模型自检**（#113，面板模型库加「自检」按钮，当场看清「请求的模型」与「上游实际计费的模型」是否一致，billed_model WARN 每小时去重，另有默认值不变的 `QD_COSY_CLIENTTYPE`/`QD_COSY_UA` 身份覆盖）、**英文界面补上原生弹窗**（PR #114，语言包扩到 608 条并附抽取脚本）。一键更新未收录（桌面更新走安装包）。
+发布说明见 [Releases](https://github.com/Kepler16f/qoder2api-hub-desktop/releases/tag/v1.0.9_R)。
 
 ### v1.0.8_R — 桌面版：随网关 2026.10.28.2_upstream–2026.10.29.1_upstream 发布
 
