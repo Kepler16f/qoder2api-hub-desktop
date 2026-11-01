@@ -1,7 +1,7 @@
 # Qoder2API-Hub Desktop — Qoder 双区多账号网关 · 开箱即用桌面客户端
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-1.0.9_R-2496ED?style=flat-square" alt="Version 1.0.9_R">
+  <img src="https://img.shields.io/badge/Release-1.0.10_R-2496ED?style=flat-square" alt="Version 1.0.10_R">
   <img src="https://img.shields.io/badge/Desktop-Win_x64_·_Win_ARM64_·_macOS_·_Linux-8A2BE2?style=flat-square" alt="Desktop Platforms">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
@@ -228,6 +228,11 @@ Claude Code、Codex CLI、OpenCode、DSH、Crush 可以在看板「智能体配�
 >   天然不撞。历史号对应：`2026.10.07` ≈ 2026.10.7.1_upstream（上游 v1.2.18）、
 >   `2026.10.08` ≈ 2026.10.8.1_re（上下文压缩）；更早的「网关 1.2.18/1.2.19/
 >   1.2.20」是 fork 旧连号（1.2.18 与上游撞车才改制），仅为历史记录。
+
+### v1.0.10_R — 桌面版：随网关 2026.11.01.1_upstream 发布
+
+随上一条目发布的桌面版——并入上游 v1.7.11–v1.7.12 共 12 提交：**工具调用静默中断根治**（#120/#124/#116，半截 tool_calls 与 DSML 残片不再被当正文/正常结束，coding agent 整轮任务不再无声挂掉）、**Kimi 计费归因修复**（#119，business 块补发 model_key + 动态显示名解析）、**移除「计费自检」**（#121，v1.0.9_R 刚带的按钮经上游实测前提不成立，随上游删除）、树莓派 SBC 判据（#123）、只读签到诊断端点。fork 独有性能补丁：官方客户端模型目录解密落盘缓存（真机每分钟 14 秒卡顿 → 缓存命中 0.02 秒）。一键更新未收录（桌面更新走安装包）。
+发布说明见 [Releases](https://github.com/Kepler16f/qoder2api-hub-desktop/releases/tag/v1.0.10_R)。
 
 ### v1.0.9_R — 桌面版：随网关 2026.10.31.1_upstream 发布
 
