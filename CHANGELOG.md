@@ -10,6 +10,17 @@
 - 主版本号只在确有破坏性变更时才动。
 
 
+## v1.7.13
+
+**🐛 问题修复**
+
+- **chat 流式出口 usage 统计丢失/乱序，调用方只剩「输入 tokens」**（kimi-k3.1-pro 实测）：上游流尾原生顺序是 `[finish] → [usage]`（与 OpenAI 规范一致），但流式守卫链让调用方收到的是 `[usage] → [finish] → [DONE]`，回读触发轮更是**整轮吞掉 usage 帧** —— 按「末帧携带 usage」解析的 OpenAI Chat 客户端读不到输出/缓存 tokens（输入侧常由客户端自估，看起来就是「只收到输入 tokens」）。三个独立缺陷：
+  1. **收尾帧被无条件扣到流末**：`_recover_leaked_tool_calls_inner` / `_sse_recover_dsml` 把 `finish_reason` 帧扣住等流末回读判定，而 usage 垫底帧（空 `choices`）直接透传 —— 顺序被倒过来。现在 usage 帧到达且**无回读缓冲**（hold/buf/tail 为空，不可能再改写 `finish_reason`）时先放行被扣的收尾帧，恢复 `[content] → [finish] → [usage] → [DONE]` 标准顺序；
+  2. **回读暂存期间 usage 帧被静默吞掉**：hold 激活时垫底帧掉进 `continue` 分支（放行白名单只有 `tool_calls`/`reasoning_content`/`role`）—— 触发回读/DSML 恢复的轮次（coding agent 带 tools 的会话最易触发）usage 整轮丢失。现在缓存到流末、跟在收尾帧之后补发；
+  3. **kimi 原生缓存字段读不到**：上游把缓存写在**顶层** `usage.cached_tokens`，四处提取器（`normalize_usage_for_client` / `_extract_usage` / `_responses_usage` / `chat_usage_to_anthropic`）的候选链都只认 `prompt_cache_hit_tokens` / `completion_tokens_details.cached_tokens` / `prompt_tokens_details.cached_tokens` —— 已补顶层位，且不改变各家模型族惯例字段的优先级。
+
+**验证**：新增 `tests/_test_usage_frame_order.py`（14 条：纯文本流帧序、工具流帧序与 #47/#124 不回归、泄漏回读/DSML 回读轮 usage 不吞且垫底补发、四处提取器顶层 `cached_tokens` 候选位、DeepSeek/Qwen 惯例字段优先级不变、`clean_chunk` 标准位归一）；全量 **99 suites / 2580 checks / 0 failed**；kimi-k3.1-pro 线上实测：纯文本 / 工具调用 / 非流式 / Anthropic / Responses 五个出口 usage 三项（输入/输出/缓存）齐全、顺序标准。
+
 ## v1.7.12
 
 **🐛 问题修复**
