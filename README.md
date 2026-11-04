@@ -1,7 +1,7 @@
 # Qoder2API-Hub Desktop — Qoder 双区多账号网关 · 开箱即用桌面客户端
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-1.0.10_R-2496ED?style=flat-square" alt="Version 1.0.10_R">
+  <img src="https://img.shields.io/badge/Release-1.0.11_R-2496ED?style=flat-square" alt="Version 1.0.11_R">
   <img src="https://img.shields.io/badge/Desktop-Win_x64_·_Win_ARM64_·_macOS_·_Linux-8A2BE2?style=flat-square" alt="Desktop Platforms">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
@@ -228,6 +228,11 @@ Claude Code、Codex CLI、OpenCode、DSH、Crush 可以在看板「智能体配�
 >   天然不撞。历史号对应：`2026.10.07` ≈ 2026.10.7.1_upstream（上游 v1.2.18）、
 >   `2026.10.08` ≈ 2026.10.8.1_re（上下文压缩）；更早的「网关 1.2.18/1.2.19/
 >   1.2.20」是 fork 旧连号（1.2.18 与上游撞车才改制），仅为历史记录。
+
+### v1.0.11_R — 桌面版：随网关 2026.11.04.1_upstream 发布
+
+随上一条目发布的桌面版——并入上游 v1.7.14–v1.7.23 共 12 提交：**安全审计修复**（#131，web 工具越权与不记账、SSRF 三条绕过、匿名注销、白名单回写，配 66 条行为级回归）、**会话身份与缓存修正**（#128/#136，一次对话不再被拆成 N 条撞 110 日上限、缓存 98%↔0% 抖动修复）、**积分可见性**（#129，三段拆分 + 全价请求统计）、思考档位双向 clamp（#126）、账号测试免费模型探活且不叠冷却（#134）。一键更新维持剔除（桌面更新走安装包）。
+发布说明见 [Releases](https://github.com/Kepler16f/qoder2api-hub-desktop/releases/tag/v1.0.11_R)。
 
 ### v1.0.10_R — 桌面版：随网关 2026.11.01.1_upstream 发布
 
