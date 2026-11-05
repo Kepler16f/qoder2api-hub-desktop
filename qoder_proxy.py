@@ -65,7 +65,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.29"
+VERSION = "1.7.30"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -4525,7 +4525,10 @@ def _echo_with_bad_args(text, allowed_names=None):
         try:
             json.loads(args)
         except Exception:
-            bad += 1
+            # 能修好就不算「坏参数」——交给 parse_leaked_tool_calls 修复后还原，
+            # 否则这一轮会被 fail-closed 整轮丢掉（issue: DSH 工具参数 502）。
+            if _repair_args_json(args) is None:
+                bad += 1
     return bad > 0
 
 
@@ -4566,6 +4569,40 @@ def _repair_json_quotes(text):
     s = (text or "").replace('\\"', ph)
     s = s.replace('"', '\\"')
     return s.replace(ph, '\\"')
+
+
+def _repair_args_json(raw):
+    """尽量把模型写坏的 arguments 修成合法 JSON（issue: DSH 工具参数 502）。
+
+    模型高频写法：内层双引号未转义（`"command":"echo "hi" && ls"`）、尾随逗号。
+    依次尝试：严格 -> 转义内层裸引号 -> 去尾随逗号 -> 两者叠加。
+    返回修复后的字符串；都修不好返回 None（调用方继续按失败处理，不伪造调用）。
+    """
+    text = str(raw or "")
+    if not text.strip():
+        return ""
+    cands = [text]
+    try:
+        cands.append(_repair_json_quotes(text))
+    except Exception:
+        pass
+    # 更强的一档：按 JSON 状态机只转义「未转义的内层引号」（_escape_unescaped_quotes，
+    # 与 <tool_call> 解析同源）。模型写 `"command":"echo "hi" && ls"` 时这一步能救回来。
+    try:
+        _esc = _escape_unescaped_quotes(text)
+        if _esc not in cands:
+            cands.append(_esc)
+    except Exception:
+        pass
+    for base in list(cands):
+        cands.append(re.sub(r",\s*([}\]])", r"\1", base))
+    for cand in cands:
+        try:
+            json.loads(cand)
+            return cand
+        except Exception:
+            continue
+    return None
 
 
 def _salvage_echo_array(rest):
@@ -4906,7 +4943,14 @@ def parse_leaked_tool_calls(text, allowed_names=None):
             try:
                 json.loads(args)
             except Exception:
-                return None, text
+                _fixed = _repair_args_json(args)
+                if _fixed is None:
+                    return None, text
+                args = _fixed
+                try:
+                    RECOVERY_STATS["args_repaired"] =                         RECOVERY_STATS.get("args_repaired", 0) + 1
+                except Exception:
+                    pass
         calls.append({
             "id": _new_id("call_"),
             "type": "function",
@@ -7334,6 +7378,18 @@ def _is_request_fault(code, detail):
                               for m in _REQUEST_FAULT_MARKERS)
 
 
+def _is_first_token_timeout(detail):
+    """上游「首字超时」类 504（issue：#137 现场 DSH 每轮卡 4-5 分钟后失败）。
+
+    这类错误的特征是上游 worker 迟迟不产出首 token；**同账号立刻重试几乎必然
+    再超时**，只会把客户端拖到 idle timeout。应当直接换账号（换 worker）而不是
+    原地退避重试。
+    """
+    text = str(detail or "").lower()
+    return ("first token timeout" in text or "first_token_timeout" in text
+            or "upstream timeout" in text)
+
+
 def _is_transient_upstream(code, detail):
     """判断一次上游 HTTP 错误是否属于瞬时故障（可重试）。
 
@@ -8574,6 +8630,14 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                     continue
                 # 429/401/403 与客户端参数错：立即进入分类，不重试
                 if exc.code in (429, 401, 403):
+                    break
+                # 首字超时：同账号重试几乎必然再超时（会拖到客户端 idle timeout），
+                # 直接 break 让外层换账号——换 worker 才有意义。
+                if _is_first_token_timeout(detail):
+                    log("upstream first-token timeout on '%s' model '%s' - "
+                        "rotating to another account instead of retrying"
+                        % (account.uid[:8], model), level="WARN", tag="chat")
+                    note_risk("timeout", detail)
                     break
                 if _is_transient_upstream(exc.code, detail) \
                         and tries < TRANSIENT_MAX_RETRIES:

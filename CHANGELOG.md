@@ -10,6 +10,23 @@
 - 主版本号只在确有破坏性变更时才动。
 
 
+## v1.7.30
+
+**🐛 修复：DSH 两类每轮必失败的错误（现场日志 14×504 + 2×坏参数）**
+
+日志里 17 次失败中 14 次是 `504 First Token Timeout or Upstream Timeout`、2 次是 `invalid JSON arguments`、1 次是客户端 `stream idle timeout after 300000ms`。
+
+1. **首字超时不再「同账号退避重试」**：旧逻辑对 5xx 在**同一账号**上重试 2 次（1s/2s 退避），而首字超时几乎必然再超时 —— 一段 90s 的上游等待乘三次 ≈ 4.5 分钟，正好撞上客户端 300s idle timeout。
+   现在 `_is_first_token_timeout()` 命中（`First Token Timeout` / `Upstream Timeout`）**立即换账号**（换 worker 才有意义），并记一条 WARN 与 `note_risk("timeout")` 便于排查。
+2. **工具参数不再是「坏一点就整轮 502」**：新增 `_repair_args_json()`（严格 → 转义内层裸引号 → 去尾随逗号 → 两者叠加，含 JSON 状态机版本），`parse_leaked_tool_calls()` 与 `_echo_with_bad_args()` 都先尝试修复：
+   - 修好 → 还原成真实工具调用（本轮继续跑），并计入 `RECOVERY_STATS.args_repaired`；
+   - 修不好 → 仍 fail-closed（不伪造调用）。
+   现场那条 `{"command":"echo "hi" && ls"}` 现在能正确还原为 `echo "hi" && ls`。
+
+**行为变更**：#37 的「内层未转义引号」从「必须 raise」改为「修复后还原」，`_test_issue37_fail_closed.py` / `_test_issues_1_4_4.py` 已按新语义更新（真截断、多余文本、非法转义等仍 raise）。
+
+**验证**：新增 `tests/_test_dsh_504_args.py`（22 条：首字超时判定与换号、六种参数修复、还原后语义、真坏仍 fail-closed）；全量 **121 suites / 3203 checks / 0 failed**。
+
 ## v1.7.29
 
 **🐛 修复：SOTA 专属积分没被识别（INTL 合计少算 2,000）**
