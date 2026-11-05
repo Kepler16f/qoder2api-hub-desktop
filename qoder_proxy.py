@@ -1360,6 +1360,13 @@ def credits_summary():
             # issue #141：额度构成（套餐内 / 资源包 / SOTA / 共享池）与取数端点，
             # 面板据此把「这些数字是怎么来的」摊开。
             "composition": cred.get("composition") or [],
+            # 面板账号表用：四类小计（共享池单独标注，不参与个人合计）
+            "composition_sums": {
+                k: sum(int(b.get("remain") or 0)
+                       for b in (cred.get("composition") or [])
+                       if b.get("kind") == k)
+                for k in ("plan", "pack", "sota", "shared")
+            },
             "source": cred.get("source") or "",
             "expires_at": cred.get("expires_at"),
         })
@@ -11229,6 +11236,15 @@ class Handler(BaseHTTPRequestHandler):
             req_realm = query.get("realm", [None])[0] \
                 or self.headers.get("X-Realm") or CURRENT_REALM
             return self._json(200, recent_usage(limit, realm=req_realm, page=page))
+        if path == "/credits/probe":
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            _q = parse_qs(urlparse(self.path).query)
+            return self._handle_credits_probe({
+                "uid": (_q.get("uid") or [""])[0],
+                "realm": (_q.get("realm") or [None])[0],
+                "limit": (_q.get("limit") or [None])[0]})
         if path == "/credits/summary":
             # issue #21：只读积分汇总。**刻意不放进 _is_panel_route** ——
             # 同宿主机轮询方用 API key 即可拉取；实现内绝不触发上游查询
@@ -11786,6 +11802,42 @@ class Handler(BaseHTTPRequestHandler):
         return self._unknown_path_error(path)
 
     # issue #121：/diag/model-billing 已移除——上游对网关身份一律回报 "auto"，    # 该字段不携带计费信息，据此提示用户只会误导（用户实测国际版同样如此）。
+    def _handle_credits_probe(self, payload):
+        # issue #141：额度端点自动探测（主机 × 路径矩阵）。
+        # 用于确认某个区域到底哪个端点有数据（INTL 的 /api/v2/quota/usage
+        # 经常 404/403）。只读：不改账号，只写探测结果缓存。
+        if not self._panel_ok():
+            return self._error(401, "panel password required",
+                               "invalid_request_error")
+        uid = str((payload or {}).get("uid") or "").strip()
+        realm = (payload or {}).get("realm") or None
+        limit = (payload or {}).get("limit")
+        try:
+            limit = int(limit) if limit is not None else None
+        except (TypeError, ValueError):
+            limit = None
+        accs = []
+        if uid and POOL:
+            a = POOL.get(uid)
+            if a is not None:
+                accs = [a]
+        elif POOL:
+            accs = [a for a in POOL.accounts
+                    if (not realm or a.realm == realm)][:3]
+        if not accs:
+            return self._error(404, "no account to probe",
+                               "invalid_request_error")
+        results = []
+        for a in accs:
+            try:
+                res = a.probe_credits_endpoints(ACCOUNTS_DIR, limit=limit)
+            except Exception as exc:
+                res = {"ok": False, "error": str(exc)[:160], "rows": []}
+            results.append({"uid": a.uid, "nickname": a.nickname,
+                            "realm": a.realm, **res})
+        return self._json(200, {"ok": any(r.get("ok") for r in results),
+                                "results": results})
+
     def _handle_diag_queue(self, payload):
         # issue #139：上游排队（10605）诊断——一次最小探测，把业务码、
         # retryAfterSeconds、queueCount 与机器身份来源一起回显。
@@ -13185,6 +13237,11 @@ class Handler(BaseHTTPRequestHandler):
             log("local web tools %s (panel)" % ("enabled" if enabled else "disabled"),
                 tag="webtools")
             return self._json(200, {"ok": True, "web_tools": web_tools_enabled()})
+        if path == "/credits/probe":
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            return self._handle_credits_probe(payload)
         if path == "/settings/save":
             if not self._panel_ok():
                 return self._error(401, "panel password required",
@@ -13259,41 +13316,6 @@ class Handler(BaseHTTPRequestHandler):
         payload = self._payload_or_error(allow_list=(path == "/accounts/import"))
         if payload is None:
             return
-        if path == "/credits/probe":
-            # issue #141：额度端点自动探测（主机 × 路径矩阵）。
-            # 用于确认某个区域到底哪个端点有数据（INTL 的 /api/v2/quota/usage
-            # 经常 404/403）。只读：不改账号，只写探测结果缓存。
-            if not self._panel_ok():
-                return self._error(401, "panel password required",
-                                   "invalid_request_error")
-            uid = str((payload or {}).get("uid") or "").strip()
-            realm = (payload or {}).get("realm") or None
-            limit = (payload or {}).get("limit")
-            try:
-                limit = int(limit) if limit is not None else None
-            except (TypeError, ValueError):
-                limit = None
-            accs = []
-            if uid and POOL:
-                a = POOL.get(uid)
-                if a is not None:
-                    accs = [a]
-            elif POOL:
-                accs = [a for a in POOL.accounts
-                        if (not realm or a.realm == realm)][:3]
-            if not accs:
-                return self._error(404, "no account to probe",
-                                   "invalid_request_error")
-            results = []
-            for a in accs:
-                try:
-                    res = a.probe_credits_endpoints(ACCOUNTS_DIR, limit=limit)
-                except Exception as exc:
-                    res = {"ok": False, "error": str(exc)[:160], "rows": []}
-                results.append({"uid": a.uid, "nickname": a.nickname,
-                                "realm": a.realm, **res})
-            return self._json(200, {"ok": any(r.get("ok") for r in results),
-                                    "results": results})
         if path == "/diag/queue":
             if not self._panel_ok():
                 return self._error(401, "panel password required",

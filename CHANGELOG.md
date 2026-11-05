@@ -26,6 +26,19 @@
 
 **验证**：`_test_issue141_credit_composition.py` 扩到 38 条（新增 SOTA 合计 3800、行内构成、到期、端点提示、404 文案）；全量 **120 suites / 3173 checks / 0 failed**。
 
+## v1.7.27
+
+**🐛 修复：额度合计漏 SOTA / 探测接口 404 / 构成要跑到别处看**
+
+三项都是围绕「国际版用量读不到、数字也对不上」的现场反馈：
+
+1. **合计只算了 套餐内 + 资源包，漏掉 SOTA 专属积分**：官方界面 1800（资源包）+ 2000（SOTA）= **3800**，网关只显示 1800。
+   现在 `fetch_credits` 用归一后的 `composition` 覆盖主数字（不含共享池——组织级单独去重），所以 `remain/size/used` 与官方口径一致。
+2. **`POST /credits/probe` 在老版本网关上是 404**：路由抽成 `_handle_credits_probe()`，**do_GET 与 do_POST 各挂一处**（GET 走 query 参数，浏览器直接打开也能用）；面板在 404 时明确提示「升级到 1.7.26+ 并重启」，而不是让用户以为配错了。
+3. **构成不必去「用量洞察」找**：账号行的积分下面直接显示 `套餐内 x · 资源包 y · SOTA z · 共享 w` + 最近到期，悬停可看取数端点；`/credits/summary` 每行新增 `composition_sums` 四类小计。
+
+**验证**：`_test_issue141_credit_composition.py` 扩到 **42 条**（含 GET/POST 双路由、四类小计、老网关 404 提示）；全量 **120 suites / 3177 checks / 0 failed**。
+
 ## v1.7.26
 
 **✨ 额度构成 + 端点自动探测（INTL 读不到用量的问题）**

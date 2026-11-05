@@ -3511,6 +3511,22 @@ class Account(object):
             "updated_at": time.time(),
             "updated_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
+        # 旧解析只认 userQuota + addOnQuota，SOTA 等容器会被漏掉，于是面板
+        # 「剩余」比官方少一块（现场：官方 1800+2000=3800，网关只显示 1800）。
+        # 有构成时以构成为准重算主数字（不含共享池——组织级、单独去重）。
+        _comp = [b for b in (self.credits.get("composition") or [])
+                 if b.get("kind") != "shared"]
+        if _comp:
+            _r = sum(int(b.get("remain") or 0) for b in _comp)
+            _u = sum(int(b.get("used") or 0) for b in _comp)
+            _s = sum(int(b.get("size") or 0) for b in _comp)
+            if _r or _s:
+                self.credits["remain"] = _r
+                self.credits["used"] = _u
+                self.credits["size"] = _s
+                _shared_remain = int((shared or {}).get("remain") or 0) \
+                    if (shared and shared.get("available", True)) else 0
+                remain_effective = int(_r) + _shared_remain
         # 面板用：积分变化（正=进账、负=消耗）。只在数值真的变了时更新，
         # 同日多次刷新保留最后一次，避免签到 +100 被后续刷新覆盖成 0。
         try:
