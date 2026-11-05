@@ -3413,6 +3413,15 @@ class Account(object):
         remain = int(_num(uq, "remaining") + _num(aq, "remaining"))
         used = int(_num(uq, "used") + _num(aq, "used"))
         size = int(_num(uq, "total") + _num(aq, "total"))
+        # issue #141 后续：老口径只累加 userQuota + addOnQuota，**漏掉 SOTA 专属积分**
+        # 之类的新容器（INTL 实测 1800 资源包 + 2000 SOTA，面板却只显示 1800）。
+        # 归一器认得这些容器，就用它的合计覆盖；共享池照旧单列（组织级去重）。
+        _norm = normalize_quota_payload(q, self.realm) or {}
+        _comp = _norm.get("composition") or []
+        if _comp:
+            remain = int(_norm.get("remain") or remain)
+            size = int(_norm.get("size") or size)
+            used = int(_norm.get("used") or used)
         # ---- #25-d：退化 body 合理性守卫（保守）--------------------------
         # 形态（naonao 实测）：isQuotaExceeded=true + 两个 quota 全 0/缺键。
         # 判定**不依赖** expiresAt=253402214400——那是 CN 号「永不过期」的
@@ -3497,8 +3506,7 @@ class Account(object):
             "packages": _pkgs,
             # issue #141：把响应归一成「构成」（套餐内 / 资源包 / SOTA / 共享池）。
             # 归一器认得字段名，认不出就为空——不臆造。
-            "composition": ((normalize_quota_payload(q, self.realm) or {}).get("composition")
-                            or []),
+            "composition": _comp,
             "source": url,
             "updated_at": time.time(),
             "updated_iso": time.strftime("%Y-%m-%d %H:%M:%S"),

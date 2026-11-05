@@ -3464,7 +3464,15 @@ async function probeCredits(btn){
       toast("所有候选端点都没有额度字段（见日志）", "warn");
     }
     await loadCreditsComposition(true);
-  }catch(e){ toast("探测失败: " + e.message, "bad"); }
+  }catch(e){
+    const msg = String((e && e.message) || e);
+    // 老网关没有这个路由：明确告诉用户是版本问题，别让他以为是自己配错了
+    if(/not found/i.test(msg)){
+      toast("当前网关版本不支持额度探测（需升级到 1.7.26+ 并重启网关）", "warn");
+    } else {
+      toast("探测失败: " + msg, "bad");
+    }
+  }
   finally { if(btn) btn.disabled = false; }
 }
 async function loadCreditUsage(force){
@@ -4155,6 +4163,32 @@ function accountRow(a){
       '已用 ' + fmt(cred.shared.used) + ' · 总量 ' + fmt(cred.shared.size) + '">共享 ' +
       fmt(cred.shared.remain) + '</span>'
     : '';
+  // issue #141 后续：额度构成就贴在该账号的积分旁边（不再要求去别处看）
+  let compLine = '';
+  if(cred && Array.isArray(cred.composition) && cred.composition.length){
+    const part = {};
+    cred.composition.forEach(b => {
+      const k = b.kind || "pack";
+      part[k] = (part[k] || 0) + Number(b.remain || 0);
+    });
+    const bits = [];
+    if(part.plan) bits.push("套餐内 " + fmt(part.plan));
+    if(part.pack) bits.push("资源包 " + fmt(part.pack));
+    if(part.sota) bits.push("SOTA " + fmt(part.sota));
+    if(part.shared) bits.push("共享 " + fmt(part.shared));
+    const exps = cred.composition.map(b => Number(b.expires_at || 0)).filter(x => x > 0);
+    let expTxt = "";
+    if(exps.length){
+      const d = new Date(Math.min.apply(null, exps) * 1000);
+      expTxt = " · 最近到期 " + d.getFullYear() + "-"
+        + String(d.getMonth() + 1).padStart(2, "0") + "-"
+        + String(d.getDate()).padStart(2, "0");
+    }
+    const srcTip = cred.source ? ("\n取数端点：" + cred.source) : "";
+    compLine = '<div class="mono" style="font-size:10px;color:var(--dim);margin-top:1px" title="'
+      + esc("额度构成（上游返回的容器）" + srcTip) + '">'
+      + esc(bits.join(" · ") + expTxt) + '</div>';
+  }
   // issue #40 后续：上游返回「全 0 退化体」时不再一片空白——显示 0* 并说明原因
   const degraded = a.creditsDegraded || null;
   const credText = cred
@@ -4190,7 +4224,7 @@ function accountRow(a){
     + '<td style="text-align:center">' + state + _ckOff + '</td>'
     + '<td style="text-align:center;white-space:nowrap">' + accountGuardBadge(a) + '</td>'
     + '<td style="text-align:left;white-space:nowrap">' + credText
-    +   creditsDeltaChip(a) + freshLine + '</td>'
+    +   creditsDeltaChip(a) + compLine + freshLine + '</td>'
     + '<td style="text-align:right">' + fmt(usage.requests) + '</td>'
     + '<td style="text-align:right">' + fmt(usage.total_tokens) + '</td>'
     + '<td style="text-align:right">' + fmt(usage.cached_tokens) + '</td>'

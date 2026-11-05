@@ -71,8 +71,7 @@ check("开头读来源缓存", "_srcs = load_credits_sources(_dir)" in _ff)
 check("先用 _fetch_credits_via_source", "_fetch_credits_via_source(_dir, _src)" in _ff)
 check("失败分支会探测（限 6 个）", "probe_credits_endpoints(_dir, limit=6)" in _acc_src)
 check("探测命中后重试", '_probe["hit"]' in _acc_src)
-check("成功时把构成写进 credits",
-      '"composition": ((normalize_quota_payload(q, self.realm) or {}).get("composition")' in _acc_src)
+check("成功时把构成写进 credits", '"composition": _comp,' in _acc_src)
 check("记录取数端点", '"source": url,' in _acc_src)
 
 print("[#141] 接口与面板")
@@ -88,5 +87,21 @@ check("面板展示四列", all(x in _dash for x in ("套餐内", "资源包", "
 check("面板有自动探测按钮", "function probeCredits(" in _dash)
 check("按钮打 /credits/probe", 'postJSON("/credits/probe"' in _dash)
 check("挂进洞察加载链", "loadCreditsComposition(false)" in _dash)
+
+print("[#141 后续] 合计含 SOTA（修「INTL 少算 2000」）")
+_pay2 = {"userQuota": {"remaining": 0, "used": 0, "total": 0},
+         "addOnQuota": {"remaining": 1800, "used": 0, "total": 1800},
+         "sotaCredits": {"remaining": 2000, "used": 0, "total": 2000}}
+_n2 = A.normalize_quota_payload(_pay2, "intl")
+check("老口径只算 1800，归一后是 3800", _n2["remain"] == 3800, _n2["remain"])
+check("fetch_credits 用归一合计覆盖 remain/size",
+      'remain = int(_norm.get("remain") or remain)' in _acc_src)
+
+print("[#141 后续] 构成显示在账号积分旁边")
+check("账号行渲染 composition 明细", "cred.composition" in _dash and "compLine" in _dash)
+check("四类分别展示", all(x in _dash for x in ('套餐内 "', '资源包 "', 'SOTA "', '共享 "')))
+check("带最近到期", "最近到期" in _dash)
+check("悬停显示取数端点", "取数端点：" in _dash)
+check("老网关 404 给出升级提示", "当前网关版本不支持额度探测" in _dash)
 
 finish()
