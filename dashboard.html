@@ -1919,6 +1919,11 @@ window.initLangSystem();
       <h2>全价请求 <em id="fullPriceHint"></em></h2>
       <div id="fullPriceWrap"></div>
     </div>
+
+    <div class="insight-block">
+      <h2>额度构成 <em id="creditCompHint"></em></h2>
+      <div id="creditCompWrap"></div>
+    </div>
     <div class="insight-block">
       <h2>官方积分消耗 <em id="creditUsageHint"></em></h2>
       <div id="creditUsageWrap"></div>
@@ -3387,6 +3392,80 @@ function renderFullPrice(fp){
     + '<div style="font-size:11px;color:var(--dim);margin-top:2px">占窗口积分 ' + pct + '</div></div></div>'
     + '<div class="legend"><span>这类请求按<b>全价</b>计费：换前缀（改系统提示/工具清单）、新开会话、或压缩历史后首轮最容易命中。'
     + '想降成本就保持前缀稳定，并让长会话走压缩而不是重开。</span></div>';
+}
+// issue #141：额度构成（套餐内 / 资源包 / SOTA / 共享池）+ 端点自动探测
+let CREDITS_COMP_SIG = null;
+function compSum(list, kind){
+  return (list || []).filter(b => (b.kind || "") === kind)
+    .reduce((s, b) => s + Number(b.remain || 0), 0);
+}
+function compExpiry(list){
+  const ts = (list || []).map(b => Number(b.expires_at || 0)).filter(x => x > 0);
+  if(!ts.length) return "";
+  const soon = Math.min.apply(null, ts);
+  const d = new Date(soon * 1000);
+  return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-"
+    + String(d.getDate()).padStart(2, "0");
+}
+async function loadCreditsComposition(force){
+  const box = document.getElementById("creditCompWrap");
+  if(!box) return;
+  let d = null;
+  try{ d = await getJSON("/credits/summary"); }catch(e){ d = null; }
+  if(!d || !d.accounts || !d.accounts.length){
+    box.innerHTML = '<div class="stat-empty">还没有可用的账号</div>';
+    return;
+  }
+  const sig = JSON.stringify(d.accounts.map(a => [a.uid, a.credits_remain,
+    (a.composition || []).map(b => [b.kind, b.remain, b.size, b.expires_at])]));
+  if(!force && sig === CREDITS_COMP_SIG) return;
+  CREDITS_COMP_SIG = sig;
+  const rows = d.accounts.map(a => {
+    const comp = a.composition || [];
+    const plan = compSum(comp, "plan");
+    const pack = compSum(comp, "pack");
+    const sota = compSum(comp, "sota");
+    const shared = compSum(comp, "shared");
+    const exp = compExpiry(comp);
+    const src = (a.source || "").replace(/^https?:\/\//, "");
+    const num = v => v ? fmt(Math.round(v)) : '<span style="color:var(--dim)">0</span>';
+    return '<tr><td>' + esc(a.nickname || a.uid || "") + '</td>'
+      + '<td style="text-align:center">' + esc(a.realm || "") + '</td>'
+      + '<td style="text-align:right">' + num(plan) + '</td>'
+      + '<td style="text-align:right">' + num(pack) + '</td>'
+      + '<td style="text-align:right">' + num(sota) + '</td>'
+      + '<td style="text-align:right">' + (shared ? num(shared) : '<span style="color:var(--dim)">—</span>') + '</td>'
+      + '<td style="text-align:right"><b style="color:var(--accent2)">'
+        + fmt(Math.round(a.credits_remain_effective || a.credits_remain || 0)) + '</b></td>'
+      + '<td style="color:var(--dim)">' + (exp ? esc(exp) : "—") + '</td>'
+      + '<td style="color:var(--dim);font-size:11px">' + (src ? esc(src) : "未探测") + '</td></tr>';
+  }).join("");
+  box.innerHTML = '<div class="stat-panel-sub" style="margin:0 0 8px">'
+    + '按「官方返回的额度容器」拆开：<b>套餐内</b>（userQuota/plan）/ <b>资源包</b>（addOnQuota/packages）/ '
+    + '<b>SOTA 专属</b> / <b>共享池</b>（组织级）。来源端点一栏是本次取数实际用的 URL —— '
+    + 'INTL 与 CN 不是同一套，网关会自动探测并记住。'
+    + ' <button class="sec" style="font-size:11px;padding:2px 8px" onclick="probeCredits(this)">自动探测</button></div>'
+    + '<div class="table-wrap"><table class="insight-table"><thead><tr>'
+    + '<th>账号</th><th style="text-align:center">区域</th>'
+    + '<th style="text-align:right">套餐内</th><th style="text-align:right">资源包</th>'
+    + '<th style="text-align:right">SOTA</th><th style="text-align:right">共享池</th>'
+    + '<th style="text-align:right">剩余</th><th>最近到期</th><th>来源端点</th>'
+    + '</tr></thead><tbody>' + rows + '</tbody></table></div>';
+}
+async function probeCredits(btn){
+  if(btn) btn.disabled = true;
+  try{
+    const r = await postJSON("/credits/probe", {});
+    const hits = (r.results || []).filter(x => x.ok);
+    const first = hits[0] && hits[0].hit;
+    if(first){
+      toast("探测成功：使用 " + first.host.replace(/^https?:\/\//, "") + first.path, "ok");
+    } else {
+      toast("所有候选端点都没有额度字段（见日志）", "warn");
+    }
+    await loadCreditsComposition(true);
+  }catch(e){ toast("探测失败: " + e.message, "bad"); }
+  finally { if(btn) btn.disabled = false; }
 }
 async function loadCreditUsage(force){
   if(!force && Date.now() - CREDIT_USAGE_AT < 60000) return;
@@ -7075,6 +7154,7 @@ async function loadAnalytics(force){
   try{ renderFullPrice(statData && statData.full_price); }
   catch(e){ /* 全价请求卡失败不影响主看板 */ }
   try{ loadCreditUsage(!!force); }catch(e){ /* 官方积分消耗失败不影响主看板 */ }
+  try{ loadCreditsComposition(false); }catch(e){ /* 额度构成失败不影响主看板 */ }
 }
 
 function renderStats(d){

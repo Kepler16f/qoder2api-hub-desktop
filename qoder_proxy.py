@@ -1356,6 +1356,11 @@ def credits_summary():
             "credits_size": cred.get("size"),
             # 登记时间：credits.updated_at（fetch_credits 写入），不是文件 mtime。
             "registered_at": cred.get("updated_at"),
+            # issue #141：额度构成（套餐内 / 资源包 / SOTA / 共享池）与取数端点，
+            # 面板据此把「这些数字是怎么来的」摊开。
+            "composition": cred.get("composition") or [],
+            "source": cred.get("source") or "",
+            "expires_at": cred.get("expires_at"),
         })
         total = int(plan_remain) + shared_counted
         by_realm[realm] = by_realm.get(realm, 0) + total
@@ -13225,7 +13230,7 @@ class Handler(BaseHTTPRequestHandler):
                 # 否则会在 404 分支被拦掉（CORS 无需另加，"/v1" 前缀已覆盖）。
                 "/v1/messages", "/v1/messages/count_tokens",
                 # issue #123：签到诊断（只读，面板鉴权）
-                "/diag/checkin", "/diag/queue"):
+                "/diag/checkin", "/diag/queue", "/credits/probe"):
             if path in ("/v1/completions", "/completions"):
                 # legacy Completions（prompt 而非 messages）本网关不实现：
                 # 明确 404 优于"接受请求却按空会话转发上游"。
@@ -13241,6 +13246,41 @@ class Handler(BaseHTTPRequestHandler):
         payload = self._payload_or_error(allow_list=(path == "/accounts/import"))
         if payload is None:
             return
+        if path == "/credits/probe":
+            # issue #141：额度端点自动探测（主机 × 路径矩阵）。
+            # 用于确认某个区域到底哪个端点有数据（INTL 的 /api/v2/quota/usage
+            # 经常 404/403）。只读：不改账号，只写探测结果缓存。
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            uid = str((payload or {}).get("uid") or "").strip()
+            realm = (payload or {}).get("realm") or None
+            limit = (payload or {}).get("limit")
+            try:
+                limit = int(limit) if limit is not None else None
+            except (TypeError, ValueError):
+                limit = None
+            accs = []
+            if uid and POOL:
+                a = POOL.get(uid)
+                if a is not None:
+                    accs = [a]
+            elif POOL:
+                accs = [a for a in POOL.accounts
+                        if (not realm or a.realm == realm)][:3]
+            if not accs:
+                return self._error(404, "no account to probe",
+                                   "invalid_request_error")
+            results = []
+            for a in accs:
+                try:
+                    res = a.probe_credits_endpoints(ACCOUNTS_DIR, limit=limit)
+                except Exception as exc:
+                    res = {"ok": False, "error": str(exc)[:160], "rows": []}
+                results.append({"uid": a.uid, "nickname": a.nickname,
+                                "realm": a.realm, **res})
+            return self._json(200, {"ok": any(r.get("ok") for r in results),
+                                    "results": results})
         if path == "/diag/queue":
             if not self._panel_ok():
                 return self._error(401, "panel password required",
