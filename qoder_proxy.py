@@ -64,7 +64,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.24"
+VERSION = "1.7.25"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -4574,6 +4574,235 @@ def _salvage_echo_array(rest):
     return None
 
 
+# ---------------------------------------------------------------------------
+# 伪 XML 工具调用：`<tool_call> Name {json} </tool_call>`（issue #137）
+# ---------------------------------------------------------------------------
+# 上游（尤其自定义供应商 / 经转换层中转的模型）会吐这种非标准形态：
+#   [assistant 请求调用工具] <tool_call> Bash {"command":"ls -la"} </tool_call>
+# 它既不是 OpenAI 结构化 tool_calls、也不是 DSML、也不是网关自己的
+# marker+JSON 数组 —— 三个既有解析器全部认不出，整段被判定成「无法还原的
+# 协议残片」，流式中途 fail-closed，客户端看到的就是整轮静默中断。
+TOOL_CALL_OPEN = "<tool_call"
+_CALL_TAG_OPEN_RE = re.compile(r"<\s*tool_call\s*>", re.IGNORECASE)
+_CALL_TAG_OPEN_ATTR_RE = re.compile(
+    r"<\s*tool_call\b([^>]*)>", re.IGNORECASE)
+_CALL_TAG_CLOSE_RE = re.compile(r"<\s*/\s*tool_call\s*>", re.IGNORECASE)
+_CALL_TAG_ATTR_NAME_RE = re.compile(
+    r"""\b(?:name|tool|tool_name|function)\s*=\s*(?:"([^"]+)"|'([^']+)')""",
+    re.IGNORECASE)
+_CALL_TAG_NAME_RE = re.compile(
+    r"\s*([A-Za-z_][A-Za-z0-9_.:\-]*)\s*(?=[({\[]|$)")
+# 形态 D：名字后可跟逗号/冒号/等号分隔符（`Bash, {...}` / `Bash: {...}`）
+_CALL_TAG_LEAD_RE = re.compile(
+    r"\s*([A-Za-z_][A-Za-z0-9_.:\-]*)\s*(?=[,:=]|[({\[]|$)")
+
+
+def _escape_unescaped_quotes(s):
+    """把 JSON 字符串值里**未转义**的双引号补上转义。
+
+    模型写 `<tool_call>Bash {"command":"echo "hi" && ls"}</tool_call>` 时，内层
+    引号没有转义，整个对象都不是合法 JSON。判据：字符串内遇到的 `"`，只有其后
+    第一个非空白字符是 `, } ] :` 或文本结束才算闭合引号，否则是内层字面引号。
+    已经写成 `\"` 的保持原样。
+    """
+    out, in_str, i, n = [], False, 0, len(s)
+    while i < n:
+        c = s[i]
+        if not in_str:
+            out.append(c)
+            if c == '"':
+                in_str = True
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            out.append(s[i:i + 2])      # 已成对的转义序列整体搬运
+            i += 2
+            continue
+        if c == '"':
+            j = i + 1
+            while j < n and s[j] in " \t\r\n":
+                j += 1
+            if j >= n or s[j] in ",}]:":
+                out.append(c)
+                in_str = False
+            else:
+                out.append('\\"')
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _loads_lenient(raw):
+    """尽量把工具参数文本解析成 JSON；全部尝试失败返回 None。
+
+    依次尝试：严格解析 -> 去尾随逗号 -> 转义内层裸引号 -> 两者叠加。
+    与 _salvage_echo_array 同一定位：模型复述的参数常有未转义引号。
+    """
+    t = str(raw or "").strip()
+    if not t:
+        return {}
+    no_trailing = re.sub(r",\s*([}\]])", r"\1", t)
+    escaped = _escape_unescaped_quotes(t)
+    cands = [t]
+    if no_trailing != t:
+        cands.append(no_trailing)
+    if escaped != t:
+        cands.append(escaped)
+        cands.append(re.sub(r",\s*([}\]])", r"\1", escaped))
+    for cand in cands:
+        try:
+            return json.loads(cand)
+        except Exception:
+            continue
+    return None
+
+
+def _make_tool_call(name, args):
+    """组装成 OpenAI 结构化 tool_call；参数不是合法 JSON 时返回 None。"""
+    name = str(name or "").strip().strip("\"'`")
+    if not name or not re.match(r"^[A-Za-z_][A-Za-z0-9_.:\-]*$", name):
+        return None
+    if isinstance(args, (dict, list)):
+        argstr = json.dumps(args, ensure_ascii=False)
+    elif isinstance(args, str):
+        argstr = args.strip() or "{}"
+    elif args is None:
+        argstr = "{}"
+    else:
+        argstr = json.dumps(args, ensure_ascii=False)
+    try:
+        json.loads(argstr)
+    except Exception:
+        return None
+    return {"id": _new_id("call_"), "type": "function",
+            "function": {"name": name, "arguments": argstr}}
+
+
+def _parse_one_call_tag(body, attr_name=None):
+    """单个标签块 -> tool_call：
+
+    形态 A：`{"name": "Bash", "arguments": {...}}`（JSON 对象）
+    形态 B：`Bash {"command": "ls"}` / `Bash({...})` / 只有工具名
+    形态 C：`<tool_call name="Bash">{...}</tool_call>`（名字在属性里）
+    形态 D：`Bash, {"command":"ls"}` / `Bash: {...}`（名字后用逗号/冒号分隔）
+    """
+    b = _strip_json_fence((body or "").strip())
+    if attr_name:
+        # 形态 C：属性给了工具名，正文就是参数本身
+        b = b.lstrip("=:").strip()
+        if not b:
+            return _make_tool_call(attr_name, {})
+        args = _loads_lenient(b)
+        if args is None:
+            return None
+        return _make_tool_call(attr_name, args)
+    if not b:
+        return None
+    if b.startswith("{"):
+        obj = _loads_lenient(b)
+        if not isinstance(obj, dict):
+            return None
+        name = obj.get("name") or obj.get("tool") or obj.get("tool_name")
+        if not (isinstance(name, str) and name.strip()):
+            return None        # 只有一个裸参数对象，没有工具名 -> 无法还原
+        for key in ("arguments", "input", "args", "parameters"):
+            if key in obj:
+                return _make_tool_call(name, obj.get(key))
+        return _make_tool_call(name, {})
+    # 形态 D 的探测必须在 _CALL_TAG_NAME_RE 之前：后者的前瞻要求「名后紧跟
+    # ( { [ 或结尾」，`Bash, {…}` / `Bash: {…}` 会整个 match 失败。
+    m = _CALL_TAG_LEAD_RE.match(b)
+    if not m:
+        return None
+    # 字符类含 `:` 是为了命名空间工具（`ns:tool`）；但 `Read: {…}` 里的冒号
+    # 是分隔符，会被贪心吃进名字。只剥**尾**冒号，命名空间名不受影响。
+    name = m.group(1).rstrip(":")
+    rest = b[m.end():].lstrip(",:=").strip()
+    if rest.startswith("(") and rest.endswith(")"):
+        rest = rest[1:-1].strip()
+    if not rest:
+        return _make_tool_call(name, {})
+    args = _loads_lenient(rest)
+    if args is None:
+        return None
+    return _make_tool_call(name, args)
+
+
+def parse_tool_call_tags(text, allowed_names=None):
+    """把 `<tool_call> Name {json} </tool_call>` 还原成结构化 tool_calls。
+
+    严格守卫（避免把「讲解这个格式」的普通回复误判成一次调用）：
+      1) 至少一个标签块能解析出工具名 + 合法 JSON 参数；
+      2) 本次请求声明了 tools 时，解析出的工具名必须全部命中声明集合；
+      3) 最后一个标签块之后只能剩空白 / 围栏残片 —— 真实泄漏永远在消息末尾，
+         讲解示例后面通常还有说明文字。
+
+    返回 (calls|None, clean_text)；clean_text 是剥掉标签块与网关 marker 后
+    的剩余正文（未识别时原样返回 text）。
+    """
+    t = str(text or "")
+    if not t or TOOL_CALL_OPEN not in t.lower():
+        return None, text
+    spans, calls, pos = [], [], 0
+    while True:
+        m = _CALL_TAG_OPEN_ATTR_RE.search(t, pos)
+        if not m:
+            break
+        attr_name = None
+        for am in _CALL_TAG_ATTR_NAME_RE.finditer(m.group(1) or ""):
+            attr_name = am.group(1) or am.group(2)
+            break
+        close = _CALL_TAG_CLOSE_RE.search(t, m.end())
+        nxt = _CALL_TAG_OPEN_ATTR_RE.search(t, m.end())
+        if nxt and (close is None or nxt.start() < close.start()):
+            # 缺闭标签（流被截断）：拿下一个开标签前的文本当参数
+            body, end = t[m.end():nxt.start()], nxt.start()
+        elif close is not None:
+            body, end = t[m.end():close.start()], close.end()
+        else:
+            body, end = t[m.end():], len(t)
+        call = _parse_one_call_tag(body, attr_name)
+        if call is not None:
+            calls.append(call)
+            spans.append((m.start(), end))
+        pos = max(end, m.end())
+    if not calls:
+        return None, text
+    # 未声明 tools 的会话里 `<tool_call>` 几乎都是在讨论这个格式（教程、提问、
+    # 粘贴示例）—— 不还原，交回正文，避免把聊天内容变成客户端无法执行的调用。
+    if not allowed_names:
+        return None, text
+    if not all(c["function"]["name"] in allowed_names for c in calls):
+        return None, text
+    # 有没有网关 marker 决定了判定宽严：
+    #   · 有 marker  -> 模型在复述网关写进历史的协议（真泄漏）；
+    #   · 无 marker  -> 只是正文里出现了标签，必须「整段就是一个块」才算，
+    #                   否则讲解示例（标签前后都有散文）会被误判成一次真实调用。
+    has_marker = bool(_LEAK_MARKER_RE.search(t))
+    lead = _LEAK_MARKER_RE.sub("", t[:spans[0][0]]).strip().strip("`").strip()
+    if not has_marker and lead:
+        return None, text
+    # 块之后的残留：允许 marker 变体、围栏、以及**不含协议结构的短散文**
+    # （模型常写「以上是本次操作」之类收尾）。带标签/JSON 键的残留仍判失败，
+    # 那是真的没剥干净，宁可交回正文也不伪造调用。
+    tail_txt = _LEAK_MARKER_RE.sub("", t[spans[-1][1]:]).strip().strip("`").strip()
+    if tail_txt and (_LEAK_STRUCT_RE.search(tail_txt)
+                     or _CALL_TAG_OPEN_RE.search(tail_txt)):
+        return None, text
+    if not has_marker and tail_txt:
+        return None, text
+    clean, last = [], 0
+    for start, end in spans:
+        clean.append(t[last:start])
+        last = end
+    clean.append(t[last:])
+    out = _LEAK_MARKER_RE.sub("", "".join(clean))
+    out = re.sub(r"<\s*assistant\s*请求调用工具\s*>", "", out)
+    return calls, out.strip()
+
+
 def parse_leaked_tool_calls(text, allowed_names=None):
     """把模型复述的「marker + JSON 数组」还原成结构化 tool_calls。
 
@@ -4856,6 +5085,42 @@ def _marker_starts_at(text):
     return False
 
 
+def _tool_tag_candidate(text):
+    """这段文本是否仍是「`<tool_call> Name {json} </tool_call>`」候选（issue #137）。
+
+    只对**块形态本身**判定，不管前面的 marker：
+      · 标签还没打完（"<" "<tool_ca" …）-> 仍是候选，等下一帧；
+      · 标签已开、闭标签未到 -> 仍是候选；
+      · 闭标签已到 -> 之后只能剩空白/围栏/marker，出现别的字即证伪
+        （"例如 <tool_call>…</tool_call> 就是这样" 这类讲解不会被吞）。
+    """
+    t = (text or "").lstrip()
+    if not t:
+        return True
+    low = t.lower()
+    if TOOL_CALL_OPEN.startswith(low):
+        return True
+    if not low.startswith(TOOL_CALL_OPEN):
+        return False
+    # "<tool_callXXX" 只有紧跟分隔符才算标签：`<tool_calling>` 是普通词。
+    nxt = low[len(TOOL_CALL_OPEN):len(TOOL_CALL_OPEN) + 1]
+    if nxt and nxt not in (">", " ", "\t", "\n", "\r", "/"):
+        return False
+    # 开标签可以带属性（`<tool_call name="Bash">`）；只要 `>` 还没到就继续等。
+    if ">" not in t:
+        return True
+    if not _CALL_TAG_OPEN_ATTR_RE.match(t):
+        return False
+    close = _CALL_TAG_CLOSE_RE.search(t)
+    if close is None:
+        return True
+    rest = _LEAK_MARKER_RE.sub("", t[close.end():]).strip().strip("`").strip()
+    if not rest:
+        return True
+    # 块后已出现正文：只要不含协议结构就仍是候选（收尾散文很常见）
+    return _LEAK_STRUCT_RE.search(rest) is None
+
+
 def _still_leak_candidate(text):
     """整段文本目前是否仍是「marker + JSON 数组」候选？（流式暂存判定用）"""
     state, body = _leak_body_offset(text)
@@ -4865,6 +5130,11 @@ def _still_leak_candidate(text):
         return False
     rest = (body or "").lstrip()
     if not rest:
+        return True
+    # issue #137：伪 XML 工具调用（`<tool_call>Name {json}</tool_call>`）不是
+    # JSON 数组，但同属「marker + 协议块」，必须继续 hold 到流末再判定；
+    # 否则第二帧就被证伪、整块当正文补发（或中途 fail-closed）。
+    if _tool_tag_candidate(rest):
         return True
     # issue #51：marker 之后可能先跟一小段杂字（">、=、: 等）再进数组，
     # 且数组开头的 [ 可能丢了（直接 {"name":...}）。两种都保持候选，
@@ -5340,6 +5610,12 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
 
     if hold is not None:
         calls, clean = parse_leaked_tool_calls(hold, allowed_names)
+        if not calls and TOOL_CALL_OPEN in (hold or "").lower():
+            # issue #137：伪 XML 形态（`[marker] <tool_call>Name {json}</tool_call>`）
+            calls, clean = parse_tool_call_tags(hold, allowed_names)
+            if calls:
+                RECOVERY_STATS["tool_tag"] = \
+                    RECOVERY_STATS.get("tool_tag", 0) + 1
         if calls:
             recovered = True
             RECOVERY_STATS["leak"] = RECOVERY_STATS.get("leak", 0) + 1
@@ -5770,18 +6046,172 @@ def _sse_guard_nameless_tool_calls(frames):
 
 
 
+def _tool_tag_tail_hold(text):
+    """返回「疑似 `<tool_call>` 开头但还没打完」的尾巴（跨帧暂留，issue #137）。"""
+    t = text or ""
+    i = t.rfind("<")
+    if i < 0 or len(t) - i > len(TOOL_CALL_OPEN) + 8:
+        return ""
+    tail = t[i:]
+    if ">" in tail:
+        return ""                    # 标签已完整：交由正文缓冲判定
+    if TOOL_CALL_OPEN.startswith(tail.lower()):
+        return tail                  # "<" / "<tool_c" / "<tool_call" …
+    return ""
+
+
+def _sse_recover_tool_tags(frames, allowed_names=None):
+    """把流式正文里的 `<tool_call> Name {json} </tool_call>` 还原为 tool_calls。
+
+    issue #137：模型（尤其经自定义供应商中转的模型）会把工具调用写成伪 XML。
+    这条链路此前只认结构化 tool_calls / DSML / 网关 marker+JSON 数组，
+    `<tool_call>` 形态要么当正文漏给客户端，要么被判成「无法还原的协议残片」
+    而 fail-closed —— 客户端看到的就是整轮静默中断。
+
+    策略与 _sse_recover_dsml 一致：平时只暂留「像标签开头」的几个字符；一旦
+    正文出现 `<tool_call` 就转入缓冲直到流末统一解析。解析出调用则补发散文 +
+    tool_calls + finish=tool_calls；解析不出则原样补发（fail-open）。
+    未声明 tools 的会话一律不缓冲（`<tool_call>` 只会是在讨论这个格式）。
+    """
+    if not allowed_names:
+        for raw in frames:
+            yield raw
+        return
+    buf = ""
+    tail = ""
+    finish = None
+    tail_usage = []
+    meta = {"id": None, "model": None, "created": None}
+    recovered = False
+    # 已放行的正文：块若落在未闭合的 ``` 里，那是文档示例（教程/提问里贴的
+    # 格式），**不能**转成真实调用 —— 误报会真的执行命令。
+    # 必须累计整段再算奇偶：围栏标记会跨帧拆开（"``" + "`"），逐帧计数会漏。
+    emitted_text = []
+
+    for raw in frames:
+        text = (raw.decode("utf-8", "replace")
+                if isinstance(raw, bytes) else raw)
+        data = strip_data_prefix(text)
+        if not data or data == "[DONE]":
+            continue
+        try:
+            payload = json.loads(data)
+        except Exception:
+            yield raw
+            continue
+        choices = payload.get("choices") if isinstance(payload, dict) else None
+        if not isinstance(choices, list) or not choices:
+            if (isinstance(payload, dict)
+                    and isinstance(payload.get("usage"), dict)):
+                if buf or tail:
+                    # 缓冲期间的 usage 垫底帧：缓存到收尾帧之后补发
+                    tail_usage.append(payload)
+                    continue
+                if finish is not None:
+                    _fp, _ffin = finish
+                    finish = None
+                    yield ("data: " + json.dumps(_fp, ensure_ascii=False)
+                           + "\n\n").encode("utf-8")
+            yield raw
+            continue
+        if not meta["id"] and payload.get("id"):
+            meta["id"] = payload.get("id")
+        if not meta["model"] and payload.get("model"):
+            meta["model"] = payload.get("model")
+        if not meta["created"] and payload.get("created"):
+            meta["created"] = payload.get("created")
+        ch = choices[0] if isinstance(choices[0], dict) else {}
+        delta = ch.get("delta") or {}
+        piece = delta.get("content")
+        fin = ch.get("finish_reason")
+        if not isinstance(piece, str) or not piece:
+            if fin:
+                finish = (payload, fin)
+            else:
+                yield raw
+            continue
+        piece = tail + piece
+        tail = ""
+        if not buf:
+            hold = _tool_tag_tail_hold(piece)
+            body = piece[:len(piece) - len(hold)] if hold else piece
+            if TOOL_CALL_OPEN in body.lower():
+                # 围栏判定必须发生在**进入缓冲之前**：正文已经走完的 ``` 若为
+                # 奇数，说明这个标签落在未闭合的代码块里 = 文档示例（教程、提问
+                # 里贴的格式），绝不能转成真实调用 —— 误报会真的执行命令。
+                if ("".join(emitted_text) + body).count("```") % 2 == 1:
+                    payload2 = json.loads(json.dumps(payload))
+                    payload2["choices"][0].setdefault("delta", {})["content"] = body
+                    emitted_text.append(body)
+                    yield ("data: " + json.dumps(payload2, ensure_ascii=False)
+                           + "\n\n").encode("utf-8")
+                    tail = hold
+                    continue
+                buf = body
+                tail = hold
+                continue
+            if body:
+                payload2 = json.loads(json.dumps(payload))
+                payload2["choices"][0].setdefault("delta", {})["content"] = body
+                emitted_text.append(body)
+                yield ("data: " + json.dumps(payload2, ensure_ascii=False)
+                       + "\n\n").encode("utf-8")
+            tail = hold
+            continue
+        buf += piece
+
+    if buf:
+        calls, clean = parse_tool_call_tags(buf, allowed_names)
+        if calls:
+            recovered = True
+            RECOVERY_STATS["tool_tag"] = RECOVERY_STATS.get("tool_tag", 0) + 1
+            if clean and _residue_text_only(clean):
+                log("dropped residue in post-recovery text (%d chars) — issue #49"
+                    % len(clean), level="WARN", tag="chat")
+            elif clean:
+                yield _leak_chunk_frame(meta, {"content": clean})
+            for i, call in enumerate(calls):
+                yield _leak_chunk_frame(meta, {"tool_calls": [{
+                    "index": i,
+                    "id": call.get("id") or _new_id("call_"),
+                    "type": "function",
+                    "function": call.get("function") or {},
+                }]})
+        else:
+            # fail-open：不是可执行的调用（讲解示例 / 参数坏了 / 名字没声明）
+            yield _leak_chunk_frame(meta, {"content": buf})
+    if tail:
+        yield _leak_chunk_frame(meta, {"content": tail})
+    if finish is not None:
+        payload, fin = finish
+        if recovered:
+            payload = json.loads(json.dumps(payload))
+            for ch2 in payload.get("choices") or []:
+                if isinstance(ch2, dict) and ch2.get("finish_reason"):
+                    ch2["finish_reason"] = "tool_calls"
+        yield ("data: " + json.dumps(payload, ensure_ascii=False)
+               + "\n\n").encode("utf-8")
+    elif recovered:
+        yield _leak_chunk_frame(meta, {}, "tool_calls")
+    for _up in tail_usage:
+        yield ("data: " + json.dumps(_up, ensure_ascii=False)
+               + "\n\n").encode("utf-8")
+
+
 def recover_leaked_tool_calls(frames, allowed_names=None):
-    """流式出口：回读（issue #8）+ **tool_call id 保证**（issue #47）
+    """流式出口：回读（issue #8 / #51 / #137）+ **tool_call id 保证**（issue #47）
     + 截断参数守卫（issue #112）。
 
     保持同名：三条调用点（chat 主链路 / Anthropic / Responses）都不用改。
+    各阶段都是生成器，顺序即数据流方向；用具名中间变量而非层层嵌套 ——
+    出口是包装器这一事实要能被静态断言钉住（见 _test_stream_tool_ids 第 7 节）。
     """
-    for frame in _sse_guard_truncated_tool_args(
-            _sse_guard_nameless_tool_calls(
-                _sse_fill_tool_call_ids(
-                    _sse_recover_dsml(
-                        _recover_leaked_tool_calls_inner(frames, allowed_names),
-                        allowed_names)))):
+    leaked = _recover_leaked_tool_calls_inner(frames, allowed_names)
+    dsml = _sse_recover_dsml(leaked, allowed_names)
+    tagged = _sse_recover_tool_tags(dsml, allowed_names)
+    with_ids = _sse_fill_tool_call_ids(tagged)
+    named = _sse_guard_nameless_tool_calls(with_ids)
+    for frame in _sse_guard_truncated_tool_args(named):
         yield frame
 
 
@@ -5963,6 +6393,24 @@ STRUCTURED_TOOL_HISTORY_WHITELIST = ("qwen", "glm", "gm4", "gm5",
 _STRUCTURED_LOG_ONCE = {"done": False}
 
 
+def _structured_realms():
+    """auto 模式下允许启用结构化历史的出口（默认仅 cn = 旧行为）。
+
+    issue #137 后续：INTL 此前因「未取得端到端验证」被排除，于是 INTL 会话一直
+    走文本化历史 —— 网关把 `[assistant 请求调用工具] + JSON` 写进 assistant 消息，
+    模型照着复述，轻则整轮 502（issue #72 的 marker_only），重则客户端拿到协议
+    正文。实测（本机 intl 账号 + DeepSeek-Flash）结构化直传完全被上游接受：
+    返回原生 tool_calls、正文为空。要启用：
+        QD_STRUCTURED_TOOL_HISTORY_REALMS=cn,intl
+    默认值不变，避免影响未验证的环境。
+    """
+    raw = os.environ.get("QD_STRUCTURED_TOOL_HISTORY_REALMS")
+    if raw is None or not raw.strip():
+        return {"cn"}
+    out = {p.strip().lower() for p in raw.split(",") if p.strip()}
+    return out or {"cn"}
+
+
 def _structured_mode():
     """QD_STRUCTURED_TOOL_HISTORY 三态：'on' / 'off' / 'auto'（默认）。"""
     raw = (os.environ.get("QD_STRUCTURED_TOOL_HISTORY") or "").strip().lower()
@@ -6010,7 +6458,7 @@ def structured_tool_history_enabled(model="", model_key="", realm="",
         return False
     if mode == "on":
         return True
-    if (realm or "") != "cn":
+    if (realm or "").strip().lower() not in _structured_realms():
         return False
     for cand in (str(model_key or ""), str(model or "")):
         low = cand.strip().lower()
@@ -8623,6 +9071,12 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
         _echo_src = _block16 or ""
         if _echo_src:
             _rec, _clean = parse_leaked_tool_calls(_echo_src, allowed_names)
+            if not _rec and TOOL_CALL_OPEN in _echo_src.lower():
+                # issue #137：marker 后面跟的是伪 XML 调用，不是 JSON 数组
+                _rec, _clean = parse_tool_call_tags(_echo_src, allowed_names)
+                if _rec:
+                    RECOVERY_STATS["tool_tag"] = \
+                        RECOVERY_STATS.get("tool_tag", 0) + 1
             if _rec:
                 message["content"] = _head16 + (_clean or "")
                 tool_calls_map = {i: c for i, c in enumerate(_rec)}
@@ -8707,6 +9161,22 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
                     "failing the turn closed (aggregate-dsml)" % len(_bad_dsml),
                     level="WARN", tag="chat")
                 raise EmptyToolEcho(len(_bad_dsml), "unrecovered_aggregate_dsml")
+    # issue #137：伪 XML 工具调用回退（`<tool_call>Name {json}</tool_call>`）。
+    # 非流式侧与 DSML 同位置：模型没吐结构化 tool_calls，正文里只有这种标签。
+    if not tool_calls_map and TOOL_CALL_OPEN in (message.get("content")
+                                                or "").lower():
+        _tag_calls, _tag_clean = parse_tool_call_tags(
+            message.get("content") or "", allowed_names)
+        if _tag_calls:
+            tool_calls_map = {i: c for i, c in enumerate(_tag_calls)}
+            message["content"] = _tag_clean or ""
+            if finish in ("stop", None):
+                finish = "tool_calls"
+            RECOVERY_STATS["tool_tag"] = \
+                RECOVERY_STATS.get("tool_tag", 0) + 1
+        else:
+            _log_unrecovered_leak(message.get("content") or "",
+                                  "aggregate-tool-tag")
     # 二次防御：剔除「无函数名」的空 tool_call，防止客户端死等
     if tool_calls_map:
         tool_calls_map = {k: v for k, v in tool_calls_map.items()
@@ -9263,7 +9733,8 @@ def _responses_usage(u):
     }
 
 
-def chat_to_response(chat_obj, model, custom_names=None, ns_map=None):
+def chat_to_response(chat_obj, model, custom_names=None, ns_map=None,
+                     allowed_names=None):
     """Fold a Chat Completions object into a Responses API response object.
 
     custom_names: the set of tool names the client declared as freeform.
@@ -9319,6 +9790,22 @@ def chat_to_response(chat_obj, model, custom_names=None, ns_map=None):
                     "arguments": dc.get("arguments") or "{}",
                 })
             text = clean_t
+    # issue #137：伪 XML 工具调用回退（`<tool_call>Name {json}</tool_call>`）。
+    # 与 DSML 回退同位：客户端（Codex 等）走 Responses 协议时同样不许把这种
+    # 标签当正文透传。
+    if not (msg.get("tool_calls")) and TOOL_CALL_OPEN in text.lower():
+        tag_calls, clean_t = parse_tool_call_tags(text, allowed_names)
+        for tc in tag_calls or []:
+            output.append({
+                "id": _new_id("fc_"),
+                "type": "function_call",
+                "status": "completed",
+                "call_id": tc.get("id") or _new_id("call_"),
+                "name": (tc.get("function") or {}).get("name") or "",
+                "arguments": (tc.get("function") or {}).get("arguments") or "{}",
+            })
+        if tag_calls:
+            text = clean_t or ""
     if text or not output:
         output.append({
             "id": _new_id("msg_"),
@@ -12532,7 +13019,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(502, "upstream stream error: %s" % exc)
             wall = int((time.time() - t_start) * 1000)
             result = chat_to_response(chat_obj, model, custom_names,
-                                       ns_map=tool_ns)
+                                       ns_map=tool_ns,
+                                       allowed_names=_tool_names_from_payload(chat_req))
             record_usage(model, chat_obj.get("usage"), stream=False,
                          elapsed_ms=wall, fp=fp, account=account.uid,
                          effort=usage_ctx.get("effort"),

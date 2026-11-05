@@ -10,6 +10,23 @@
 - 主版本号只在确有破坏性变更时才动。
 
 
+## v1.7.25
+
+**🐛 修复：伪 XML 工具调用 `<tool_call>` 无法回读 → 整轮 502（#140，采纳报告者的 patch）**
+
+上游会把工具调用写成 `<tool_call> Bash {"command":"ls"} </tool_call>`（Qwen 系常见）。这个形态**不在任何既有解析器覆盖范围内**（marker+JSON 数组 / DSML 都不认），而 `_leak_residue_present()` 又因为 `<tool_call` 命中判成「协议残片」→ 直接 fail-closed → 客户端整轮静默中断。
+
+- 新增 `parse_tool_call_tags(text, allowed_names)`：支持 4 种形态 —— `Name {json}`、`{"name":…,"arguments":…}`、`Name({...})`、`<tool_call name="X">` 属性式；参数侧依次尝试严格 JSON → 去尾随逗号 → 转义内层裸引号（模型常写 `"command":"echo "hi" && ls"`）；
+- 流式 hold 判定补标签分支：此前 `_json_array_prefix_ok()` 只认 `[` 开头，`<tool_call` 一进来就被判成「候选被证伪」；
+- 五条出口全覆盖：chat 流式 / chat 非流式 / Responses 流式 / Responses 非流式 / Anthropic；
+- 防误伤守卫：未声明 tools 的会话不转换、解析出的名字必须全部命中声明集合、无 marker 时必须是「整段一个块」、未闭合代码围栏内视为文档示例、参数非法 JSON 不伪造调用。
+
+**📝 新增配置说明：结构化工具历史**
+
+`QD_STRUCTURED_TOOL_HISTORY` / `QD_STRUCTURED_TOOL_HISTORY_REALMS` 写进文档：文本化历史里那段 `[assistant 请求调用工具]` 脚手架会被模型复述（`marker_only` 502 的来源），想根治就把 INTL 也纳入结构化——**启动脚本里的示例保持注释状态**，默认值不变（网关仍只在 CN 用结构化）。
+
+**验证**：报告者提供的 3 个套件（`_test_issue137_tool_call_tags.py` 63 / `_test_issue138_502_forms.py` 49 / `_test_issue137_e2e.py` 22）全部绿；全量 **117 suites / 3099 checks / 0 failed**。
+
 ## v1.7.24
 
 **🐛 修复：排队 / 额度错误被客户端判成「API Key 无效」（#137，合并 PR #138）**
