@@ -10,34 +10,18 @@
 - 主版本号只在确有破坏性变更时才动。
 
 
-## v1.7.27
+## v1.7.28
 
-**🐛 修复：INTL 额度总量少算（漏掉 SOTA 专属积分）**
+**🐛 修复：INTL 额度合计漏 SOTA / 探测接口 404 / 构成要跑到别处看**
 
-老口径只累加 `userQuota + addOnQuota`，INTL 实测「资源包 1,800 + SOTA 2,000」在面板只显示 1,800。现在合计改用归一后的 `composition`（含 SOTA 等容器），共享池照旧单列去重。
+（v1.7.27 先修了合计与账号行内联；这里补齐探测路由与四类小计，一并说明。）
 
-**✨ 额度构成直接显示在账号行**
-
-不用再去「用量洞察」翻区块：账号列表的积分列下方直接跟一行构成明细 —— `套餐内 X · 资源包 Y · SOTA Z · 共享 W · 最近到期 YYYY-MM-DD`，悬停看取数端点。
-
-**🐛 面板「自动探测」报 `not found: /credits/probe`**
-
-两件事：路由已确认在 `do_POST` 内正确（本地 e2e：无 token 401 / 有 token 200，CN 与 INTL 都命中 `/api/v2/quota/usage`）；**老网关没有这个路由时**，面板现在明确提示「当前网关版本不支持额度探测（需升级到 1.7.26+ 并重启网关）」，而不是丢一句 not found。
-
-**验证**：`_test_issue141_credit_composition.py` 扩到 38 条（新增 SOTA 合计 3800、行内构成、到期、端点提示、404 文案）；全量 **120 suites / 3173 checks / 0 failed**。
-
-## v1.7.27
-
-**🐛 修复：额度合计漏 SOTA / 探测接口 404 / 构成要跑到别处看**
-
-三项都是围绕「国际版用量读不到、数字也对不上」的现场反馈：
-
-1. **合计只算了 套餐内 + 资源包，漏掉 SOTA 专属积分**：官方界面 1800（资源包）+ 2000（SOTA）= **3800**，网关只显示 1800。
-   现在 `fetch_credits` 用归一后的 `composition` 覆盖主数字（不含共享池——组织级单独去重），所以 `remain/size/used` 与官方口径一致。
-2. **`POST /credits/probe` 在老版本网关上是 404**：路由抽成 `_handle_credits_probe()`，**do_GET 与 do_POST 各挂一处**（GET 走 query 参数，浏览器直接打开也能用）；面板在 404 时明确提示「升级到 1.7.26+ 并重启」，而不是让用户以为配错了。
+1. **合计只算 套餐内 + 资源包，漏掉 SOTA 专属积分**：官方界面 1,800（资源包）+ 2,000（SOTA）= **3,800**，网关只显示 1,800。
+   现在 `fetch_credits` 用归一后的 `composition` 覆盖 `remain/size/used`（共享池仍单列、按组织去重），与官方口径一致。
+2. **`/credits/probe` 在老版本网关上 404**：路由抽成 `_handle_credits_probe()`，**do_GET 与 do_POST 各挂一处**（GET 走 query 参数，浏览器直接打开也能用）；面板在 404 时提示「升级到 1.7.26+ 并重启」，而不是让用户以为配错了。
 3. **构成不必去「用量洞察」找**：账号行的积分下面直接显示 `套餐内 x · 资源包 y · SOTA z · 共享 w` + 最近到期，悬停可看取数端点；`/credits/summary` 每行新增 `composition_sums` 四类小计。
 
-**验证**：`_test_issue141_credit_composition.py` 扩到 **42 条**（含 GET/POST 双路由、四类小计、老网关 404 提示）；全量 **120 suites / 3177 checks / 0 failed**。
+**验证**：`_test_issue141_credit_composition.py` **42 条**（含 GET/POST 双路由、四类小计、老网关 404 提示、账号行内联渲染）；全量 **120 suites / 3177 checks / 0 failed**。
 
 ## v1.7.26
 
