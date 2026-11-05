@@ -6987,6 +6987,39 @@ def _friendly_net_error(exc, target=""):
     return s[:300]
 
 
+# issue #137：排队 / 额度这类「不是凭证问题」的错误，上游详情里带着信封层的
+# "code":"403"。不少客户端只看错误文字归类——DSH 的 pi-ai 适配层第一条规则就是
+# /\b(?:401|403)\b/ -> AUTH，于是界面显示成「API 密钥无效」。这里把详情里独立的
+# 401/403 改写成 HTTP_401/HTTP_403（\b 两侧都是单词字符，不再命中），并在文末
+# 附一句客户端分类器认得的英文原因：排队 -> rate limit，额度 -> quota exhausted /
+# usage limit reached。
+_AUTH_LIKE_CODE_RE = re.compile(r"(?<![0-9A-Za-z_])(401|403)(?![0-9A-Za-z_])")
+_QUEUED_CLIENT_HINT = " [rate limit: upstream model queue is full (10605), retry later]"
+_QUOTA_CLIENT_HINT = (" [quota exhausted: upstream account credits exhausted (112), "
+                      "top up or enable another account]")
+_DAILY_CLIENT_HINT = (" [usage limit reached: upstream daily request count "
+                      "exceeded (110), retry after local midnight]")
+# 这些错误类型对客户端一律不用 401/403 状态码（改 429，与 OpenAI insufficient_quota 一致）
+_NON_AUTH_ERROR_TYPES = frozenset({"upstream_queued", "quota_exhausted",
+                                   "quota_daily_limit"})
+
+
+def _neutralize_auth_codes(text):
+    """把文字里独立出现的 401/403 改写成 HTTP_401/HTTP_403（issue #137）。"""
+    return _AUTH_LIKE_CODE_RE.sub(r"HTTP_\1", str(text or ""))
+
+
+def _client_error_status(code, err_type):
+    """发给客户端的状态码：非凭证类错误不用 401/403（issue #137）。"""
+    try:
+        c = int(code)
+    except Exception:
+        return code
+    if err_type in _NON_AUTH_ERROR_TYPES and c in (401, 403):
+        return 429
+    return c
+
+
 def friendly_upstream_error(code, detail):
     """把上游错误转成对客户端可读的消息；瞬时故障给出重试指引。
 
@@ -6997,16 +7030,26 @@ def friendly_upstream_error(code, detail):
         code_i = int(code)
     except Exception:
         code_i = 502
+    _safe = _neutralize_auth_codes(detail)
     # issue #87：排队（fast 模式在这里统一给出中文原因，所有入口共用）
     if ("10605" in detail or "isQueued" in detail
             or "RESOURCE_LIMIT" in detail) and _to_int_status(code) in (403, 503):
         return ("上游模型排队中（10605 / RESOURCE_LIMIT）：请稍后重试，"
                 "或换一个模型/区域。这不是你的 Key、账号或网络问题。"
-                "上游详情：%s" % (detail[:160] or "(无详情)"), "upstream_queued")
+                "上游详情：%s" % (_safe[:160] or "(无详情)")
+                + _QUEUED_CLIENT_HINT, "upstream_queued")
     # issue #108：额度耗尽也走 403，但重试无效——让客户端看懂该充值/换号
-    if _quota_cooldown(detail)[0] == "exhausted":
+    _quota_kind = _quota_cooldown(detail)[0]
+    if _quota_kind == "exhausted":
         return ("上游账号额度耗尽（112 / pricingUrl）：重试无效，请充值或启用其它账号。"
-                "上游详情：%s" % (detail[:160] or "(无详情)"), "quota_exhausted")
+                "上游详情：%s" % (_safe[:160] or "(无详情)")
+                + _QUOTA_CLIENT_HINT, "quota_exhausted")
+    # issue #137：每日次数上限（110）此前落到兜底分支，原样显示成 upstream 403
+    if _quota_kind == "daily":
+        return ("上游账号今日请求次数已达上限（110）：本地 0 点后恢复，"
+                "或启用其它账号。这不是你的 Key 问题。上游详情：%s"
+                % (_safe[:160] or "(无详情)") + _DAILY_CLIENT_HINT,
+                "quota_daily_limit")
     # issue #64：版本过低是硬门控（官方客户端会自己升级，网关只能提示）
     if "430" in str(code):
         return ("客户端/网关版本过低（430）：上游要求升级后才能继续。"
@@ -7020,7 +7063,8 @@ def friendly_upstream_error(code, detail):
     if "10605" in detail or "isQueued" in detail or "RESOURCE_LIMIT" in detail:
         return ("上游排队中（10605 / RESOURCE_LIMIT）：已按 retryAfterSeconds 等待并重试，"
                 "仍拿不到可用资源。请稍后重试；若频繁出现，说明该模型当前排队严重。"
-                "上游详情：%s" % (detail[:200] or "(无详情)"), "upstream_queued")
+                "上游详情：%s" % (_safe[:200] or "(无详情)")
+                + _QUEUED_CLIENT_HINT, "upstream_queued")
     # 0) issue #37：工具参数非法（确定性、可重试但不是账号问题）
     if "invalid JSON arguments" in detail:
         return ("上游生成的工具调用参数不是合法 JSON，本轮**未执行任何工具**；"
@@ -9970,6 +10014,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _error(self, code, message, err_type="server_error", retry_after=None):
+        code = _client_error_status(code, err_type)   # issue #137
         extra = {"Retry-After": int(retry_after)} if retry_after else None
         self._json(code, {"error": {"message": message, "type": err_type,
                                     "code": code}}, extra_headers=extra)
@@ -10005,7 +10050,8 @@ class Handler(BaseHTTPRequestHandler):
             "error": {
                 "message": ("upstream rate limit reached for this model; "
                             "retry in %ds" % wait)
-                + ((" - " + exc.detail[:200]) if getattr(exc, "detail", "") else ""),
+                + ((" - " + _neutralize_auth_codes(exc.detail[:200]))   # issue #137
+                   if getattr(exc, "detail", "") else ""),
                 "type": "rate_limit_error",
                 "code": 429,
                 "retry_after": wait,
@@ -12346,14 +12392,16 @@ class Handler(BaseHTTPRequestHandler):
                                  stream=True,
                                  account=account.uid if account else None,
                                  key_id=self._key_id_for_usage())
-                    msg, _ = friendly_upstream_error(_to_int_status(_pst),
-                                                     pump_exc.detail)
+                    msg, _etype = friendly_upstream_error(_to_int_status(_pst),
+                                                          pump_exc.detail)
                     log("responses upstream status %s: %s"
                         % (_pst, msg[:200]), level="ERROR", tag="chat")
                     # Responses 协议靠终态事件收尾：只关流会让客户端一直等。
                     try:
                         self._sse_write(_responses_failed_frame(
-                            holder, _to_int_status(_pst), msg))
+                            holder,
+                            _client_error_status(_to_int_status(_pst), _etype),
+                            msg))
                     except Exception:
                         pass
                     self._sse_end()
@@ -12837,7 +12885,8 @@ class Handler(BaseHTTPRequestHandler):
                         _to_int_status(_cst), exc.detail)
                     err = json.dumps({"error": {
                         "message": msg, "type": etype,
-                        "code": _cst}}, ensure_ascii=False)
+                        "code": _client_error_status(_cst, etype)}},   # issue #137
+                        ensure_ascii=False)
                     try:
                         self._sse_write(("data: %s\n\n" % err).encode("utf-8"))
                         self._sse_write(b"data: [DONE]\n\n")
