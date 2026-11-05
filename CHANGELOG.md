@@ -10,6 +10,37 @@
 - 主版本号只在确有破坏性变更时才动。
 
 
+## v1.7.29
+
+**🐛 修复：SOTA 专属积分没被识别（INTL 合计少算 2,000）**
+
+实测 INTL 的 `/api/v2/quota/usage` 里，SOTA 不在顶层某个 `sota*` 字段，而在：
+
+```json
+"dedicatedResourcePackages": [{
+  "total": 2000, "used": 39, "remaining": 1961, "expiresAt": 1794146889433,
+  "displayLabels": [{"dimension": "title",
+                     "valueI18n": {"zh-CN": "SOTA 专属积分"}}]
+}]
+```
+
+之前的归一器没有这个键名 → 面板只报「资源包 1,800」，官方却是 1,800 + 1,961 = **3,761**。
+
+- 新增 `dedicatedResourcePackages` / `dedicatedResourcePackage` / `exclusivePackages` 等别名，归到 **SOTA** 桶；
+- 展示名优先取 `displayLabels[dimension=title].valueI18n["zh-CN"]`（没有就退 `name`）；
+- `available=false` 的包**只展示不计入**合计（过期/停用的活动包不该算余额）；
+- 单测按官方那三条数字钉住：剩余 **3,761** / 总量 **3,800** / 已用 **39**。
+
+**🐛 修复：面板「探测失败: Failed to fetch」**
+
+探测原先逐个候选打上游（每个 20s、最多 22 个），浏览器先超时把连接掐断。
+
+- 单候选超时 8s、默认只试 **4** 个候选；
+- **已知来源排第一**（命中过就 1 次请求返回）；
+- 面板改用 `AbortController` 限时 100s，并把提示分成三种：超时 / 老网关 404 / 请求被中断（附「稍等再点或直接打开 `/credits/probe?limit=3`」）。
+
+**验证**：套件扩到 **54 条**（SOTA 映射、displayLabels 取名、不可用包不计入、探测加速与三种错误提示）；全量 **120 suites / 3189 checks / 0 failed**。
+
 ## v1.7.28
 
 **🐛 修复：INTL 额度合计漏 SOTA / 探测接口 404 / 构成要跑到别处看**

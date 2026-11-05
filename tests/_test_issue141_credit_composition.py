@@ -85,7 +85,9 @@ check("summary 行带组成 / 来源 / 到期",
 check("面板有「额度构成」区块", "额度构成" in _dash)
 check("面板展示四列", all(x in _dash for x in ("套餐内", "资源包", "SOTA", "共享池")))
 check("面板有自动探测按钮", "function probeCredits(" in _dash)
-check("按钮打 /credits/probe", 'postJSON("/credits/probe"' in _dash)
+check("按钮打 /credits/probe",
+      ('postJSON("/credits/probe"' in _dash) or
+      ('fetch("/credits/probe"' in _dash))
 check("挂进洞察加载链", "loadCreditsComposition(false)" in _dash)
 
 print("[#141 后续] 合计含 SOTA（修「INTL 少算 2000」）")
@@ -109,4 +111,35 @@ check("有共用的 _handle_credits_probe", "def _handle_credits_probe" in _src)
 check("do_GET 与 do_POST 各挂一处路由", _src.count('if path == "/credits/probe":') == 2)
 check("GET 走 query 参数（浏览器直接打开也能用）", "_q = parse_qs(urlparse(self.path).query)" in _src)
 check("summary 行给四类小计", "composition_sums" in _src)
+print("[#141+] SOTA 在 dedicatedResourcePackages 里（实测字段）")
+_pay = {
+    "userQuota": {"total": 0.0, "used": 0.0, "remaining": 0.0},
+    "addOnQuota": {"total": 1800.0, "used": 0.0, "remaining": 1800.0},
+    "dedicatedResourcePackages": [{
+        "total": 2000.0, "used": 39.0, "remaining": 1961.0,
+        "expiresAt": 1794146889433, "available": True,
+        "displayLabels": [{"dimension": "title",
+                           "valueI18n": {"zh-CN": "SOTA 专属积分"}}]}],
+}
+_n = A.normalize_quota_payload(_pay, "intl")
+_kinds = [b["kind"] for b in _n["composition"]]
+check("dedicatedResourcePackages 归到 sota 桶", _kinds == ["plan", "pack", "sota"], _kinds)
+check("用 displayLabels 的中文名当展示名",
+      _n["composition"][2]["name"] == "SOTA 专属积分", _n["composition"][2]["name"])
+check("合计 = 1800 + 1961（与官方一致）", _n["remain"] == 3761, _n["remain"])
+check("总量 = 1800 + 2000", _n["size"] == 3800, _n["size"])
+check("已用 = 39", _n["used"] == 39, _n["used"])
+check("带上到期时间", bool(_n["composition"][2].get("expires_at")))
+_pay2 = {k: (v if k != "dedicatedResourcePackages" else [dict(v[0], available=False)])
+         for k, v in _pay.items()}
+_n2 = A.normalize_quota_payload(_pay2, "intl")
+check("不可用的包不计入合计", _n2["remain"] == 1800, _n2["remain"])
+
+print("[#141+] 探测要快（面板 Failed to fetch 的根因）")
+check("单候选超时 8s", "timeout=8, retries=0" in _acc_src)
+check("默认只试 4 个候选", "limit = 4" in _acc_src)
+check("已知来源排第一", "known = load_credits_sources" in _acc_src)
+check("面板用 AbortController 限时", "new AbortController()" in _dash)
+check("区分超时 / 404 / 网络中断",
+      "探测超时" in _dash and "not found" in _dash and "请求被中断" in _dash)
 finish()

@@ -3453,28 +3453,49 @@ async function loadCreditsComposition(force){
     + '</tr></thead><tbody>' + rows + '</tbody></table></div>';
 }
 async function probeCredits(btn){
-  if(btn) btn.disabled = true;
+  if(btn){ btn.disabled = true; btn.textContent = "探测中…"; }
+  // issue：探测要按候选逐个打上游，慢的时候浏览器先掐断（Failed to fetch）。
+  // 用 AbortController 给 100s 预算，并把「超时/网络中断」与「404 老网关」分开提示。
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 100000);
   try{
-    const r = await postJSON("/credits/probe", {});
+    const resp = await fetch("/credits/probe", {method:"POST",
+        headers: authHeaders({"Content-Type":"application/json"}),
+        body: JSON.stringify({limit: 4}), signal: ctrl.signal});
+    const text = await resp.text();
+    let r = {};
+    try{ r = text ? JSON.parse(text) : {}; }catch(e){ r = {raw: text}; }
+    if(!resp.ok){
+      const m = (r && r.error && r.error.message) || ("HTTP " + resp.status);
+      throw new Error(m);
+    }
     const hits = (r.results || []).filter(x => x.ok);
     const first = hits[0] && hits[0].hit;
     if(first){
-      toast("探测成功：使用 " + first.host.replace(/^https?:\/\//, "") + first.path, "ok");
+      toast("探测成功：使用 " + String(first.host).replace(/^https?:\/\//, "") + first.path, "ok");
     } else {
-      toast("所有候选端点都没有额度字段（见日志）", "warn");
+      const rows = (r.results || []).flatMap(x => x.rows || []);
+      const codes = {};
+      rows.forEach(row => { const k = row.status; codes[k] = (codes[k] || 0) + 1; });
+      const summary = Object.keys(codes).map(k => k + "×" + codes[k]).join(" ");
+      toast("没有端点返回可识别的额度字段（候选结果：" + (summary || "无") + "），见网关日志", "warn");
     }
     await loadCreditsComposition(true);
   }catch(e){
     const msg = String((e && e.message) || e);
-    // 老网关没有这个路由：明确告诉用户是版本问题，别让他以为是自己配错了
-    if(/not found/i.test(msg)){
-      toast("当前网关版本不支持额度探测（需升级到 1.7.26+ 并重启网关）", "warn");
+    if(e && e.name === "AbortError"){
+      toast("探测超时（>100s）：先试试只探测已知端点 GET /credits/probe?limit=3", "warn");
+    } else if(/not found/i.test(msg)){
+      toast("当前网关版本不支持额度探测（需升级到 1.7.27+ 并重启网关）", "warn");
+    } else if(/Failed to fetch|NetworkError|load failed/i.test(msg)){
+      toast("请求被中断（网关可能仍在探测）：稍等几秒再点一次，或直接打开 /credits/probe?limit=3 查看", "warn");
     } else {
       toast("探测失败: " + msg, "bad");
     }
   }
-  finally { if(btn) btn.disabled = false; }
+  finally { clearTimeout(timer); if(btn){ btn.disabled = false; btn.textContent = "自动探测"; } }
 }
+
 async function loadCreditUsage(force){
   if(!force && Date.now() - CREDIT_USAGE_AT < 60000) return;
   CREDIT_USAGE_AT = Date.now();

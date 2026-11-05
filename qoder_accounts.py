@@ -126,9 +126,26 @@ def _bucket_from(src, kind, name):
         remain = max(0.0, size - used)
     if remain is None and size is None:
         return None
-    out = {"name": name, "kind": kind,
+    # 上游把展示名放在 displayLabels[].valueI18n（zh-CN / en-US），优先用它；
+    # 这样「SOTA 专属积分」这类活动包能显示成人话，而不是容器名。
+    label = ""
+    for dl in (src.get("displayLabels") or []):
+        if not isinstance(dl, dict):
+            continue
+        if str(dl.get("dimension") or "") != "title":
+            continue
+        i18n = dl.get("valueI18n") if isinstance(dl.get("valueI18n"), dict) else {}
+        label = str(i18n.get("zh-CN") or i18n.get("en-US")
+                      or dl.get("value") or "").strip()
+        if label:
+            break
+    if not label:
+        label = str(src.get("name") or "").strip()
+    out = {"name": (label or name), "kind": kind,
            "remain": int(remain or 0), "used": int(used or 0),
            "size": int(size or 0)}
+    if src.get("available") is not None:
+        out["available"] = bool(src.get("available"))
     for key in ("expiresAt", "expireAt", "expires_at", "expiredAt",
                 "validUntil", "dueAt"):
         if src.get(key) is not None:
@@ -152,6 +169,11 @@ _QUOTA_BUCKETS = (
     (("addonquota", "resourcepackage", "resourcepackages", "addon",
       "package", "packages", "bonus"),
      "pack", "资源包"),
+    # issue: INTL 实测 —— SOTA 专属积分在 dedicatedResourcePackages 里（数组），
+    # 名字在 displayLabels[].valueI18n（zh-CN: "SOTA 专属积分"）。
+    (("dedicatedresourcepackages", "dedicatedresourcepackage",
+      "exclusivepackages", "sotapackages"),
+     "sota", "专属积分包"),
     (("orgresourcepackage", "sharedquota", "teamquota", "poolquota",
       "sharedcredits"),
      "shared", "共享额度池"),
@@ -206,9 +228,12 @@ def normalize_quota_payload(payload, realm=""):
     top = payload if isinstance(payload, dict) else {}
     out = {
         "composition": found,
-        "remain": sum(b["remain"] for b in found if b["kind"] != "shared"),
-        "used": sum(b["used"] for b in found if b["kind"] != "shared"),
-        "size": sum(b["size"] for b in found if b["kind"] != "shared"),
+        "remain": sum(b["remain"] for b in found
+                       if b["kind"] != "shared" and b.get("available", True)),
+        "used": sum(b["used"] for b in found
+                     if b["kind"] != "shared" and b.get("available", True)),
+        "size": sum(b["size"] for b in found
+                     if b["kind"] != "shared" and b.get("available", True)),
         "fields": sorted({b["kind"] for b in found}),
     }
     for key in ("expiresAt", "expireAt", "expires_at"):
@@ -3205,11 +3230,22 @@ class Account(object):
             h = str(h or "").rstrip("/")
             if h and h not in hosts:
                 hosts.append(h)
+        # 已知来源优先：命中过就第一个试，正常情况下 1 次请求就返回。
+        known = load_credits_sources(accounts_dir or "").get(str(self.realm or "cn"))
+        order = []
+        if isinstance(known, dict) and known.get("host") and known.get("path"):
+            order.append((str(known["host"]).rstrip("/"), str(known["path"])))
+        for host in hosts:
+            for path in CREDITS_PATHS:
+                if (host, path) not in order:
+                    order.append((host, path))
+        if limit is None:
+            limit = 4          # 默认只试 4 个：面板 90s 超时之外的候选没意义
         rows = []
         hit = None
         tried = 0
-        for host in hosts:
-            for path in CREDITS_PATHS:
+        for host, path in order:
+            if True:
                 if limit is not None and tried >= limit:
                     break
                 tried += 1
@@ -3219,7 +3255,7 @@ class Account(object):
                 try:
                     body = http_json(url, method="GET",
                                       headers=self.headers(),
-                                      timeout=20, retries=0)
+                                      timeout=8, retries=0)
                 except urllib.error.HTTPError as exc:
                     row["status"] = exc.code
                     rows.append(row)
