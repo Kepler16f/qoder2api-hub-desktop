@@ -10,6 +10,29 @@
 - 主版本号只在确有破坏性变更时才动。
 
 
+## v1.7.26
+
+**✨ 额度构成 + 端点自动探测（INTL 读不到用量的问题）**
+
+不同区域的额度接口不是一套：CN 的 `openapi.qoder.com.cn/api/v2/quota/usage` 有数据，INTL 同路径常 404/403。现在网关内置**候选矩阵**（主机 × 路径）自动探测，命中组合记进 `accounts/credits-source.json`，之后优先使用；`fetch_credits` 失败时也会探测并重试（限 6 个候选）。
+
+- 新增 `normalize_quota_payload()`：把任意额度响应归一成**构成**（套餐内 / 资源包 / SOTA 专属 / 共享池），认不出就不显示、不臆造；
+- 新增 `POST /credits/probe`（面板鉴权）：一次返回候选矩阵的 `status` 与命中 `fields`；
+- 面板「用量洞察」新增 **额度构成** 区块：四列 + 剩余 + 最近到期 + **来源端点**，并带「自动探测」按钮；
+- `/credits/summary` 每行新增 `composition` / `source` / `expires_at`。
+
+实测（本机双区账号）：CN 与 INTL 都命中 `/api/v2/quota/usage`，字段 `pack + plan`；无 token 访问 `/credits/probe` 返回 401。
+
+**✨ 会话缓存保温（合并 PR #142，`QD_CACHE_KEEPALIVE`，默认关闭）**
+
+报告者用连续实测定位到：#136 修好会话键轮换后，仍有**与提问边界无关**的 0% 全价行——同一 `win:` 会话、前缀连续，但**闲置 ≥ ~5 分钟**后首发热缓存失效（4m41s 存活 / 5m05s 只剩公共头部 / 16m29s 全零），失效后 36–46s 立刻恢复 99.7%。
+
+- 新增 `qoder_keepalive.py`：成功转发后按最终 `session_id` 记快照（LRU，默认 2 个会话、不落盘），后台线程每 20s 巡检，闲置 ≥ `QD_CACHE_KEEPALIVE_INTERVAL`（默认 240s，小于上游 TTL）且未超 `QD_CACHE_KEEPALIVE_MAX_AGE`（默认 1800s）时重发一次 `max_tokens=1` 的最小请求续期；
+- 保温请求**照常记账**，`key_id=keepalive`，面板可审计（124k ≈ 10.7 积分 vs 全量重写 ≈ 137）；
+- 默认关闭（`QD_CACHE_KEEPALIVE=0`）：不开就不存任何东西，行为与改动前一致。
+
+**验证**：新增 `_test_issue141_credit_composition.py`(31) + PR 自带 `_test_cache_keepalive.py`(31)；`/credits/probe` 走真实服务 e2e（401/200 两条路径 + 双区命中）；全量 **119 suites / 3161 checks / 0 failed**。
+
 ## v1.7.25
 
 **🐛 修复：伪 XML 工具调用 `<tool_call>` 无法回读 → 整轮 502（#140，采纳报告者的 patch）**
