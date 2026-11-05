@@ -33,6 +33,14 @@
 
 **验证**：新增 `_test_issue141_credit_composition.py`(31) + PR 自带 `_test_cache_keepalive.py`(31)；`/credits/probe` 走真实服务 e2e（401/200 两条路径 + 双区命中）；全量 **119 suites / 3161 checks / 0 failed**。
 
+**🐳 修复：镜像里缺少 qoder_keepalive.py**
+
+PR #142 新增的模块没加进 `Dockerfile` 的 COPY 列表，CI 的冒烟测试（按 import 推导必需模块）
+当场报 `MISSING: qoder_keepalive.py`，构建失败。已补进镜像，并新增 `tests/_test_dockerfile_modules.py`
+把这件事变成回归：**Dockerfile 必须覆盖所有被 import 的 qoder_* 模块**（顺带校验 COPY 引用的文件都存在）。
+
+**验证**：全量 **120 suites / 3166 checks / 0 failed**。
+
 ## v1.7.25
 
 **🐛 修复：伪 XML 工具调用 `<tool_call>` 无法回读 → 整轮 502（#140，采纳报告者的 patch）**
