@@ -53,6 +53,7 @@ import qoder_anthropic
 
 # issue #116：把宿主日志注入 anthropic 模块（它自己只 import 标准库）
 import qoder_catalog
+import qoder_keepalive
 import qoder_pricing
 import qoder_settings
 import qoder_session_cache
@@ -8614,6 +8615,18 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
             for note, msg in blame:
                 note(msg)
             account.note_success(model=model)
+            if qoder_keepalive.enabled() and only_account is None:
+                # 缓存保温：登记这条刚成功的真实对话（默认关闭，见
+                # qoder_keepalive 模块说明）。配套 issue：上游隐式前缀缓存
+                # 实测 ~5 分钟闲置过期，闲置后首发全量重写（0% 命中全价）。
+                # 只登记真实客户端流量：only_account 路径是账号测试/诊断探测。
+                try:
+                    qoder_keepalive.observe(
+                        payload, session_id=body_obj.get("session_id"),
+                        account_uid=account.uid, realm=realm,
+                        model=str(payload.get("model") or ""))
+                except Exception:
+                    pass
             if _team_lease:
                 # 关闭/退出时自动释放租约（handler 都走 with resp / resp.close）
                 return _TeamLeaseResp(resp, account, _team_lease), account, encoded
@@ -13604,6 +13617,47 @@ def acc_realm(account):
     return account.realm if account else CURRENT_REALM
 
 
+def _keepalive_send(entry):
+    """保温一次：同 payload、同账号、同 session_id，stream=False + max_tokens=1。
+
+    由 qoder_keepalive 后台线程在会话闲置超过 QD_CACHE_KEEPALIVE_INTERVAL
+    后调用（默认 240s，小于上游 ~5min TTL）。session_key 传登记时的最终
+    session_id，open_upstream 会把它当作窗口键原样回填 —— 与原请求同一个
+    会话身份；前缀逐字节相同 → 命中上游缓存并续期，消耗 ≈ 一次缓存读。
+    记账 key_id=keepalive，面板可见可审计。失败抛异常由 tick 淘汰该会话。
+    """
+    acc = POOL.get(entry["account_uid"]) if POOL else None
+    if acc is None:
+        raise LookupError("keepalive: account %s unavailable"
+                          % (entry["account_uid"] or "")[:8])
+    payload = dict(entry["payload"])
+    payload["stream"] = False
+    payload["max_tokens"] = 1
+    usage_ctx = {}
+    resp, used, _enc = open_upstream(payload, session_key=entry["session_id"],
+                                     target_realm=entry["realm"] or None,
+                                     only_account=acc, usage_ctx=usage_ctx)
+    try:
+        obj = aggregate_stream(resp, entry["model"], holder={"usage": None})
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+    usage = obj.get("usage") or {}
+    if usage:
+        try:
+            record_usage(entry["model"], usage, stream=False,
+                         account=(used.uid if used else None)
+                         or entry["account_uid"],
+                         key_id="keepalive",
+                         realm_reason=usage_ctx.get("realm_reason", ""),
+                         session_trace=usage_ctx)
+        except Exception:
+            pass
+    return usage
+
+
 def main():
     global POOL, ACCOUNTS_DIR, API_KEY, SYSTEM_PROMPT, USAGE_DIR, USAGE_LOG, \
         USAGE_SUMMARY, SCHEDULER
@@ -13949,6 +14003,14 @@ def main():
     _warm = threading.Thread(target=_warm_models, name="qd-models-warm",
                              daemon=True)
     _warm.start()
+    # 缓存保温线程（可选，默认关闭）：会话闲置超过上游缓存 TTL 前用同
+    # payload 发一个 max_tokens=1 的最小请求续期，避免闲置后首发全量重写。
+    if qoder_keepalive.enabled():
+        qoder_keepalive.configure(_keepalive_send)
+        qoder_keepalive.start_loop()
+        log("cache keepalive on: interval=%ss max_age=%ss max_convs=%s"
+            % (qoder_keepalive.interval(), qoder_keepalive.max_age(),
+               qoder_keepalive.max_convs()), tag="keepalive")
     # 进程生命周期内保持 handler 引用：SetConsoleCtrlHandler 存的是裸指针，
     # 回调被 GC 会在关窗时崩溃。
     _ctrl_handler = install_console_close_handler()
