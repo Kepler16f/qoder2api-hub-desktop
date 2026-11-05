@@ -10,6 +10,27 @@
 - 主版本号只在确有破坏性变更时才动。
 
 
+## v1.7.24
+
+**🐛 修复：排队 / 额度错误被客户端判成「API Key 无效」（#137，合并 PR #138）**
+
+上游排队（10605）、额度耗尽（112）、每日次数上限（110）都不是凭证问题，但错误文字里带着上游信封的 `{"code":"403"}`，按文字归类的客户端（DSH 的 pi-ai 适配层第一条规则就是 `\b(?:401|403)\b` → AUTH）会显示「API 密钥无效」，用户于是去换 Key，方向完全错了。
+
+- 这三类错误的**上游详情**里独立的 `401`/`403` 改写为 `HTTP_401`/`HTTP_403`（`v1.4030`、端口 `14031` 这类长数字不动）；
+- 文末附客户端分类器认得的英文原因：排队 `rate limit`、112 `quota exhausted`、110 `usage limit reached`；
+- 这三类对客户端**不再用 401/403**，统一改 429（与 OpenAI `insufficient_quota` 一致）：`_error` / 流内错误帧 / Responses 失败帧 / `_rate_limited` 全部同步；
+- 110 补上专门分支（此前落到兜底 `upstream 403`）。
+
+**🔍 新增：排队诊断（`POST /diag/queue`，面板鉴权，#139）**
+
+一次最小探测，回显 `kind`（ok/queued/exhausted/daily）、业务码、`retry_after`、`queue_count`、`identity_source`（native/derived）与一句话建议 —— 用来区分「上游模型排队」与「账号/身份被针对」。排队时明确提示「与 Key/账号凭证无关」并给出 `QD_QUEUE_WAIT_MODE=fast` 这个「立即返回 429、不等待」的开关。
+
+**✨ 面板可切换「工具协议残片收尾」（#135 后续）**
+
+上一版只能用环境变量 `QD_TOOL_ECHO_MODE`。现在「设置 → 工具协议残片收尾」有下拉框（strict / lenient），**改完立即生效**，无需重启；环境变量仍然优先（面板会标注「由环境变量固定为 …」）。后端新增 `POST /settings/tool-echo-mode`。
+
+**验证**：合并 PR 自带 `_test_issue137_error_class.py`(43)；新增 `_test_issue139_queue_diag.py`(14)、`_test_issue135b_echo_toggle.py`(19)；`/diag/queue` 走真实服务 e2e（200 + 401 两条路径）；全量 **114 suites / 2965 checks / 0 failed**。
+
 ## v1.7.23
 
 **🐛 修复：prompt 缓存 98% ↔ 0% 来回跳（#136，v1.7.17 引入的回归）**

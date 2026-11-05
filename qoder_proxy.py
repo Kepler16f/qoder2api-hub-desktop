@@ -64,7 +64,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.23"
+VERSION = "1.7.24"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -2439,6 +2439,9 @@ def runtime_settings_view():
         "limits": qoder_settings.limits_data(ACCOUNTS_DIR),
         # 本地 web 工具开关（默认关）：这是唯一由模型驱动出网的能力
         "web_tools": web_tools_enabled(),
+        # issue #135：工具协议残片收尾策略（面板可切换，立即生效）
+        "tool_echo_mode": tool_echo_mode(),
+        "tool_echo_mode_env": (os.environ.get("QD_TOOL_ECHO_MODE") or "").strip().lower(),
         # issue #106：各模型上下文档（面板回显 + 客户端可查）
         "model_context": _model_context_snapshot(),
         "web_tools_rounds": WEB_TOOLS_MAX_ROUNDS,
@@ -7004,6 +7007,21 @@ _NON_AUTH_ERROR_TYPES = frozenset({"upstream_queued", "quota_exhausted",
                                    "quota_daily_limit"})
 
 
+def tool_echo_mode():
+    """工具协议残片的收尾策略（issue #135）：strict | lenient。
+
+    优先级：环境变量 QD_TOOL_ECHO_MODE（显式覆盖）> 面板设置 > strict。
+    面板改了就生效，不必重启（每次请求现读）。
+    """
+    env = (os.environ.get("QD_TOOL_ECHO_MODE") or "").strip().lower()
+    if env in ("strict", "lenient"):
+        return env
+    try:
+        val = str(qoder_settings.tool_echo_mode(ACCOUNTS_DIR) or "").strip().lower()
+    except Exception:
+        val = ""
+    return val if val in ("strict", "lenient") else TOOL_ECHO_MODE
+
 def _neutralize_auth_codes(text):
     """把文字里独立出现的 401/403 改写成 HTTP_401/HTTP_403（issue #137）。"""
     return _AUTH_LIKE_CODE_RE.sub(r"HTTP_\1", str(text or ""))
@@ -11263,6 +11281,78 @@ class Handler(BaseHTTPRequestHandler):
         return self._unknown_path_error(path)
 
     # issue #121：/diag/model-billing 已移除——上游对网关身份一律回报 "auto"，    # 该字段不携带计费信息，据此提示用户只会误导（用户实测国际版同样如此）。
+    def _handle_diag_queue(self, payload):
+        # issue #139：上游排队（10605）诊断——一次最小探测，把业务码、
+        # retryAfterSeconds、queueCount 与机器身份来源一起回显。
+        # 目的：让用户能自己区分「上游模型排队」与「账号/身份被针对」。
+        model = str((payload or {}).get("model") or "").strip() or "auto"
+        realm = (payload or {}).get("realm") or self._request_realm()
+        uid = str((payload or {}).get("uid") or "").strip()
+        acc = POOL.get(uid) if uid else None
+        probe = {
+            "model": model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "stream": False,
+            "max_tokens": 8,
+        }
+        out = {"ok": True, "model": model, "realm": realm,
+               "account": (acc.uid[:8] if acc else None),
+               "code": None, "kind": "", "retry_after": None,
+               "queue_count": None, "detail": "", "hint": ""}
+        t0 = time.time()
+        try:
+            resp, used, _ = open_upstream(
+                probe, target_realm=realm,
+                only_account=acc if acc else None)
+            try:
+                resp.read(2048)
+            except Exception:
+                pass
+            resp.close()
+            out["code"] = 200
+            out["kind"] = "ok"
+            out["account"] = used.uid[:8] if used else out["account"]
+        except UpstreamStatus as exc:
+            detail = str(getattr(exc, "detail", "") or "")
+            out["code"] = exc.status
+            out["detail"] = detail[:400]
+            out["hint"] = _quota_hint(detail)
+            if "10605" in detail or "isQueued" in detail:
+                out["kind"] = "queued"
+            elif _quota_cooldown(detail)[0]:
+                out["kind"] = _quota_cooldown(detail)[0]
+            m = re.search(r"retryAfterSeconds\D+(\d+)", detail)
+            if m:
+                out["retry_after"] = int(m.group(1))
+            mc = re.search(r"queueCount\D+(\d+)", detail)
+            if mc:
+                out["queue_count"] = int(mc.group(1))
+        except Exception as exc:
+            out["code"] = 0
+            out["kind"] = "error"
+            out["detail"] = str(exc)[:200]
+        out["elapsed_ms"] = int((time.time() - t0) * 1000)
+        # 机器身份来源：native（官方桥）还是 derived（派生值）。
+        # 上游对「陌生设备」可能更倾向排队，这个字段能帮用户判断。
+        try:
+            _realm = realm if realm in ("cn", "intl") else CURRENT_REALM
+            _native = qoder_accounts.native_machine_identity(
+                _realm, acc.uid if acc else "")
+            out["identity_source"] = "native" if _native else "derived"
+        except Exception:
+            out["identity_source"] = "unknown"
+        if out["kind"] == "queued":
+            _cnt = out.get("queue_count")
+            out["advice"] = ("上游模型排队中（10605）。这与 Key/账号凭证无关："
+                             "官方客户端同一时刻也可能排队，只是它不提示。"
+                             "可换模型或换区域重试；也可设 QD_QUEUE_WAIT_MODE=fast "
+                             "让请求立即返回 429 而不是等待。")
+            if _cnt:
+                out["advice"] += " 当前队列长度约 %d。" % _cnt
+        elif out["kind"] in ("exhausted", "daily"):
+            out["advice"] = "账号额度/次数问题，不是排队；充值或换号。"
+        return self._json(200, out)
+
     def _handle_diag_checkin(self, payload):
         """issue #123：签到诊断——把每一步的上游结果原样吐出来，便于定位。
 
@@ -12362,7 +12452,7 @@ class Handler(BaseHTTPRequestHandler):
                             pass
                 if pump_exc is not None and isinstance(
                         pump_exc, InvalidToolArguments) \
-                        and TOOL_ECHO_MODE == "lenient":
+                        and tool_echo_mode() == "lenient":
                     # issue #135：上游只吐了工具协议残片（Qwen3.8-Flash 实测高频）。
                     # strict（默认）会让这一轮流以 response.failed 结束，某些客户端
                     # （Codex）收到后直接静默结束对话 —— 用户看到的就是「话说到一半
@@ -12525,6 +12615,28 @@ class Handler(BaseHTTPRequestHandler):
                 % (res.get("from"), res.get("to"), len(res.get("files") or []),
                    res.get("backup") or "-", restarted), tag="update")
             return self._json(200, dict(res, restarting=restarted))
+        if path == "/settings/tool-echo-mode":
+            # issue #135：strict / lenient 面板切换（立即生效，无需重启）
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            try:
+                body = self._read_payload()
+            except Exception as exc:
+                return self._error(400, "invalid json: %s" % exc,
+                                   "invalid_request_error")
+            mode = str((body or {}).get("mode") or "").strip().lower()
+            if mode not in ("strict", "lenient", ""):
+                return self._error(400, "mode must be strict or lenient",
+                                   "invalid_request_error")
+            try:
+                saved = qoder_settings.set_tool_echo_mode(ACCOUNTS_DIR, mode)
+            except Exception as exc:
+                return self._error(500, "save failed: %s" % exc)
+            log("tool echo mode set to %s (panel)" % (saved or "(default)"),
+                tag="panel")
+            return self._json(200, {"ok": True, "tool_echo_mode": saved,
+                                    "effective": tool_echo_mode()})
         if path == "/settings/model-context":
             # issue #106：为某个模型设定上下文档（label="" 清除回到官方默认）
             if not self._panel_ok():
@@ -12625,7 +12737,7 @@ class Handler(BaseHTTPRequestHandler):
                 # 否则会在 404 分支被拦掉（CORS 无需另加，"/v1" 前缀已覆盖）。
                 "/v1/messages", "/v1/messages/count_tokens",
                 # issue #123：签到诊断（只读，面板鉴权）
-                "/diag/checkin"):
+                "/diag/checkin", "/diag/queue"):
             if path in ("/v1/completions", "/completions"):
                 # legacy Completions（prompt 而非 messages）本网关不实现：
                 # 明确 404 优于"接受请求却按空会话转发上游"。
@@ -12641,6 +12753,11 @@ class Handler(BaseHTTPRequestHandler):
         payload = self._payload_or_error(allow_list=(path == "/accounts/import"))
         if payload is None:
             return
+        if path == "/diag/queue":
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            return self._handle_diag_queue(payload)
         if path == "/diag/checkin":
             if not self._panel_ok():
                 return self._error(401, "panel password required",
