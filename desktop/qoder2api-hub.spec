@@ -84,7 +84,13 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # 上游 qoder_images.py 里 PIL 是**可选**加速路径（try-import，缺失时走纯
+    # Python 解码）。上游 CI 的桌面产线只装 pyinstaller、不装 Pillow，所以
+    # 发布的 5 个平台产物都不含 PIL；而本机 site-packages 有 Pillow 时
+    # PyInstaller 静态分析会把它整个打进来（+12MB，安装包 15MB→27MB），
+    # 造成「本机覆盖安装的包」与「用户下载的包」依赖集合不一致。
+    # 桌面版坚持零外部 pip 依赖，这里显式排除，保证本机与 CI 产物一致。
+    excludes=["PIL"],
     noarchive=False,
 )
 
