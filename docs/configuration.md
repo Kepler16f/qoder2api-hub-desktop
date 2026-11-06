@@ -270,6 +270,31 @@ export QD_STRUCTURED_TOOL_HISTORY_REALMS="cn,intl"
 
 启动脚本里那一行是**注释状态**的示例 —— 是否打开由你决定，网关不替你改默认值。
 
+## 性能与看板缓存（v1.8.0）
+
+统计概览与详细统计使用 10 秒固定 TTL 的有界结果缓存；日志发生追加、截断或替换时立即失效，相同冷查询并发合并。最近请求的行数计数按文件指纹复用，推理不走此缓存。`/health.analytics_cache` 暴露命中/计算/合并等待数量，不包含凭据。
+
+日用量缓存不再因持续轮询延长过期时间。基准与适用边界见 [v1.8.0 性能说明](performance-v1.8.0.md)。
+
+## 图片预处理与转换超时（`QD_IMAGE_TRANSCODE`）
+
+`Image conversion timeout` 表示 provider 的图片转换阶段超时，与模型首字超时、网关 Key 失效不同。网关不会把图片删成文字来伪装成功。
+
+- Chat / Responses / Anthropic 桥接后，在统一出站构造中处理内联图片。
+- `QD_IMAGE_TRANSCODE=auto`（默认）：大于等于 256 KiB 的 PNG/BMP/TIFF 优先归一；不缩分辨率，不移除任何图片。非透明图片可改为 quality=95、4:4:4 JPEG，且必须比原图至少小 20% 才替换；透明图保留无损 PNG。需要逐像素输入时设 `QD_IMAGE_TRANSCODE=off`。
+- 小图、JPEG、动画、带 EXIF/ICC/色彩或 DPI 元数据的图、16 位图、解码失败的图片原样保留；远程 URL 不下载、不改写。
+- `/health` 的 `image_preflight.codec_available` 可确认当前运行解释器是否具备编解码组件；`enabled` 表示预处理是否开启。
+- 归一结果只放内存 LRU（最多 32 条、32 MiB），相同图片跨轮与重试使用相同字节，不落盘，不把 base64/URL/凭据写进日志。
+- 官方 Docker 镜像包含 Pillow；本机部署可在**运行网关的同一 Python 解释器**安装：
+
+```bash
+python -m pip install "Pillow>=11.3,<14"
+```
+
+未安装 Pillow 时核心代理仍正常运行，图片原样透传；有大图时日志以 `codec_missing` 提醒。安装后重启网关。
+
+转换超时仅在尚未输出时允许一次自动重试（受现有重试开关限制）；耗尽后保留 HTTP 504，返回 `upstream_image_conversion_timeout`，保留上游 request_id，不冷却账号、不解绑会话、不对全池重复转换。该修复减少转换压力与重试放大，不承诺消除上游服务本身的间歇超时。
+
 ## 工具协议残片的收尾策略（`QD_TOOL_ECHO_MODE`）
 
 有些模型（实测 `Qwen3.8-Flash`）会把工具调用**当成正文**吐出来（DSML 标签 / `[assistant 请求调用工具]` 标记 + 半截参数），随后流结束。网关识别到这类残片时默认 **fail-closed**：不再把残片当正文补发，流式响应以 `response.failed`（Responses）或错误帧收尾。
