@@ -125,18 +125,37 @@ def normalize_tiers(value):
     return result
 
 
-def load_config(directory):
+def load_config(directory, _shared=False):
+    """Stat-keyed immutable snapshot; only admin callers receive independent copies.
+
+    Runtime resolves reuse parsed plans. Atomic saves invalidate immediately;
+    external edits invalidate on inode/size/mtime/ctime (no TTL stale window).
+    """
     path = rules_path(directory)
+    cache_key = str(path)
     try:
-        raw = path.read_bytes()
+        st = path.stat()
     except FileNotFoundError:
+        with _LOCK:
+            _CACHE.pop(cache_key, None)
         return {"rules": [], "tiers": [], "policy": dict(DEFAULT_POLICY),
                 "configured": False, "board_enabled": False, "revision": "empty"}
-    revision = hashlib.sha256(raw).hexdigest()
+    stamp = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
     with _LOCK:
-        cached = _CACHE.get(str(path))
-        if cached and cached[0] == revision:
-            return json.loads(cached[1])
+        cached = _CACHE.get(cache_key)
+        if cached and cached[0] == stamp:
+            return cached[1] if _shared else json.loads(cached[2])
+    # fstat the descriptor read, not a possibly replaced pathname.
+    with path.open("rb") as fh:
+        fst = os.fstat(fh.fileno())
+        raw = fh.read()
+    latest = path.stat()
+    # Windows stat(path).ctime is creation time while fstat.ctime may be change time.
+    # Cache only when path still names the exact descriptor snapshot we read.
+    stable = (latest.st_dev, latest.st_ino, latest.st_size, latest.st_mtime_ns) == (
+        fst.st_dev, fst.st_ino, fst.st_size, fst.st_mtime_ns)
+    stamp = (latest.st_dev, latest.st_ino, latest.st_size, latest.st_mtime_ns, latest.st_ctime_ns)
+    revision = hashlib.sha256(raw).hexdigest()
     try:
         body = json.loads(raw)
         if not isinstance(body, dict):
@@ -152,8 +171,9 @@ def load_config(directory):
     with _LOCK:
         if len(_CACHE) >= 16:
             _CACHE.clear()
-        _CACHE[str(path)] = (revision, json.dumps(result, ensure_ascii=False))
-    return result
+        if stable:
+            _CACHE[cache_key] = (stamp, result, json.dumps(result, ensure_ascii=False))
+    return result if _shared else json.loads(json.dumps(result, ensure_ascii=False))
 
 
 def load_rules(directory):
@@ -199,7 +219,7 @@ def scope_uids(accounts, ids=None, groups=None):
 
 def resolve(directory, accounts, model, key=None, explicit_realm=None, config=None):
     key = key or {}
-    config = load_config(directory) if config is None else config
+    config = load_config(directory, _shared=True) if config is None else config
     key_realm = key.get("realm") or ""
     if key_realm and explicit_realm and key_realm != explicit_realm:
         raise ValueError("API Key realm conflicts with requested realm")

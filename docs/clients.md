@@ -95,8 +95,22 @@ export ANTHROPIC_MODEL="Qwen3.8-Max"
 | OpenCode | `~/.config/opencode/opencode.json` | OpenAI 兼容 |
 | DSH (DeepSeek Harness) | `~/.dsh/settings.yaml`、`~/.dsh/.credentials.yaml` | OpenAI 兼容 |
 | Crush (Charm) | `~/.config/crush/crush.json` | OpenAI 兼容 |
+| Aider | `~/.aider.conf.yml` | OpenAI 兼容 |
+| Continue | `~/.continue/config.yaml` | OpenAI 兼容 |
+| Pi Coding Agent | `~/.pi/agent/models.json` | OpenAI 兼容 |
+| Factory Droid | `~/.factory/settings.json` | OpenAI 兼容 |
+| GitHub Copilot CLI | `~/.copilot/providers.json` | OpenAI 兼容 BYOK |
+| OpenHands CLI | `~/.openhands/agent_settings.json` | OpenAI 兼容 |
+| Kilo Code CLI | `~/.config/kilo/kilo.json`（已有 JSONC 选择原路径） | OpenAI 兼容 |
+| Mistral Vibe | `~/.vibe/config.toml`、`~/.vibe/.env` | OpenAI 兼容 |
 
-- **只做增量修改**：只插入或更新 `qoder-proxy` 这一段配置，原有的注释、缩进和其他 provider 都保留不动
+共 **31 个客户端，13 类自动适配**。Goose、Qwen Code、Cline、Roo Code、Kilo VS Code、Cursor、Windsurf、Trae、Zed、Junie、Augment、Cherry Studio、Chatbox、LobeChat、Open WebUI 等按官方能力提供检测/手动接入；Gemini CLI、Amp 等原生协议不冒充 OpenAI 兼容，也不写入其私有登录数据库。客户端版本变化可能需要按卡片中的官方文档调整。
+
+API Base URL、cURL、Chat Completions、Responses、Anthropic Messages 示例已统一迁移到「智能体配置」页。每个客户端的「占位符模板 / 接入指引」从空白临时环境构建，只包含 `YOUR_API_KEY`，不读取本机客户端配置或调用 Key reveal。只有用户点击「一键配置」才显式读取选定 Key 并写入客户端。
+
+检测只检查 PATH、约定配置目录、VS Code/Cursor/Windsurf 扩展目录及应用目录，不启动客户端、不读取系统凭据库。自动配置只面向网关所在机器；Docker/远程部署仍在客户端机器运行独立配置器。
+
+- **保留其他设置**：YAML/TOML 使用局部字段或受控块增量修改；JSON 进行字段级合并（可能重新格式化），其他 provider 保留；复杂 JSONC 不盲目重写。OpenCode 按官方 v1 格式生成 models 映射，而非数组。
 - **可以还原**：写入前会备份原文件（`accounts/agent-backups/`，每个文件保留最近 10 份）。点「还原」后，文件会逐字节恢复到接入前的样子，网关新建的文件也会被删除
 - **全部成功才生效**：如果一个客户端要写多个文件，其中任意一个失败，全部回滚
 - **自动填好模型表**：写入时会从网关拉取 `/v1/models`，顺便验证 Key 是否有效

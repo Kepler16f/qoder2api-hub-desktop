@@ -64,10 +64,10 @@ COPY _test_qoder.py _diag_gateway.py _diag_campaign.py _verify_models.py \
      _refresh_catalog.py _install_umid.py ./
 
 # Create data directories
-RUN mkdir -p /app/accounts /app/usage
+RUN mkdir -p /app/accounts /app/usage /app/logs/usage
 
 # Volume persistence for credentials and usage logs
-VOLUME ["/app/accounts", "/app/usage"]
+VOLUME ["/app/accounts", "/app/usage", "/app/logs"]
 
 EXPOSE 8790
 

@@ -4,7 +4,7 @@
     "name": "English",
     "dir": "ltr",
     "order": 10,
-    "version": 8
+    "version": 9
   },
   "messages": {
     "简体中文": "Simplified Chinese",
@@ -296,7 +296,11 @@
     "待确认": "To confirm",
     "立即检查": "Check now",
     "一键配置": "Configure",
-    "未安装": "Not installed",
+    "未检测到": "Not detected",
+    "已检测到": "Detected",
+    "占位符模板": "Placeholder template",
+    "接入指引": "Setup guide",
+    "API 配置示例": "API configuration examples",
     "虚拟机": "VM",
     "连续签到（批量视图）": "Check-in streak (batch view)",
     "临期优先窗口": "Expiring-first window",
@@ -331,8 +335,9 @@
     "全部模型已定价": "All models are priced",
     "暂无可用速率样本": "No rate samples available",
     "默认档位": "default tier",
-    "OpenAI 兼容 (/v1/chat/completions)": "OpenAI-compatible (/v1/chat/completions)",
-    "原生 Anthropic Messages (/v1/messages)": "native Anthropic Messages (/v1/messages)",
+    "自动配置 · 可还原": "Automatic setup · Restorable",
+    "检测 + 手动指引": "Detection + Manual setup",
+    "检测依据与配置位置": "Detection evidence and configuration paths",
     "视觉": "Vision",
     "工具": "Tools",
     "推理": "Reasoning",

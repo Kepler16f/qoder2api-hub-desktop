@@ -71,7 +71,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -11163,6 +11163,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, qoder_agents.overview(ACCOUNTS_DIR))
             except qoder_agents.AgentConfigError as exc:
                 return self._error(500, str(exc))
+        if path == "/agents/template":
+            try:
+                return self._json(200, qoder_agents.template(
+                    str((query.get("client") or [""])[0]),
+                    str((query.get("base_url") or ["http://127.0.0.1:8790"])[0]),
+                    model=str((query.get("model") or ["auto"])[0])))
+            except qoder_agents.AgentConfigError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
         if path == "/agents/models":
             # 网关自己的模型清单（面板配置页预填用；与 /v1/models 同源字段）
             if not self._authorized():
