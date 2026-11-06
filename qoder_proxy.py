@@ -5757,16 +5757,12 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
             # issue #72：**不要把「残缺工具回声」当成功结束**。此前吞掉后按
             # stop 收尾，coding agent 会认为任务做完了（静默中断，比报错更难查）。
             # 客户端声明了 tools 且本轮没有一个可用调用 -> fail-closed，让客户端重试。
-            if allowed_names and _marker_only_echo(hold):
-                _kind = "marker_only" if _marker_only_echo(hold) else "partial_array"
-                log("dropped truncated leaked tool-call echo (%d chars, %s, "
-                    "tools_declared=%d) — failing the turn closed (issue #72)"
-                    % (len(hold), _kind, len(allowed_names)),
-                    level="WARN", tag="chat")
-                raise EmptyToolEcho(len(hold), _kind)
-            # issue #9：未声明工具时仍按原样吞掉（无可恢复的调用可言）
-            log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
-                % len(hold), level="WARN", tag="chat")
+            _kind = "marker_only" if _marker_only_echo(hold) else "partial_array"
+            log("dropped truncated leaked tool-call echo (%d chars, %s, "
+                "tools_declared=%d) — failing the turn closed (issue #72)"
+                % (len(hold), _kind, len(allowed_names)),
+                level="WARN", tag="chat")
+            raise EmptyToolEcho(len(hold), _kind)
         elif _tool_echo_droppable(hold, allowed_names):
             # issue #11：模型把 [工具结果...] 回声块当正文吐出（自造闭标记或
             # 未闭合的截断块）——吞掉，不还原（需 tool_call_id 配对）。
@@ -6316,6 +6312,54 @@ def _sse_recover_tool_tags(frames, allowed_names=None):
                + "\n\n").encode("utf-8")
 
 
+# 模型偶发把工具调用写成正文（真实 Claude 会话）。这不是可执行
+# 协议：不能猜测执行命令，也不能返回正常 stop 让客户端误判任务完成。
+_NAMED_TOOL_ECHO_RE = re.compile(
+    r"(?m)^[ \t]*\[([A-Za-z_][A-Za-z0-9_.:\-]*)[ \t]+工具调用\]\s*(?=[{\[])"
+)
+
+
+def _raise_unstructured_tool_echo(text, allowed_names):
+    if not allowed_names:
+        return
+    for match in _NAMED_TOOL_ECHO_RE.finditer(_outside_fences(text)):
+        if match.group(1) in allowed_names:
+            log("unstructured named tool-call echo — failing the turn closed",
+                level="WARN", tag="chat")
+            raise EmptyToolEcho(len(text), "unstructured_tool_call")
+
+
+def _sse_guard_unstructured_tool_echo(frames, allowed_names=None):
+    """正文里的伪工具调用必须在发送成功收尾前报错；正文仍即时输出。"""
+    if not allowed_names:
+        yield from frames
+        return
+    content, deferred = [], []
+    has_calls = False
+    for raw in frames:
+        finish = False
+        try:
+            text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+            payload = json.loads(strip_data_prefix(text))
+            for choice in payload.get("choices") or []:
+                delta = choice.get("delta") or {}
+                piece = delta.get("content")
+                if isinstance(piece, str):
+                    content.append(piece)
+                has_calls = has_calls or bool(delta.get("tool_calls"))
+                finish = finish or bool(choice.get("finish_reason"))
+        except (ValueError, TypeError, AttributeError):
+            pass
+        if finish or deferred:
+            # 连同 usage / [DONE] 保持原顺序；失败时绝不先发成功的 finish。
+            deferred.append(raw)
+        else:
+            yield raw
+    if not has_calls:
+        _raise_unstructured_tool_echo("".join(content), allowed_names)
+    yield from deferred
+
+
 def recover_leaked_tool_calls(frames, allowed_names=None):
     """流式出口：回读（issue #8 / #51 / #137）+ **tool_call id 保证**（issue #47）
     + 截断参数守卫（issue #112）。
@@ -6329,7 +6373,8 @@ def recover_leaked_tool_calls(frames, allowed_names=None):
     tagged = _sse_recover_tool_tags(dsml, allowed_names)
     with_ids = _sse_fill_tool_call_ids(tagged)
     named = _sse_guard_nameless_tool_calls(with_ids)
-    for frame in _sse_guard_truncated_tool_args(named):
+    checked = _sse_guard_truncated_tool_args(named)
+    for frame in _sse_guard_unstructured_tool_echo(checked, allowed_names):
         yield frame
 
 
@@ -6512,21 +6557,17 @@ _STRUCTURED_LOG_ONCE = {"done": False}
 
 
 def _structured_realms():
-    """auto 模式下允许启用结构化历史的出口（默认仅 cn = 旧行为）。
+    """auto 模式允许结构化历史的出口，默认 cn + intl。
 
-    issue #137 后续：INTL 此前因「未取得端到端验证」被排除，于是 INTL 会话一直
-    走文本化历史 —— 网关把 `[assistant 请求调用工具] + JSON` 写进 assistant 消息，
-    模型照着复述，轻则整轮 502（issue #72 的 marker_only），重则客户端拿到协议
-    正文。实测（本机 intl 账号 + DeepSeek-Flash）结构化直传完全被上游接受：
-    返回原生 tool_calls、正文为空。要启用：
-        QD_STRUCTURED_TOOL_HISTORY_REALMS=cn,intl
-    默认值不变，避免影响未验证的环境。
+    国际区 GLM-5.3 已实测接受配对的 assistant.tool_calls / role:tool，
+    继续文本化会让模型照抄历史信封并静默结束。provider 白名单与 id 守卫
+    仍由 structured_tool_history_enabled 控制；显式设为 cn 可回退旧范围。
     """
     raw = os.environ.get("QD_STRUCTURED_TOOL_HISTORY_REALMS")
     if raw is None or not raw.strip():
-        return {"cn"}
+        return {"cn", "intl"}
     out = {p.strip().lower() for p in raw.split(",") if p.strip()}
-    return out or {"cn"}
+    return out or {"cn", "intl"}
 
 
 def _structured_mode():
@@ -6564,9 +6605,8 @@ def structured_tool_history_enabled(model="", model_key="", realm="",
 
     - off          -> False（一键回退文本化）
     - on           -> True（显式强制：DeepSeek / Kimi / INTL 补验证用）
-    - auto（默认） -> 仅「CN 出口 + provider 白名单 + id 齐备」为真：
-        task-31 实测只在 CN / legacy 通道覆盖过（INTL 超时未取得结果），
-        故 auto 不在 INTL 启用；DeepSeek / Kimi 待补端到端验证，同样排除。
+    - auto（默认） -> 「允许的出口 + provider 白名单 + id 齐备」为真：
+        默认允许 CN / INTL；QD_STRUCTURED_TOOL_HISTORY_REALMS 可缩小范围。
     任何模式下 id 不齐备都回退文本化（fail-safe：宁可少用，不发畸形请求）。
     """
     if not _tool_ids_ok(messages):
@@ -9312,18 +9352,13 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
             elif _leaked_partial_droppable(_echo_src, allowed_names):
                 # issue #72：声明了 tools 却只拿到残缺回声 -> fail-closed（502），
                 # 不再把「空调用 + 正常内容」当成成功返回。
-                if allowed_names and _marker_only_echo(_echo_src):
-                    _kind72 = ("marker_only" if _marker_only_echo(_echo_src)
-                               else "partial_array")
-                    log("dropped truncated leaked tool-call echo (%d chars, %s, "
-                        "tools_declared=%d) — failing the turn closed (issue #72)"
-                        % (len(_echo_src), _kind72, len(allowed_names)),
-                        level="WARN", tag="chat")
-                    raise EmptyToolEcho(len(_echo_src), _kind72)
-                # issue #9：截断的 marker+JSON 回声不还原、也不透传。
-                log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
-                    % len(_echo_src), level="WARN", tag="chat")
-                message["content"] = _head16
+                _kind72 = ("marker_only" if _marker_only_echo(_echo_src)
+                           else "partial_array")
+                log("dropped truncated leaked tool-call echo (%d chars, %s, "
+                    "tools_declared=%d) — failing the turn closed (issue #72)"
+                    % (len(_echo_src), _kind72, len(allowed_names)),
+                    level="WARN", tag="chat")
+                raise EmptyToolEcho(len(_echo_src), _kind72)
             elif _tool_echo_droppable(_echo_src, allowed_names):
                 # issue #11：工具结果回声块同样不还原、不透传。
                 log("dropped leaked tool-result echo (%d chars) — issue #11"
@@ -9397,6 +9432,8 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
         else:
             _log_unrecovered_leak(message.get("content") or "",
                                   "aggregate-tool-tag")
+    if not tool_calls_map:
+        _raise_unstructured_tool_echo(message.get("content") or "", allowed_names)
     # 二次防御：剔除「无函数名」的空 tool_call，防止客户端死等
     if tool_calls_map:
         tool_calls_map = {k: v for k, v in tool_calls_map.items()
@@ -10373,6 +10410,8 @@ def stream_responses_events(inner_lines, model, holder):
                  {"output_index": entry["output_index"], "item": fc_item})
     # 冲刷剩余缓冲文本
     if text_buffer:
+        if not tool_calls_map and not dsml_tool_calls:
+            _raise_unstructured_tool_echo(text_buffer, holder.get("allowed_names"))
         leak_calls, leak_clean = (None, text_buffer)
         dropped_leak = False
         dropped_tool_echo = False
@@ -10405,18 +10444,13 @@ def stream_responses_events(inner_lines, model, holder):
             # issue #72：客户端声明了 tools、本轮又没恢复出任何调用时，
             # **不能以 response.completed 收尾**（agent 会误判任务完成）。
             _allowed72 = holder.get("allowed_names") or set()
-            if _allowed72 and _marker_only_echo(text_buffer):
-                _kind72 = ("marker_only" if _marker_only_echo(text_buffer)
-                           else "partial_array")
-                log("dropped truncated leaked tool-call echo (%d chars, %s, "
-                    "tools_declared=%d) — failing the turn closed (issue #72)"
-                    % (len(text_buffer), _kind72, len(_allowed72)),
-                    level="WARN", tag="chat")
-                raise EmptyToolEcho(len(text_buffer), _kind72)
-            # issue #9：截断的 marker+JSON 回声 -> 不输出文本、不走 DSML 回退。
-            log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
-                % len(text_buffer), level="WARN", tag="chat")
-            calls_rem, clean_rem = None, None
+            _kind72 = ("marker_only" if _marker_only_echo(text_buffer)
+                       else "partial_array")
+            log("dropped truncated leaked tool-call echo (%d chars, %s, "
+                "tools_declared=%d) — failing the turn closed (issue #72)"
+                % (len(text_buffer), _kind72, len(_allowed72)),
+                level="WARN", tag="chat")
+            raise EmptyToolEcho(len(text_buffer), _kind72)
         elif dropped_tool_echo:
             # issue #11：工具结果回声块 -> 同样吞掉，不走 DSML 回退。
             log("dropped leaked tool-result echo (%d chars) — issue #11"
