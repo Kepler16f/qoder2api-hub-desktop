@@ -1084,6 +1084,11 @@ function lookup(src, depth){
     if(MSG.hasOwnProperty(q)) return MSG[q];
     if(FRG.hasOwnProperty(q)) return FRG[q];
   }
+  if(d < MAX_SLOT_DEPTH && /[\r\n]/.test(src)){
+    var lines = src.split(/(\r?\n)/);
+    var mapped = lines.map(function(line){ return /[\r\n]/.test(line) ? line : lookup(line, d + 1); }).join('');
+    if(mapped !== src) return mapped;
+  }
   if(CJK.test(t)){
     for(var k in PAT){
       /* 编译缓存必须放在 PAT 之外：PAT[k] 是译文字符串本身，给字符串挂属性在
@@ -1173,16 +1178,19 @@ var WATCH_ATTRS = ['title', 'placeholder', 'aria-label'];
  * 一轮的最大变更源；<code>/<pre> 是命令与配置示例，翻了就不可用。
  * .no-i18n 给语言下拉自己用（母语名不能被翻成别的语言）。 */
 var SKIP_SEL = '.log-line, code, pre, .no-i18n';
-var seen = (typeof WeakSet === 'function') ? new WeakSet() : null;
+var seen = (typeof WeakMap === 'function') ? new WeakMap() : null;
 
 function skippable(el){
   return !!(el && el.closest && el.closest(SKIP_SEL));
 }
 
 function applyText(n){
-  if(seen){ if(seen.has(n)) return; seen.add(n); }
+  // A reused text node may receive new Chinese content after polling or animation.
+  // Cache its last value, not merely its identity, or dynamic text stays untranslated.
+  if(seen && seen.get(n) === n.nodeValue) return;
   var out = t(n.nodeValue);
   if(out !== n.nodeValue) n.nodeValue = out;
+  if(seen) seen.set(n, n.nodeValue);
 }
 
 function applyAttrs(el){
@@ -3052,6 +3060,12 @@ body{background:var(--bg-secondary);color:var(--text-primary)}body>header{min-he
 @media(max-width:600px){#pageAgents>section{padding:18px}.agent-catalog-tools>*{width:100%;max-width:none!important}.agent-client-card{padding:15px}.agent-template-head h3{font-size:15px}}
 @media(prefers-reduced-motion:reduce){.agent-client-card{transition:none;transform:none!important}}
 
+
+.model-catalog-toolbar{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin:0 0 22px;padding:16px 18px;border:1px solid var(--border-color);border-radius:14px;background:var(--bg-secondary)}
+.model-catalog-toolbar p{margin:0;font-size:12px;color:var(--text-tertiary);line-height:1.7}.model-catalog-toolbar #modelCatalogState{margin-left:auto;font:11px ui-monospace,monospace;color:var(--text-secondary)}
+#pageModels .model-catalog-realms{display:flex;gap:3px;padding:3px;border-radius:10px;background:var(--bg-tertiary);flex:none}#pageModels .model-catalog-realms button{background:transparent;color:var(--text-secondary);border:1px solid transparent;border-radius:8px;min-height:34px;padding:7px 13px;font-size:12px;box-shadow:none}#pageModels .model-catalog-realms button.active{background:var(--bg-secondary);border-color:var(--border-color);color:var(--text-primary);font-weight:650;box-shadow:0 1px 3px #0000000d}
+@media(max-width:680px){.model-catalog-toolbar{padding:12px;gap:10px}.model-catalog-toolbar #modelCatalogState{margin-left:0}.model-catalog-toolbar p{flex-basis:100%;order:3}#pageModels .model-catalog-realms{max-width:100%;flex-wrap:wrap}}
+
 </style>
 </head>
 <body>
@@ -3265,6 +3279,7 @@ body{background:var(--bg-secondary);color:var(--text-primary)}body>header{min-he
 
 <div id="pageModels" class="main-page">
 <div class="admin-page-heading"><div><div class="admin-eyebrow">MODEL CATALOG</div><h2>模型</h2><p>官方能力、上下文与模型级护栏，集中管理。</p></div><button class="sec" onclick="loadModels();loadSettings()">刷新模型</button></div>
+<div class="model-catalog-toolbar"><div class="seg model-catalog-realms" role="group" aria-label="模型目录区域"><button type="button" id="modelCatalogCn" aria-pressed="false" onclick="setModelCatalogRealm('cn')">国内版 (China)</button><button type="button" id="modelCatalogIntl" aria-pressed="false" onclick="setModelCatalogRealm('intl')">国际版 (Global)</button></div><p>仅切换模型目录，不改变网关默认出口或账号视图。</p><span id="modelCatalogState" role="status" aria-live="polite"></span></div>
   <!-- 版本模型库与能力清单 -->
   <section id="sectionModels">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
@@ -4794,23 +4809,54 @@ async function initRealm(preserveView){
 const MODELS_CACHE = {};    // realm -> data[]
 const GROWTH_CACHE = {};    // realm|uid -> /tasks 响应（含 __at 时间戳）
 
-async function loadModels(){
-  const realm = window.VIEW_REALM || "intl";
-  const hit = MODELS_CACHE[realm];
-  if(hit){                       // 1) 立即用缓存渲染
-    MODELS_DATA = hit;
-    renderAvailableModels();
+// Model catalog owns its region: viewing a model must never POST /realm or change account scope.
+let MODEL_CATALOG_REQUEST = 0;
+function getModelCatalogRealm(){
+  if(['cn','intl'].includes(window.MODEL_CATALOG_REALM)) return window.MODEL_CATALOG_REALM;
+  let selected='';
+  try{ selected=new URLSearchParams(window.location.search).get('model_realm')||''; }catch(e){}
+  if(!['cn','intl'].includes(selected)){
+    try{ selected=localStorage.getItem('qd_model_catalog_realm')||''; }catch(e){}
   }
+  if(['cn','intl'].includes(selected)) window.MODEL_CATALOG_REALM=selected;
+  return ['cn','intl'].includes(selected)?selected:(window.VIEW_REALM||'intl');
+}
+function renderModelCatalogRealm(realm, message){
+  ['cn','intl'].forEach(r=>{const button=document.getElementById(r==='cn'?'modelCatalogCn':'modelCatalogIntl');if(button){button.classList.toggle('active',r===realm);button.setAttribute('aria-pressed',String(r===realm));}});
+  const state=document.getElementById('modelCatalogState');if(state)state.textContent=(realm==='cn'?'国内版':'国际版')+' · '+message;
+}
+async function setModelCatalogRealm(realm){
+  if(!['cn','intl'].includes(realm))return;
+  window.MODEL_CATALOG_REALM=realm;
+  try{localStorage.setItem('qd_model_catalog_realm',realm);}catch(e){}
+  try{const url=new URL(window.location.href);url.searchParams.set('model_realm',realm);history.replaceState(null,'',url.pathname+url.search+url.hash);}catch(e){}
+  await loadModels();
+}
+async function loadModels(){
+  const realm = getModelCatalogRealm(), request = ++MODEL_CATALOG_REQUEST;
+  const hit = MODELS_CACHE[realm];
+  // Clear the previous region immediately: old rows must never wear the new region label.
+  MODELS_DATA = hit || [];
+  renderAvailableModels();
+  renderModelCatalogRealm(realm,hit?'显示缓存，正在刷新…':'正在加载模型…');
+  const table=document.getElementById('modelsTable');if(table)table.setAttribute('aria-busy','true');
   try{
     const r = await getJSON('/v1/models?realm=' + encodeURIComponent(realm));
-    // 2) 后台刷新；仅当用户仍停留在同一区域时覆盖界面
-    MODELS_CACHE[realm] = r.data || [];
-    if((window.VIEW_REALM || "intl") === realm){
+    if(request!==MODEL_CATALOG_REQUEST)return;
+    MODELS_CACHE[realm] = Array.isArray(r.data) ? r.data : [];
+    if(request===MODEL_CATALOG_REQUEST && getModelCatalogRealm()===realm){
       MODELS_DATA = MODELS_CACHE[realm];
       renderAvailableModels();
+      renderModelCatalogRealm(realm,'共 '+MODELS_DATA.length+' 个模型');
     }
   }catch(e){
-    console.error('loadModels error:', e);
+    if(request===MODEL_CATALOG_REQUEST && getModelCatalogRealm()===realm){
+      renderModelCatalogRealm(realm,hit?'刷新失败，显示本区域缓存':'加载失败，请重试');
+      if(!hit){const body=document.querySelector('#modelsTable tbody');if(body)body.innerHTML='<tr><td colspan="6" class="empty">模型目录加载失败，请点击刷新模型重试。</td></tr>';}
+    }
+    console.error('loadModels error:',e);
+  }finally{
+    if(request===MODEL_CATALOG_REQUEST && table)table.setAttribute('aria-busy','false');
   }
 }
 

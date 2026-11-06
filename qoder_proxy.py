@@ -71,7 +71,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.9.0"
+VERSION = "1.8.1"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -615,6 +615,10 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
         for field in ("session_affinity", "upstream_session_id", "route_rule"):
             if session_trace.get(field):
                 row[field] = session_trace[field]
+        for field in ("output_content_chars", "output_reasoning_chars", "output_has_tool_call",
+                      "output_finish_reason", "output_code_without_tools"):
+            if field in session_trace:
+                row[field] = session_trace[field]
     if account:
         row["account"] = account
     # P1-3：推理档位审计（请求档位 vs 实际下发档位）与 API key 归属。
@@ -685,6 +689,12 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
                fields.get("completion_tokens", 0), speed_tag), tag="chat")
     except Exception:
         pass
+    if session_trace and session_trace.get("output_code_without_tools"):
+        log("response observation: model=%s realm=%s code/text output without tool call "
+            "(content_chars=%s reasoning_chars=%s finish=%s); no tool was dispatched" %
+            (model, row.get("realm", "?"), session_trace.get("output_content_chars", 0),
+             session_trace.get("output_reasoning_chars", 0), session_trace.get("output_finish_reason", "?")),
+            level="WARN", tag="chat")
     return row
 
 
@@ -756,6 +766,12 @@ def record_error(model, status, message, elapsed_ms=None,
         row["stream"] = bool(stream)
     if account:
         row["account"] = account
+        try:
+            actual = POOL.get(account) if POOL else None
+            if actual and getattr(actual, "realm", "") in ("cn", "intl"):
+                row["realm"] = actual.realm
+        except Exception:
+            pass
     if key_id:
         row["key_id"] = key_id
     with _lock:
@@ -4496,6 +4512,9 @@ class EmptyToolEcho(InvalidToolArguments):
     """
 
     def __init__(self, chars=0, kind="marker_only"):
+        self.kind = kind
+        self.integrity_failure = kind in ("missing_tool_name", "missing_tool_call",
+                                          "truncated_arguments", "reasoning_only", "empty_tool_turn")
         UpstreamStatus.__init__(
             self, 502, "%s [%d chars, %s]" % (EMPTY_ECHO_ERROR_DETAIL,
                                              int(chars), kind))
@@ -5996,56 +6015,48 @@ def _sse_recover_dsml(frames, allowed_names=None):
 
 
 def _sse_guard_truncated_tool_args(frames):
-    """issue #112：上游在 tool_calls 的 arguments 还没写完时就干净 EOF。
+    """Validate accumulated native arguments before forwarding terminal success.
 
-    症状（客户端侧）：流里出现了一半的 `tool_calls` 增量，随后既没有
-    `finish_reason` 也没有错误帧，连接正常关闭 —— coding agent 只看到
-    「参数不完整的调用 + 流结束」，整轮任务静默中断，用户看到的就是
-    「助手突然只回了几个命令片段就停了」。
-
-    这里在流末做一次完整性校验：累计到过 tool_call 增量、没收到
-    finish_reason、且某个调用的 arguments 不是合法 JSON -> 抛
-    EmptyToolEcho（fail-closed）。四条协议出口会把它转成明确失败，
-    客户端据此重试，而不是把半截调用当成功收尾。其余情况逐字节透传。
+    Content/reasoning deltas are never interchanged; completed JSON calls retain
+    streaming latency. An explicit finish does not make malformed JSON valid.
     """
     calls = {}
-    finish_seen = False
+    def validate():
+        for slot in calls.values():
+            args = "".join(slot["args"]).strip()
+            if not args:
+                continue  # No-argument tools are valid; existing adapters use {}.
+            try:
+                json.loads(args)
+            except (TypeError, ValueError):
+                raise EmptyToolEcho(len(args), "truncated_arguments")
     for raw in frames:
+        terminal = False
         try:
-            text = (raw.decode("utf-8", "replace")
-                    if isinstance(raw, bytes) else raw)
+            text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
             data = strip_data_prefix(text)
-            if data and data != "[DONE]":
+            if data == "[DONE]":
+                terminal = True
+            elif data:
                 payload = json.loads(data)
-                choice = (payload.get("choices") or [{}])[0] or {}
-                if choice.get("finish_reason"):
-                    finish_seen = True
-                for tc in ((choice.get("delta") or {}).get("tool_calls") or []):
-                    idx = tc.get("index")
-                    idx = 0 if idx is None else idx
-                    slot = calls.setdefault(idx, {"args": "", "name": ""})
-                    fn = tc.get("function") or {}
-                    if fn.get("name"):
-                        slot["name"] = fn["name"]
-                    if fn.get("arguments"):
-                        slot["args"] += fn["arguments"]
-        except Exception:
+                for choice in payload.get("choices") or []:
+                    if not isinstance(choice, dict):
+                        continue
+                    terminal = terminal or bool(choice.get("finish_reason"))
+                    for tc in ((choice.get("delta") or {}).get("tool_calls") or []):
+                        if not isinstance(tc, dict):
+                            continue
+                        key = (choice.get("index", 0), tc.get("index", 0))
+                        slot = calls.setdefault(key, {"args": []})
+                        args = (tc.get("function") or {}).get("arguments")
+                        if isinstance(args, str):
+                            slot["args"].append(args)
+        except (ValueError, TypeError, AttributeError):
             pass
+        if terminal:
+            validate()
         yield raw
-    if not calls or finish_seen:
-        return
-    for _idx, slot in sorted(calls.items()):
-        args = (slot.get("args") or "").strip()
-        if not args:
-            continue
-        try:
-            json.loads(args)
-        except Exception:
-            log("stream ended without finish_reason and tool call '%s' has "
-                "incomplete JSON arguments (%d chars) — failing closed "
-                "(issue #112)" % (slot.get("name") or "?", len(args)),
-                level="WARN", tag="chat")
-            raise EmptyToolEcho(len(args), "truncated_arguments")
+    validate()
 
 
 def _finish_only_frame(payload, finish_reason):
@@ -6077,7 +6088,7 @@ def _sse_guard_nameless_tool_calls(frames):
     与 Anthropic 侧的 #116 同构：
       · name 未到 -> 扣住 arguments，不发这一条；
       · name 到 -> 立刻发「id + name + 攒下的 arguments」一次；
-      · 流结束仍无名 -> 丢弃，并把 finish_reason: tool_calls 降级为 stop。
+      · 流结束仍无名 -> 明确协议失败，绝不降级为正常 stop。
     """
     pending = {}
 
@@ -6101,7 +6112,7 @@ def _sse_guard_nameless_tool_calls(frames):
         tcs = delta.get("tool_calls")
         if not isinstance(tcs, list) or not tcs:
             if fin and any(not s["opened"] for s in pending.values()):
-                yield _finish_only_frame(payload, "stop")
+                raise EmptyToolEcho(0, "missing_tool_name")
             else:
                 yield raw
             continue
@@ -6142,6 +6153,8 @@ def _sse_guard_nameless_tool_calls(frames):
                     "function": {"arguments": args},
                 })
 
+        if fin and any(not slot["opened"] for slot in pending.values()):
+            raise EmptyToolEcho(0, "missing_tool_name")
         body = {k: v for k, v in delta.items() if k != "tool_calls"}
         if forwarded:
             body["tool_calls"] = forwarded
@@ -6158,13 +6171,14 @@ def _sse_guard_nameless_tool_calls(frames):
             yield ("data: " + json.dumps(frame, ensure_ascii=False)
                    + "\n\n").encode("utf-8")
         elif fin and any(not s["opened"] for s in pending.values()):
-            yield _finish_only_frame(payload, "stop")
+            raise EmptyToolEcho(0, "missing_tool_name")
 
     dropped = [i for i, s in pending.items() if not s["opened"]]
     if dropped:
         RECOVERY_STATS["nameless_drop"] = RECOVERY_STATS.get("nameless_drop", 0) + 1
         log("dropped %d tool_call(s) without name at stream end - issue #124"
             % len(dropped), level="WARN", tag="chat")
+        raise EmptyToolEcho(0, "missing_tool_name")
 
 
 
@@ -6366,7 +6380,64 @@ def _sse_guard_unstructured_tool_echo(frames, allowed_names=None):
     yield from deferred
 
 
-def recover_leaked_tool_calls(frames, allowed_names=None):
+def _sse_guard_empty_tool_turn(frames, allowed_names=None, audit=None):
+    """No visible answer and no executable call is not successful completion.
+
+    Only tool-enabled requests opt in. Ordinary code examples are valid visible
+    answers and are never interpreted or executed as tools.
+    """
+    if not allowed_names:
+        yield from frames
+        return
+    visible, has_call, reasoning_chars, finish, seen = False, False, 0, None, False
+    content_chars = 0
+    content_prefix = ""
+    def validate():
+        if isinstance(audit, dict):
+            audit.update(output_content_chars=content_chars, output_reasoning_chars=reasoning_chars,
+                         output_has_tool_call=bool(has_call), output_finish_reason=finish or "eof")
+            audit["output_code_without_tools"] = bool(not has_call and content_prefix.lstrip().startswith(chr(96)*3))
+        if seen and not visible and not has_call and finish not in ("length", "content_filter"):
+            raise EmptyToolEcho(0, "reasoning_only" if reasoning_chars else "empty_tool_turn")
+        if finish in ("tool_calls", "function_call") and not has_call:
+            raise EmptyToolEcho(0, "missing_tool_call")
+    for raw in frames:
+        terminal = False
+        try:
+            text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+            data = strip_data_prefix(text)
+            if data == "[DONE]":
+                terminal = True
+            elif data:
+                payload = json.loads(data)
+                for choice in payload.get("choices") or []:
+                    seen = True
+                    delta = choice.get("delta") or {}
+                    content = delta.get("content")
+                    if isinstance(content, str):
+                        content_chars += len(content)
+                        if len(content_prefix) < 80:
+                            content_prefix = (content_prefix + content)[:80]
+                    visible = visible or (isinstance(content, str) and bool(content.strip()))
+                    if isinstance(content, list):
+                        visible = visible or any(isinstance(v, dict) and bool(str(v.get("text") or "").strip()) for v in content)
+                    reasoning = delta.get("reasoning_content")
+                    if isinstance(reasoning, str):
+                        reasoning_chars += len(reasoning)
+                    has_call = has_call or any(bool((tc.get("function") or {}).get("name")) for tc in delta.get("tool_calls") or [] if isinstance(tc, dict))
+                    has_call = has_call or bool((delta.get("function_call") or {}).get("name"))
+                    if choice.get("finish_reason"):
+                        finish = choice["finish_reason"]
+                        terminal = True
+        except (ValueError, TypeError, AttributeError):
+            pass
+        if terminal:
+            validate()
+        yield raw
+    validate()
+
+
+def recover_leaked_tool_calls(frames, allowed_names=None, audit=None):
     """流式出口：回读（issue #8 / #51 / #137）+ **tool_call id 保证**（issue #47）
     + 截断参数守卫（issue #112）。
 
@@ -6380,7 +6451,8 @@ def recover_leaked_tool_calls(frames, allowed_names=None):
     with_ids = _sse_fill_tool_call_ids(tagged)
     named = _sse_guard_nameless_tool_calls(with_ids)
     checked = _sse_guard_truncated_tool_args(named)
-    for frame in _sse_guard_unstructured_tool_echo(checked, allowed_names):
+    guarded = _sse_guard_unstructured_tool_echo(checked, allowed_names)
+    for frame in _sse_guard_empty_tool_turn(guarded, allowed_names, audit=audit):
         yield frame
 
 
@@ -6812,7 +6884,7 @@ def _quota_hint(detail):
     if "10605" in d or "isQueued" in d:
         return ("上游排队中（10605 / RESOURCE_LIMIT）：等 retryAfterSeconds 后会放行，")
     if "112" in d and ("pricingUrl" in d or "code" in d):
-        return "账号额度耗尽（112 / pricingUrl）：充值或换号，重试无效"
+        return "上游模型额度/套餐拒绝（112）：不代表总余额为零，核对实际账号、区域和模型权限"
     if "Billing daily count exceeded" in d or "110" in d:
         return "当日计费次数上限（110）：次日 0 点重置"
     if "430" in d:
@@ -7640,8 +7712,8 @@ def _friendly_net_error(exc, target=""):
 # usage limit reached。
 _AUTH_LIKE_CODE_RE = re.compile(r"(?<![0-9A-Za-z_])(401|403)(?![0-9A-Za-z_])")
 _QUEUED_CLIENT_HINT = " [rate limit: upstream model queue is full (10605), retry later]"
-_QUOTA_CLIENT_HINT = (" [quota exhausted: upstream account credits exhausted (112), "
-                      "top up or enable another account]")
+_QUOTA_CLIENT_HINT = (" [usage limit reached: upstream quota or plan access rejected (112); "
+                      "this does not establish that the displayed balance is zero]")
 _DAILY_CLIENT_HINT = (" [usage limit reached: upstream daily request count "
                       "exceeded (110), retry after local midnight]")
 # 这些错误类型对客户端一律不用 401/403 状态码（改 429，与 OpenAI insufficient_quota 一致）
@@ -7707,7 +7779,8 @@ def friendly_upstream_error(code, detail):
     # issue #108：额度耗尽也走 403，但重试无效——让客户端看懂该充值/换号
     _quota_kind = _quota_cooldown(detail)[0]
     if _quota_kind == "exhausted":
-        return ("上游账号额度耗尽（112 / pricingUrl）：重试无效，请充值或启用其它账号。"
+        return ("上游拒绝本次模型额度/套餐权限（112）：这不等于账号总余额为零。"
+                "请核对实际出口账号、当前模型可用额度与套餐权限；不要只看两区合计余额。"
                 "上游详情：%s" % (_safe[:160] or "(无详情)")
                 + _QUOTA_CLIENT_HINT, "quota_exhausted")
     # issue #137：每日次数上限（110）此前落到兜底分支，原样显示成 upstream 403
@@ -7731,6 +7804,15 @@ def friendly_upstream_error(code, detail):
                 "仍拿不到可用资源。请稍后重试；若频繁出现，说明该模型当前排队严重。"
                 "上游详情：%s" % (_safe[:200] or "(无详情)")
                 + _QUEUED_CLIENT_HINT, "upstream_queued")
+    if "pricingUrl" in detail:
+        return ("上游返回套餐购买/权限入口，但未明确报告余额耗尽。请核对本次模型和出口账号的套餐权限。"
+                "上游详情：%s" % _safe[:200], "upstream_plan_rejected")
+    if "missing_tool_name" in detail or "missing_tool_call" in detail:
+        return ("上游工具调用缺少名称或实际调用，已阻止伪装为正常结束；请重试该轮。", "upstream_incomplete_tool_call")
+    if "reasoning_only" in detail or "empty_tool_turn" in detail:
+        return ("上游只返回思考或空响应，没有正文及可执行工具调用；本轮未完成，未把思考改成正文。", "upstream_empty_response")
+    if "truncated_arguments" in detail:
+        return ("上游工具参数被截断或不是合法 JSON；本轮未完整结束，请重试，不会重复已发送的输出。", "upstream_incomplete_tool_call")
     # 0) issue #37：工具参数非法（确定性、可重试但不是账号问题）
     if "invalid JSON arguments" in detail:
         return ("上游生成的工具调用参数不是合法 JSON，本轮**未执行任何工具**；"
@@ -7744,6 +7826,10 @@ def friendly_upstream_error(code, detail):
                 "工具定义或粘贴的代码/文本）后重试。上游详情：%s"
                 % detail[:300],
                 "content_policy_rejected")
+    if _is_first_token_timeout(detail):
+        return ("上游首字/推理超时 (HTTP %s)：本次未拿到可用响应；不代表 Key 或额度失效。"
+                "网关不再针对该超时重复请求同一账号。上游详情：%s" % (code_i, _safe[:200]),
+                "upstream_transient_error")
     if _is_transient_upstream(code_i, detail) or (
             "provider_error" in detail and "invalid_" not in detail):
         return ("上游瞬时故障 (HTTP %s)：网关已对同账号自动重试仍失败，"
@@ -7773,7 +7859,7 @@ def _quota_cooldown(detail):
     detail 可能被套在字符串里（转义形态 \\"code\\":\\"112\\"），先去掉反斜杠再匹配。
     """
     s = str(detail or "").replace("\\", "")
-    if "pricingUrl" in s or re.search(r'"code"\s*:\s*"?112\b', s):
+    if re.search(r'"code"\s*:\s*"?112\b', s):
         return "exhausted", _QUOTA_112_COOLDOWN
     if "Billing daily count exceeded" in s or re.search(r'"code"\s*:\s*"?110\b', s):
         now = time.time()
@@ -7783,7 +7869,7 @@ def _quota_cooldown(detail):
     return "", 0
 
 
-def _note_quota_cooldown(account, status, detail, where):
+def _note_quota_cooldown(account, status, detail, where, model=None):
     """额度类 403：按病因冷却账号并打日志；返回 True 表示已处理（调用方应轮换）。
 
     issue #108：配额不是凭证失效，所以不改 enabled、也不喂降权。冷却**刻意不传**
@@ -7792,12 +7878,23 @@ def _note_quota_cooldown(account, status, detail, where):
     kind, cd = _quota_cooldown(detail)
     if not kind or not account or not hasattr(account, "note_error"):
         return False
+    model_scoped = False
+    if kind == "exhausted" and model:
+        credits = getattr(account, "credits", None)
+        try:
+            positive = qoder_accounts.shared_unlimited(credits) or float(qoder_accounts.effective_remain(credits) or 0) > 0
+        except (TypeError, ValueError, AttributeError):
+            positive = False
+        model_scoped = bool(positive)
     actual = float(account.note_error(
-        "%s HTTP %s quota %s: %s" % (where, status, kind, str(detail)[:80]),
-        cooldown=cd) or 0)
+        "%s HTTP %s quota %s realm=%s model=%s: %s" % (where, status, kind,
+            getattr(account, "realm", ""), model or "?", str(detail)[:80]),
+        cooldown=300 if model_scoped else cd,
+        **({"model": model} if model_scoped else {})) or 0)
     note_risk("rejected", detail)
     if kind == "exhausted":
-        what = "quota exhausted (112) - cooling 30min"
+        what = ("quota/plan rejected (112), positive balance snapshot - model cooling 5min"
+                if model_scoped else "quota/plan rejected (112) - cooling 30min")
     else:
         what = "daily count limit (110) - cooling until %s" % time.strftime(
             "%m-%d %H:%M", time.localtime(time.time() + actual))
@@ -7854,7 +7951,7 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
             level="WARN", tag="chat")
     elif status_int in (401, 403):
         # issue #108：额度类 403 要的是长冷却 + 换号，不是「凭证被拒」的 60s
-        if _note_quota_cooldown(account, status_int, detail, "envelope"):
+        if _note_quota_cooldown(account, status_int, detail, "envelope", model=model):
             return
         dead = qoder_accounts.session_dead(detail)
         # 10605 排队冷却为模型级或账号级
@@ -7893,10 +7990,10 @@ def _alt_realm_ready(realm, model=""):
     base = realm or detect_model_realm(model) or CURRENT_REALM
     base = base if base in ("cn", "intl") else "cn"
     other = "intl" if base == "cn" else "cn"
-    if not other or other == base:
+    if not other or other == base or exclusive_realm(model):
         return ""
     try:
-        return other if _realm_ready_total(other, model) > 0 else ""
+        return other if POOL and POOL.count_ready(other, model=model or None) > 0 else ""
     except Exception:
         return ""
 
@@ -8632,6 +8729,9 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
         # issue #86：钉死账号时区域跟随该账号（自动路由可能把它换掉）
         target_realm = getattr(only_account, "realm", "") or None
     realm = target_realm or detect_model_realm(model) or CURRENT_REALM
+    owner = exclusive_realm(model)
+    if owner and realm != owner:
+        raise UpstreamStatus(400, "model is only available in realm '%s'; refusing cross-realm fallback" % owner)
     if not target_realm:
         # 步2：只在**用户没显式指定**时，按账号可用性兜底换区
         if POOL and allowed_uids is not None:
@@ -8974,7 +9074,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                     last_error = exc
                     continue
                 # issue #108：额度类 403 长冷却换号，不吃 single_account 的 3s clamp
-                if _note_quota_cooldown(account, exc.code, detail, "HTTP"):
+                if _note_quota_cooldown(account, exc.code, detail, "HTTP", model=model):
                     if session_key and POOL:
                         POOL.affinity.unbind(session_key)
                     last_error = exc
@@ -9488,18 +9588,26 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
                                   "aggregate-tool-tag")
     if not tool_calls_map:
         _raise_unstructured_tool_echo(message.get("content") or "", allowed_names)
-    # 二次防御：剔除「无函数名」的空 tool_call，防止客户端死等
-    if tool_calls_map:
-        tool_calls_map = {k: v for k, v in tool_calls_map.items()
-                          if (v.get("function") or {}).get("name")}
+    # Never erase native calls into successful empty completion.
+    if any(not (v.get("function") or {}).get("name") for v in tool_calls_map.values()):
+        raise EmptyToolEcho(0, "missing_tool_name")
+    for entry in tool_calls_map.values():
+        args = (entry.get("function") or {}).get("arguments") or ""
+        if args.strip():
+            try:
+                json.loads(args)
+            except (ValueError, TypeError):
+                raise EmptyToolEcho(len(args), "truncated_arguments")
     if tool_calls_map:
         ordered = [tool_calls_map[k] for k in sorted(tool_calls_map.keys())]
         message["tool_calls"] = ordered
         if finish in ("stop", None):
             finish = "tool_calls"
     elif finish == "tool_calls":
-        # 占位被全部过滤掉 -> 降级为正常结束，防止客户端无限挂起
-        finish = "stop"
+        raise EmptyToolEcho(0, "missing_tool_call")
+    if (allowed_names and not tool_calls_map and not message.get("content", "").strip()
+            and finish not in ("length", "content_filter")):
+        raise EmptyToolEcho(0, "reasoning_only" if reasoning else "empty_tool_turn")
     out = {
         "id": resp_id or "chatcmpl-qoder",
         "object": "chat.completion",
@@ -12353,7 +12461,8 @@ class Handler(BaseHTTPRequestHandler):
             if _cnt:
                 out["advice"] += " 当前队列长度约 %d。" % _cnt
         elif out["kind"] in ("exhausted", "daily"):
-            out["advice"] = "账号额度/次数问题，不是排队；充值或换号。"
+            out["advice"] = ("上游模型额度/套餐权限或次数限制，不等于总余额耗尽；"
+                             "先核对实际账号、区域、模型和额度更新时间，再决定是否充值或换号。")
         return self._json(200, out)
 
     def _handle_diag_checkin(self, payload):
@@ -13460,6 +13569,7 @@ class Handler(BaseHTTPRequestHandler):
                             pass
                 if pump_exc is not None and isinstance(
                         pump_exc, InvalidToolArguments) \
+                        and not getattr(pump_exc, "integrity_failure", False) \
                         and tool_echo_mode() == "lenient":
                     # issue #135：上游只吐了工具协议残片（Qwen3.8-Flash 实测高频）。
                     # strict（默认）会让这一轮流以 response.failed 结束，某些客户端
@@ -13930,7 +14040,7 @@ class Handler(BaseHTTPRequestHandler):
                             for line in sse_with_heartbeat(
                                     recover_leaked_tool_calls(
                                         iter_inner_sse(cur, holder=holder),
-                                        allowed_names=_tool_names_from_payload(payload)),
+                                        allowed_names=_tool_names_from_payload(payload), audit=usage_ctx),
                                     self._sse_write):
                                 if first_ms is None:
                                     first_ms = int((time.time() - t_start) * 1000)

@@ -3121,9 +3121,9 @@ _r16b3, _r16b3_error = _partial16(
 check("B3 截断落在未写完的 \\uXXXX 转义 -> 明确失败",
       isinstance(_r16b3_error, P.EmptyToolEcho)
       and P.LEAK_MARKER not in _txt16(_r16b3))
-_r16c = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
-    iter([_raw27(_C16), _raw27("", "stop")]), _N16)]
-check("C [工具结果] 回声（回归）-> 吞", "[工具结果" not in _txt16(_r16c))
+_r16c, _r16c_error = _partial16([_raw27(_C16), _raw27("", "stop")])
+check("C 工具结果回声吞后无正文/调用，明确失败而非空成功",
+      "[工具结果" not in _txt16(_r16c) and isinstance(_r16c_error, P.EmptyToolEcho))
 check("B3 判据单元：未完成 / 彻底非法转义都视为可继续扩展",
       P._json_array_prefix_ok('[{"a": "x\\u63a') is True
       and P._json_array_prefix_ok('[{"a": "x\\uZZZZ') is True
@@ -3456,41 +3456,32 @@ check("#11 hold-back：标记未打完要压住，证伪（散文）立即放行
       and P._echo_hold_candidate(_TR31 + "]") is True)
 
 # --- 31.2 #11 三条链路端到端（复用 [27] 段的帧辅助） ---
-_fr31_drop = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
-    iter([_raw27(_PROD31[:10]), _raw27(_PROD31[10:]), _raw27("", "stop")]),
-    _NAMES31)]
-_text31_drop = "".join(_f["choices"][0]["delta"].get("content") or ""
-                       for _f in _fr31_drop)
-check("#11 流式：开闭对回声被吞（正文空、无标记泄漏、finish_reason 仍 stop）",
-      _text31_drop == ""
-      and _TR31 not in json.dumps(_fr31_drop, ensure_ascii=False)
-      and _fr31_drop[-1]["choices"][0]["finish_reason"] == "stop",
-      _text31_drop)
+_fr31_raw, _fr31_error = _collect_truncated_error(P.recover_leaked_tool_calls(
+    iter([_raw27(_PROD31[:10]), _raw27(_PROD31[10:]), _raw27("", "stop")]), _NAMES31))
+check("#11 流式：回声被吞后无实际调用，明确失败", isinstance(_fr31_error, P.EmptyToolEcho)
+      and _TR31.encode() not in b"".join(_fr31_raw))
 _trunc31 = _TR31 + "]\n" + '{"output": "partial'
-_fr31_tr = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
-    iter([_raw27(_trunc31[:8]), _raw27(_trunc31[8:]), _raw27("", "stop")]),
-    _NAMES31)]
-_text31_tr = "".join(_f["choices"][0]["delta"].get("content") or ""
-                     for _f in _fr31_tr)
-check("#11 流式：截断回声被吞（正文空）", _text31_tr == "", _text31_tr)
+_fr31_raw2, _fr31_error2 = _collect_truncated_error(P.recover_leaked_tool_calls(
+    iter([_raw27(_trunc31[:8]), _raw27(_trunc31[8:]), _raw27("", "stop")]), _NAMES31))
+check("#11 流式：截断结果回声不能伪成功", isinstance(_fr31_error2, P.EmptyToolEcho))
 _fr31_keep = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
     iter([_raw27(_TR31 + "] 这是一段解释文字。"), _raw27("", "stop")]), _NAMES31)]
 _text31_keep = "".join(_f["choices"][0]["delta"].get("content") or ""
                        for _f in _fr31_keep)
 check("#11 流式：散文形态原样透传（fail-open 不吞字）",
       _TR31 in _text31_keep and "解释文字" in _text31_keep, _text31_keep)
-_obj31 = P.aggregate_stream(
-    _Resp27([_env27(_PROD31[:12]), _env27(_PROD31[12:]), _env27("", "stop")]),
-    "m31", None, allowed_names=_NAMES31)
-_msg31 = _obj31["choices"][0]["message"]
-check("#11 非流式：content 清空、无 tool_calls、finish=stop（与 #9 同语义）",
-      _msg31.get("content") == "" and not _msg31.get("tool_calls")
-      and _obj31["choices"][0]["finish_reason"] == "stop", _msg31)
-_ev31 = "".join(f.decode() for f in P.stream_responses_events(
-    iter([_raw27(_PROD31[:12]), _raw27(_PROD31[12:]), _raw27("", "stop")]),
+_aggregate31_error = None
+try:
+    P.aggregate_stream(_Resp27([_env27(_PROD31[:12]), _env27(_PROD31[12:]), _env27("", "stop")]),
+                       "m31", None, allowed_names=_NAMES31)
+except P.EmptyToolEcho as exc:
+    _aggregate31_error = exc
+check("#11 非流式：纯结果回声吞后必须失败", isinstance(_aggregate31_error, P.EmptyToolEcho))
+_ev31_raw, _ev31_error = _collect_truncated_error(P.stream_responses_events(
+    P.recover_leaked_tool_calls(iter([_raw27(_PROD31[:12]), _raw27(_PROD31[12:]), _raw27("", "stop")]), _NAMES31),
     "m31", {"usage": None, "custom_names": set(), "allowed_names": _NAMES31}))
-check("#11 Responses 流式：事件里既无开标记也无闭标记",
-      _TR31 not in _ev31 and _TC31 not in _ev31)
+check("#11 Responses：无正常完成，且回声不泄漏", isinstance(_ev31_error, P.EmptyToolEcho)
+      and b"response.completed" not in b"".join(_ev31_raw) and _TR31.encode() not in b"".join(_ev31_raw))
 
 # --- 31.3 标记常量契约：写入侧引用常量 + 写出字节逐字节不变 ---
 _src31 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -3794,8 +3785,8 @@ check("#16·B3（原样样本：\\u63a 未写完转义）→ 内容不含标记�
       _M16 not in _text16(_frB316) and _fin16(_frB316) == "error",
       _text16(_frB316))
 _frC16 = _frames16([_f33(_C16[:8]), _f33(_C16[8:]), _f33("", "stop")])
-check("#16·C（原样样本：工具结果回声）→ 不含 \"[工具结果\"、finish=stop（#11 回归保护）",
-      "[工具结果" not in _text16(_frC16) and _fin16(_frC16) == "stop",
+check("#16·C（原样样本：工具结果回声）→ 不含 \"[工具结果\"、明确失败（#11 空成功回归保护）",
+      "[工具结果" not in _text16(_frC16) and _fin16(_frC16) == "error",
       _text16(_frC16))
 
 # --- hold 上限：长文本以 [ 开头且久不闭合必须放行（不得无限缓冲） ---
