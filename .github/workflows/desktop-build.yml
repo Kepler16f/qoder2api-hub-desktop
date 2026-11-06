@@ -4,9 +4,13 @@ name: Desktop builds
 #   windows-latest   → Qoder2API-Hub-setup-windows-x64.exe   （Inno Setup，按用户安装）
 #   windows-11-arm   → Qoder2API-Hub-setup-windows-arm64.exe （原生 WOA，Inno 6.7 的
 #                                                       安装器本体为 x86，WOA 仿真可跑）
-#   macos-14         → Qoder2API-Hub-macos-arm64.dmg         （ad-hoc 签名 + DMG）
+#   macos-15         → Qoder2API-Hub-macos-arm64.dmg         （ad-hoc 签名 + DMG）
 #   ubuntu-22.04     → qoder2api-hub-linux-x64.deb           （pywebview+WebKit2GTK）
 #   ubuntu-24.04-arm → qoder2api-hub-linux-arm64.deb         （同上，系统库不进包）
+#
+# 2026-11-06：macos 产线由 macos-14 改为 macos-15——GitHub 已下线
+# macos-14 的 arm64 变体（报 "The configuration 'macos-14-arm64-us-default'
+# is not supported"，job 1 秒即失败）。macos-15 的默认架构是 Apple Silicon。
 #
 # GUI 不在 CI 里自动化（无显示服务器），每条产线以 --smoke-test 无头冒烟为准；
 # GUI/深色模式/安装卸载链路已在 WOA 真机人工验证。
@@ -32,7 +36,7 @@ jobs:
         include:
           - { os: windows-latest,   target: windows-x64,   py: "3.12" }
           - { os: windows-11-arm,   target: windows-arm64, py: "3.12" }
-          - { os: macos-14,         target: macos-arm64,   py: "3.12" }
+          - { os: macos-15,         target: macos-arm64,   py: "3.12" }
           - { os: ubuntu-22.04,     target: linux-x64,     py: "3.12" }
           - { os: ubuntu-24.04-arm, target: linux-arm64,   py: "3.12" }
 
