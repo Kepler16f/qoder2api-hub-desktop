@@ -4,7 +4,7 @@
     "name": "English",
     "dir": "ltr",
     "order": 10,
-    "version": 16
+    "version": 17
   },
   "messages": {
     "简体中文": "Simplified Chinese",
@@ -951,7 +951,9 @@
     "最近一次积分变化 {0}{1}": "Last credit change {0}{1}",
     "冷却 {0}s": "Cooldown {0}s",
     "共享 {0}": "Shared {0}",
-    "共享额度（团队/企业池）：已用 {0} · 总量 {1}": "Shared quota (team / enterprise pool): used {0} · total {1}",
+    "共享：已用 {0} / 上限 {1} · 剩余 {2}": "Shared: used {0} / limit {1} · remaining {2}",
+    "共享：已用 {0} / 上限 {1}": "Shared: used {0} / limit {1}",
+    "{0}（不可用）": "{0} (unavailable)",
     "上游返回全 0 额度：{0}（{1}）": "Upstream returned an all-zero quota: {0} ({1})",
     "上游返回空额度（{0}）": "Upstream returned an empty quota ({0})",
     "更新于 {0}": "Updated {0}",
@@ -1069,6 +1071,7 @@
     "官方风控判定：是虚拟机（评分 {0}，类型码 {1}）": "Upstream risk verdict: VM (score {0}, type {1})"
   },
   "fragments": {
+    "不限量": "Unlimited",
     "将下载官方最新版本并自动重启网关。 更新前会自动备份当前代码到 backups/，失败会回滚。 确认继续？": "The latest official version will be downloaded and the gateway restarted automatically. The current code is backed up to backups/ first; a failed update rolls back. Continue?",
     " 个 Key 生效": " keys active",
     " 个 Key": " keys",

@@ -6256,6 +6256,16 @@ function creditsDeltaChip(a){
   return '<span class="delta-chip ' + cls + '" title="最近一次积分变化 ' + txt
     + (when ? ("（" + esc(when) + "）") : "") + '">' + esc(txt) + "</span>";
 }
+// 共享用量与个人额度分开显示，已用值无需悬停即可查看。
+function sharedCreditsTag(shared){
+  if(!shared || shared.remain == null) return '';
+  const unlimited = shared.unlimited || Number(shared.size) < 0;
+  const limit = unlimited ? '不限量' : fmt(shared.size);
+  const remaining = unlimited ? '' : ' · 剩余 ' + fmt(shared.remain);
+  const unavailable = shared.available === false ? '（不可用）' : '';
+  return ' <span style="color:var(--dim);font-size:11px">共享：已用 '
+    + fmt(shared.used) + ' / 上限 ' + limit + remaining + unavailable + '</span>';
+}
 function accountRow(a){
   const realmBadge = a.realm === 'cn'
     ? '<span class="realm-badge-cn">国内版</span>'
@@ -6277,13 +6287,7 @@ function accountRow(a){
               : '<span class="badge ok">可用</span>';
   const err = a.lastError ? '<div class="hint" style="color:var(--warn);margin:2px 0 0">' + esc(a.lastError) + '</div>' : '';
   const cred = a.credits;
-  // issue #39：共享额度（团队/企业/池化）——上游返回时显示在套餐额度之后，
-  // 不返回时保持原样（不编造）。口径：套餐内 remain/size + 共享 remain。
-  const sharedTag = (cred && cred.shared && cred.shared.remain != null)
-    ? ' <span style="color:var(--dim);font-size:11px" title="共享额度（团队/企业池）：' +
-      '已用 ' + fmt(cred.shared.used) + ' · 总量 ' + fmt(cred.shared.size) + '">共享 ' +
-      fmt(cred.shared.remain) + '</span>'
-    : '';
+  const sharedTag = sharedCreditsTag(cred && cred.shared);
   // issue #141 后续：额度构成就贴在该账号的积分旁边（不再要求去别处看）
   let compLine = '';
   if(cred && Array.isArray(cred.composition) && cred.composition.length){

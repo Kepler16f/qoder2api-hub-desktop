@@ -115,7 +115,10 @@ def _bucket_from(src, kind, name):
     if remain is None:
         remain = _num_or_none(src.get("balance"))
     used = _num_or_none(src.get("used"))
-    size = _num_or_none(src.get("total"))
+    # 共享池 cap 是成员使用上限（-1 表示不限量），优先于 total。
+    size = _num_or_none(src.get("cap")) if kind == "shared" else None
+    if size is None:
+        size = _num_or_none(src.get("total"))
     if size is None:
         size = _num_or_none(src.get("cap"))
     if size is None:
@@ -145,7 +148,9 @@ def _bucket_from(src, kind, name):
            "remain": int(remain or 0), "used": int(used or 0),
            "size": int(size or 0)}
     if src.get("available") is not None:
-        out["available"] = bool(src.get("available"))
+        out["available"] = _truthy(src.get("available"))
+    if kind == "shared" and out["size"] < 0:
+        out["unlimited"] = True
     for key in ("expiresAt", "expireAt", "expires_at", "expiredAt",
                 "validUntil", "dueAt"):
         if src.get(key) is not None:
@@ -3293,6 +3298,10 @@ class Account(object):
         """把归一化的「构成」落成 credits 结构（issue #141）。"""
         comp = list(norm.get("composition") or [])
         shared = next((b for b in comp if b.get("kind") == "shared"), None)
+        shared_remain = int(shared.get("remain") or 0) if (
+            shared and shared.get("available", True)
+            and not shared.get("unlimited")) else 0
+        previous = effective_remain(self.credits)
         packages = []
         for b in comp:
             if b.get("kind") == "shared":
@@ -3308,6 +3317,7 @@ class Account(object):
             packages.append(item)
         self.credits = {
             "remain": int(norm.get("remain") or 0),
+            "remain_effective": int(norm.get("remain") or 0) + shared_remain,
             "used": int(norm.get("used") or 0),
             "size": int(norm.get("size") or 0),
             "exceeded": bool(norm.get("exceeded")),
@@ -3321,6 +3331,13 @@ class Account(object):
             "updated_at": time.time(),
             "updated_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
+        current = self.credits["remain_effective"]
+        try:
+            if previous is not None and int(previous) != current:
+                self.last_credits_delta = current - int(previous)
+                self.last_credits_delta_at = time.time()
+        except (TypeError, ValueError, OverflowError):
+            pass  # 旧快照的坏数值不能阻止本次有效查询。
         self.last_quota_anomaly = None
         self.credits_degraded = None
         self.revive_balance_cooldown()
@@ -3342,7 +3359,8 @@ class Account(object):
         except Exception:
             return None
         norm = normalize_quota_payload(body, self.realm)
-        if not norm or not norm.get("size"):
+        # size 不含共享池：仅共享额度时为 0；个人全 0 退化体仍不采纳。
+        if not norm or (not norm.get("size") and "shared" not in norm["fields"]):
             return None
         norm["source"] = host + path
         return self._credits_from_composition(norm)
@@ -3471,8 +3489,14 @@ class Account(object):
         # 保守性：任一信号单独出现都放行——真·余额归零与新号不受影响。
         both_missing = (not isinstance(q.get("userQuota"), dict)
                         and not isinstance(q.get("addOnQuota"), dict))
+        if both_missing and _comp:
+            # 组织成员可只返回 orgResourcePackage，缺个人额度不代表查询失败。
+            _norm["source"] = url
+            return self._credits_from_composition(_norm)
+        has_shared = any(b.get("kind") == "shared" for b in _comp)
         degenerate = both_missing or (bool(q.get("isQuotaExceeded"))
-                                      and remain == 0 and size == 0)
+                                      and remain == 0 and size == 0
+                                      and not has_shared)
         if degenerate:
             return self._note_quota_anomaly(
                 q, "both quota objects missing" if both_missing
