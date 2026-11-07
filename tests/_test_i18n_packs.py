@@ -37,6 +37,10 @@ def squash(s):
 
 
 dash_sq = squash(dash)
+# Dynamic labels and model descriptions are also served by backend modules.
+backend_source = "\n".join(io.open(os.path.join(ROOT_DIR,n),encoding="utf-8").read()
+                           for n in ("qoder_proxy.py","qoder_accounts.py","qoder_agents.py","qoder_catalog.py","qoder_fingerprint.py"))
+ui_source = dash + "\n" + backend_source
 
 # ---------------------------------------------------------------------------
 # fork 豁免：两批文案在本 fork 刻意不与上游一致，它们在 dashboard.html 里
@@ -173,7 +177,7 @@ for name in packs:
         if k in FORK_EXEMPT_PATTERNS:
             continue
         parts = [p.strip() for p in re.split(r"\{\d+\}", k) if len(p.strip()) >= 4]
-        if parts and not any(p in dash for p in parts):
+        if parts and not any(p in ui_source for p in parts):
             dead_pat.append(k)
     check("%s 的 pattern 片段能在源码里找到（找不到说明这条永远不会命中）"
           % name, not dead_pat, dead_pat[:3])
