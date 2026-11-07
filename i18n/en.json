@@ -4,9 +4,15 @@
     "name": "English",
     "dir": "ltr",
     "order": 10,
-    "version": 17
+    "version": 18
   },
   "messages": {
+    "剩余 / 总额度": "Remaining / total credits",
+    "剩余额度": "Credits remaining",
+    "共享额度": "Shared credits",
+    "个人额度": "Personal credits",
+    "个人 + 共享": "Personal + shared",
+    "共享不可用": "Shared credits unavailable",
     "简体中文": "Simplified Chinese",
     "导入后刷新账号列表失败:": "Failed to refresh account list after import:",
     "导入后刷新面板失败:": "Failed to refresh panel after import:",
@@ -816,6 +822,7 @@
     "不指定 Key（管理员预览）": "No key (administrator preview)"
   },
   "patterns": {
+    "个人 {0} / {1}": "Personal {0} / {1}",
     "{0} 个可用 · {1} 个未参与调度": "{0} available · {1} not scheduled",
     "{0} · 共 {1} 个模型": "{0} · {1} models",
     "已保存 · {0} 层": "Saved · {0} tiers",
@@ -951,9 +958,6 @@
     "最近一次积分变化 {0}{1}": "Last credit change {0}{1}",
     "冷却 {0}s": "Cooldown {0}s",
     "共享 {0}": "Shared {0}",
-    "共享：已用 {0} / 上限 {1} · 剩余 {2}": "Shared: used {0} / limit {1} · remaining {2}",
-    "共享：已用 {0} / 上限 {1}": "Shared: used {0} / limit {1}",
-    "{0}（不可用）": "{0} (unavailable)",
     "上游返回全 0 额度：{0}（{1}）": "Upstream returned an all-zero quota: {0} ({1})",
     "上游返回空额度（{0}）": "Upstream returned an empty quota ({0})",
     "更新于 {0}": "Updated {0}",
