@@ -70,4 +70,11 @@ with mock.patch.object(P,'POOL',None):
  try:P.open_upstream({'model':'Sonus','messages':[]},target_realm='cn')
  except P.UpstreamStatus as e:check('wrong-realm model fails before network',e.status==400)
  else:check('wrong-realm model fails before network',False)
+# A nonempty final plan is a normal model stop, not malformed tool protocol.
+plan='Research summary. Next I will try a different analysis approach.'
+plan_audit={}
+out,error=collect(P.recover_leaked_tool_calls(iter([frame({'content':plan},'stop')]),{'run_code'},audit=plan_audit))
+check('planning prose plus stop remains a model stop',error is None and any(c.get('finish_reason')=='stop' for f in parse(out) for c in f.get('choices',[])))
+check('planning prose is not guessed into a tool or replay',not plan_audit.get('output_has_tool_call') and plan_audit.get('output_content_chars')==len(plan))
+check('updater recognizes corrected version as newer',P.qoder_updater._version_tuple('1.9.1')>P.qoder_updater._version_tuple('1.9.0') and P.qoder_updater._version_tuple('1.9.1')>P.qoder_updater._version_tuple('1.8.1'))
 finish()
