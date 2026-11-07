@@ -71,7 +71,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.9.1"
+VERSION = "1.9.2"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -2911,7 +2911,7 @@ def read_local_models(realm=None):
                 plain = json.loads(qmc_decrypt(blob, sub).decode("utf-8"))
             except Exception:
                 continue
-            chat = plain.get("chat") or []
+            chat = qoder_catalog.dialogue_models(plain)
             out = []
             for m in chat:
                 if not isinstance(m, dict) or not m.get("key"):
@@ -3118,7 +3118,7 @@ def fetch_models_merged():
 
 
 def read_dynamic_models(realm=None):
-    """COSY 签名拉取 /algo/api/v2/model/list（chat scene）。失败返回 []。
+    """COSY 签名拉取 /algo/api/v2/model/list（chat + app-only 对话模型）。失败返回 []。
 
     注意：签名的 body 是 qoder_encode("{}")，请求必须**带同款 body**发出
     （服务端校验签名与 body 一致，裸 GET 会 403）。
@@ -3149,7 +3149,7 @@ def read_dynamic_models(realm=None):
             log("model discovery failed on %s: %s" % (host, exc))
     if payload is None:
         return []
-    chat = payload.get("chat") or []
+    chat = qoder_catalog.dialogue_models(payload)
     out = []
     for m in chat:
         if not isinstance(m, dict):
