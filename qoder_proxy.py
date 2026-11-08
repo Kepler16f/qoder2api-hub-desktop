@@ -2525,6 +2525,9 @@ def runtime_settings_view():
         # issue #135：工具协议残片收尾策略（面板可切换，立即生效）
         "tool_echo_mode": tool_echo_mode(),
         "tool_echo_mode_env": (os.environ.get("QD_TOOL_ECHO_MODE") or "").strip().lower(),
+        # issue #146：Anthropic thinking block 输出策略
+        "anthropic_thinking": anthropic_thinking_mode(),
+        "anthropic_thinking_env": (os.environ.get("QD_ANTHROPIC_THINKING") or "").strip().lower(),
         # issue #106：各模型上下文档（面板回显 + 客户端可查）
         "model_context": _model_context_snapshot(),
         "web_tools_rounds": WEB_TOOLS_MAX_ROUNDS,
@@ -7736,6 +7739,25 @@ def tool_echo_mode():
         val = ""
     return val if val in ("strict", "lenient") else TOOL_ECHO_MODE
 
+
+def anthropic_thinking_mode(key_entry=None):
+    """Anthropic 入口 thinking block 输出策略（issue #146）：empty | off。
+
+    优先级：1) 每 Key 覆盖  2) 面板全局设置  3) 环境变量 QD_ANTHROPIC_THINKING  4) off。
+    """
+    if isinstance(key_entry, dict):
+        key_mode = str(key_entry.get("anthropic_thinking") or "").strip().lower()
+        if key_mode in ("empty", "off"):
+            return key_mode
+    try:
+        panel_mode = str(qoder_settings.anthropic_thinking(ACCOUNTS_DIR) or "").strip().lower()
+    except Exception:
+        panel_mode = ""
+    if panel_mode in ("empty", "off"):
+        return panel_mode
+    env_mode = (os.environ.get("QD_ANTHROPIC_THINKING") or "").strip().lower()
+    return env_mode if env_mode in ("empty",) else "off"
+
 def _neutralize_auth_codes(text):
     """把文字里独立出现的 401/403 改写成 HTTP_401/HTTP_403（issue #137）。"""
     return _AUTH_LIKE_CODE_RE.sub(r"HTTP_\1", str(text or ""))
@@ -12132,6 +12154,7 @@ class Handler(BaseHTTPRequestHandler):
                     # qoder_settings._clean_key_entry 一处完成）。
                     "models": models_val,
                     "note": note_val,
+                    "anthropic_thinking": (item.get("anthropic_thinking", _prev.get("anthropic_thinking") or "")),
                     "account_ids": item.get("account_ids", _prev.get("account_ids") or []),
                     "account_groups": item.get("account_groups", _prev.get("account_groups") or []),
                 })
@@ -12140,6 +12163,10 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as error:
                 return self._error(400, str(error), "invalid_request_error")
             reply["api_keys_saved"] = len(cleaned)
+        if "anthropic_thinking" in payload:
+            # issue #146：全局 Anthropic thinking 输出模式（empty/off/空串回退）
+            reply["anthropic_thinking"] = qoder_settings.set_anthropic_thinking(
+                ACCOUNTS_DIR, payload.get("anthropic_thinking"))
         if "banned_models" in payload:
             # P1-4：全局封禁列表（逗号/分号/换行分隔均可，清洗在 qoder_settings）。
             reply["banned_models"] = qoder_settings.set_banned_models(
@@ -13185,7 +13212,8 @@ class Handler(BaseHTTPRequestHandler):
                             allowed_names=_tool_names_from_payload(chat_req)),
                         self._sse_write)
                     for frame in qoder_anthropic.stream_anthropic_events(
-                            inner, model, holder):
+                            inner, model, holder,
+                            thinking_mode_override=anthropic_thinking_mode(getattr(self, "key_entry", None))):
                         if first_ms is None:
                             first_ms = int((time.time() - t_start) * 1000)
                         self._sse_write(frame)
@@ -13254,7 +13282,9 @@ class Handler(BaseHTTPRequestHandler):
                              key_id=self._key_id_for_usage())
                 return self._error(502, "upstream stream error: %s" % exc)
             wall = int((time.time() - t_start) * 1000)
-            result = qoder_anthropic.chat_to_messages(chat_obj, model=model)
+            result = qoder_anthropic.chat_to_messages(
+                chat_obj, model=model,
+                thinking_mode_override=anthropic_thinking_mode(getattr(self, "key_entry", None)))
             record_usage(model, chat_obj.get("usage"), stream=False,
                          elapsed_ms=wall, fp=fp, account=account.uid,
                          effort=usage_ctx.get("effort"),
@@ -13823,6 +13853,28 @@ class Handler(BaseHTTPRequestHandler):
                 tag="panel")
             return self._json(200, {"ok": True, "tool_echo_mode": saved,
                                     "effective": tool_echo_mode()})
+        if path == "/settings/anthropic-thinking":
+            # issue #146：Anthropic thinking block 模式切换（empty / off / "" 清除）
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            try:
+                body = self._read_payload()
+            except Exception as exc:
+                return self._error(400, "invalid json: %s" % exc,
+                                   "invalid_request_error")
+            mode = str((body or {}).get("mode") or "").strip().lower()
+            if mode not in ("empty", "off", ""):
+                return self._error(400, "mode must be empty, off, or empty string",
+                                   "invalid_request_error")
+            try:
+                saved = qoder_settings.set_anthropic_thinking(ACCOUNTS_DIR, mode)
+            except Exception as exc:
+                return self._error(500, "save failed: %s" % exc)
+            log("anthropic thinking mode set to %s (panel)" % (saved or "(default)"),
+                tag="panel")
+            return self._json(200, {"ok": True, "anthropic_thinking": saved,
+                                    "effective": anthropic_thinking_mode()})
         if path == "/settings/model-context":
             # issue #106：为某个模型设定上下文档（label="" 清除回到官方默认）
             if not self._panel_ok():
