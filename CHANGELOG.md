@@ -8,7 +8,18 @@
 - 补丁号累计到 **14** 之后，下一次发布升**次版本**并把补丁号归零：
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
-- 本次正式版本 **1.9.2**：在 v1.9.1 草稿基础上追加 QoDuck 与共享额度修复；保留已有标签，恢复正常语义版本递增。
+- 本次正式版本 **1.9.3**：支持 Transfer-Encoding: chunked 请求体与多粒度 thinking block 配置。
+
+
+## v1.9.3 — 支持 chunked 请求体与多粒度 thinking block 配置
+
+### 1. 支持 Transfer-Encoding: chunked 请求体（合并 PR #148）
+- 修复 Claude Code (undici) 大请求体下使用 chunked 传输被误判为空 body 并报错 400 `messages is required` 的问题。
+- 新增 `_read_chunked_body()` 逐分块解析与错误处理，并在 `_read_payload()` 中增加分支支持。
+
+### 2. Anthropic thinking block 判据补充与多粒度覆盖（Issue #146）
+- 在文档中补充 `QD_ANTHROPIC_THINKING=empty` 的安全判定标准，说明在反代场景下下游无验签方时的安全性。
+- 支持按 Key、面板全局、环境变量的多级覆盖粒度，并增加 `/settings/anthropic-thinking` 端点实现热生效。
 
 
 ## v1.9.2 — 模型目录、工具流完整性、额度与英文界面整合发布
