@@ -11977,8 +11977,67 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _read_chunked_body(self, max_bytes=MAX_PAYLOAD_BYTES):
+        """Decode a Transfer-Encoding: chunked request body into bytes.
+
+        Some clients (Claude Code / undici in particular) stream large
+        /v1/messages bodies with chunked encoding instead of Content-Length.
+        Reading only Content-Length made the payload look empty, so the
+        Anthropic bridge answered "messages is required" and the unread chunk
+        frames were parsed as bogus HTTP requests on the keep-alive socket.
+        """
+        chunks = []
+        total = 0
+        while True:
+            line = self.rfile.readline(65536)
+            if not line:
+                break
+            size_field = line.split(b";", 1)[0].strip()
+            if not size_field:
+                continue
+            try:
+                size = int(size_field, 16)
+            except ValueError:
+                raise BadJSON()
+            if size == 0:
+                # Consume optional trailers up to the terminating blank line.
+                while True:
+                    trailer = self.rfile.readline(65536)
+                    if not trailer or trailer in (b"\r\n", b"\n"):
+                        break
+                break
+            total += size
+            if total > max_bytes:
+                # The current chunk has not been read; close rather than
+                # parsing its data as another chunk header.
+                self.close_connection = True
+                raise BodyTooLarge(total)
+            remaining = size
+            while remaining > 0:
+                data = self.rfile.read(min(remaining, 65536))
+                if not data:
+                    raise BadJSON()
+                chunks.append(data)
+                remaining -= len(data)
+            self.rfile.read(2)  # CRLF after the chunk data
+        return b"".join(chunks)
+
     def _read_payload(self, max_bytes=MAX_PAYLOAD_BYTES, allow_list=False):
         """Parse the request body into a dict (or a list when allow_list)."""
+        transfer_encoding = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in transfer_encoding:
+            try:
+                raw = self._read_chunked_body(max_bytes=max_bytes)
+                data = json.loads(raw.decode("utf-8", "replace") or "{}")
+            except (BodyTooLarge, BadJSON):
+                raise
+            except Exception:
+                raise BadJSON()
+            if isinstance(data, dict):
+                return data
+            if allow_list and isinstance(data, list):
+                return data
+            return {}
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except Exception:
