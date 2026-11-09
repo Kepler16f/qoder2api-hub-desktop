@@ -1,7 +1,7 @@
 # Qoder2API-Hub Desktop — Qoder 双区多账号网关 · 开箱即用桌面客户端
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-1.0.12_R-2496ED?style=flat-square" alt="Version 1.0.12_R">
+  <img src="https://img.shields.io/badge/Release-1.0.13_R-2496ED?style=flat-square" alt="Version 1.0.13_R">
   <img src="https://img.shields.io/badge/Desktop-Win_x64_·_Win_ARM64_·_macOS_·_Linux-8A2BE2?style=flat-square" alt="Desktop Platforms">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
@@ -228,6 +228,11 @@ curl http://127.0.0.1:8790/v1/chat/completions \
 >   天然不撞。历史号对应：`2026.10.07` ≈ 2026.10.7.1_upstream（上游 v1.2.18）、
 >   `2026.10.08` ≈ 2026.10.8.1_re（上下文压缩）；更早的「网关 1.2.18/1.2.19/
 >   1.2.20」是 fork 旧连号（1.2.18 与上游撞车才改制），仅为历史记录。
+
+### v1.0.13_R — 桌面版：随网关 2026.11.07.1_upstream–2026.11.09.1_upstream 发布
+
+随上一条目发布的桌面版——并入上游 v1.9.2–v1.9.4：**面板管理台 + 档位路由工作台**（面板内可达、密码鉴权）、**面板视觉重构**（登录转场/滚动预触发/控件统一，桌面客户端设置区与局域网访问逐符号存活）、**Claude Code 大请求体 400 修复**（#148，chunked 请求体支持）、Anthropic thinking block 多粒度配置（#146，默认不改现有行为）、**账号额度合并口径**（#145，个人+共享合并展示、仅共享额度账号不再误判）、新模型可见（#144，QoDuck 等 app-only 模型）。一键更新维持剔除（桌面更新走安装包）。
+发布说明见 [Releases](https://github.com/Kepler16f/qoder2api-hub-desktop/releases/tag/v1.0.13_R)。
 
 ### v1.0.12_R — 桌面版：随网关 2026.11.06.1_upstream 发布
 
