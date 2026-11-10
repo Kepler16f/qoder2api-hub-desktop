@@ -211,6 +211,10 @@ curl http://127.0.0.1:8790/v1/chat/completions \
 | `start-qoder-proxy.sh` / `start-qoder-proxy-lan.sh` | Linux / macOS 启动脚本，分别对应 Windows 的 `start-qoder-proxy.bat` / `start-qoder-proxy-lan.bat`（探测 Python 3.9+ 运行时候选，`exec` 启动使进程生命周期 = 终端生命周期） |
 | `allow-firewall.sh` | Linux / macOS 放行防火墙，对应 `allow-firewall.bat`（自动识别 ufw / firewalld / nftables / iptables；WSL2 打印 Windows 侧规则与 portproxy 命令） |
 
+## 赞助商
+
+> 目前还没有赞助商。想出现在这里，联系 **zhang8586201314@gmail.com**
+
 ---
 
 ## 七、版本与更新日志 (Changelog)

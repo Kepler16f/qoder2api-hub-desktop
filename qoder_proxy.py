@@ -312,7 +312,16 @@ from pathlib import Path
 # 11-09：.1_upstream = 并入上游 v1.9.2-v1.9.4（7 提交：v1.9.2 QoDuck app-only 模型发现（catalog + 双区快照）；v1.9.3 chunked 请求体支持（PR #148——Claude Code/undici 大载荷用 Transfer-Encoding: chunked 发 /v1/messages，旧版只读 Content-Length 会判空误报 400 messages is required，未消费 chunk 帧还污染 keep-alive）+ Anthropic thinking block 多粒度配置（#146，Key/面板/环境变量三级，默认空=跟随现行为，不动「思考开着」红线）；# v1.9.4 面板视觉重构（登录转场/滚动预触发/全站控件统一，dashboard +551）。
 # fork 缝合：登录后流程保上游 await pDash（等首屏 promise）+ fork 的会话过期重登定时器重建（startDashboard 幂等守卫会让失效会话上的定时器停摆）。上游同一区间发到
 # VERSION 1.9.4，本 fork 继续日期制版本号）。
-VERSION = "2026.11.09.1_upstream"
+# 11-11：.1_upstream = 并入上游 v1.9.5-v1.9.6（PR #150 企业 VPC 专属域：
+# QD_CN_VPC_ENDPOINT 从实例名/专属域统一推导 CN 登录/OpenAPI/推理三主机，
+# 未配置保持原行为；VPC 模式隔离凭证探测、重定向限制本实例 HTTPS 端口、
+# fake-IP DNS 混入真实私网地址仍拒绝；#149 统计概览频闪修复——无限循环
+# 动画改静态圆点+hover。fork 缝合：VPC redirect 校验收进统一 opener
+# （UpstreamOpener.open 按 VPC 主机附加 _VpcRedirectHandler，覆盖 chat
+# 之外的全部 openapi 调用，_stub 注入点不变），_opener_for_request 保
+# UPSTREAM_OPENER 单例。上游同一区间发到 VERSION 1.9.6，本 fork 继续
+# 日期制版本号）。
+VERSION = "2026.11.11.1_upstream"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -360,6 +369,19 @@ _FAKEIP_NETS = [
     ipaddress.ip_network("2001:2::/48"),
     ipaddress.ip_network("fdfe:dcba:9876::/48"),
 ]
+# 与 qoder_accounts 同款：macOS 的 getaddrinfo 会同时返回 IPv4 与
+# IPv4-translated IPv6（::ffff:0:c612:2d），需要按内嵌 IPv4 识别 fake-IP。
+_FAKEIP_V4_TRANSLATED = ipaddress.ip_network("::ffff:0:0:0/96")
+
+
+def _is_fake_ip(ip):
+    candidates = [ip]
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            candidates.append(ip.ipv4_mapped)
+        elif ip in _FAKEIP_V4_TRANSLATED:
+            candidates.append(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
+    return any(addr in net for addr in candidates for net in _FAKEIP_NETS)
 
 
 def _host_boundary_violation(ip, allow_local):
@@ -386,6 +408,10 @@ def validate_public_http_url(url, allow_local=False):
     host = (parsed.hostname or "").strip().strip("[]").lower()
     if not host:
         raise ValueError("URL host is required")
+    # 企业 VPC 专属域通常解析到公司内网；只放行 QD_CN_VPC_ENDPOINT
+    # 推导出的固定主机，普通公网 URL 的校验逻辑保持不变。
+    if qoder_accounts.is_configured_vpc_host(host):
+        return url
     if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
         if not allow_local:
             raise ValueError("requests to localhost are not allowed")
@@ -411,7 +437,7 @@ def validate_public_http_url(url, allow_local=False):
             addrs.append(ipaddress.ip_address(addr))
         except ValueError:
             raise ValueError("URL host resolved to a non-IP address: %r" % addr)
-    if addrs and all(any(ip in net for net in _FAKEIP_NETS) for ip in addrs):
+    if addrs and all(_is_fake_ip(ip) for ip in addrs):
         return url  # fake-IP DNS：真实 IP 不可见，名称级校验已通过
     for ip in addrs:
         if _host_boundary_violation(ip, allow_local):
@@ -15868,6 +15894,15 @@ def main(argv=None):
                     help="write the server PID to this file (stop.bat uses it; "
                          "removed on exit)")
     args = ap.parse_args(argv)
+    args = ap.parse_args()
+    if qoder_accounts.vpc_config_error():
+        sys.stderr.write(
+            "[ERROR] invalid QD_CN_VPC_ENDPOINT: %s\n"
+            "        expected an instance name (e.g. acme) or one of\n"
+            "        acme.vpc.qoder.com.cn / acme-openapi.vpc.qoder.com.cn /\n"
+            "        acme-gateway.vpc.qoder.com.cn\n"
+            % qoder_accounts.vpc_config_error())
+        raise SystemExit(1)
     qoder_logpaths.install_stream_logging(os.path.dirname(os.path.abspath(__file__)))
     if not args.usage_dir and not os.environ.get("QD_PROXY_USAGE_DIR"):
         _migration = qoder_logpaths.migrate_legacy_usage(
@@ -16094,7 +16129,16 @@ def main(argv=None):
                                   rep.domain if rep else "-"))
     log("realm      : %s (%s)" % (
         CURRENT_REALM,
-        "qoder.com" if CURRENT_REALM == "intl" else "qoder.com.cn"))
+        get_realm_config(CURRENT_REALM).get("domain") or "qoder.com.cn"))
+    if qoder_accounts.vpc_configured():
+        _cn = qoder_accounts.get_realm_config("cn")
+        log("vpc        : %s (openapi=%s gateway=%s)"
+            % (qoder_accounts.vpc_instance(), _cn["openapi"], _cn["gateway"]),
+            tag="realm")
+        if CURRENT_REALM != "cn":
+            log("VPC endpoint is CN-only, but the current realm is %s - "
+                "switch to CN in the dashboard or set QD_PROXY_DEFAULT_REALM=cn"
+                % CURRENT_REALM, level="WARN", tag="realm")
     log("catalog    : %s" % (BASEPROMPT_PATH if BASEPROMPT
                              else "baseprompt.json MISSING"))
 
