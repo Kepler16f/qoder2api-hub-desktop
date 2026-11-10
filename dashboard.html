@@ -3246,8 +3246,8 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
 .stat-kpi .s{font-size:11.5px!important;color:var(--text-secondary)!important;margin-top:10px!important;line-height:1.4!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important}
 .stat-kpi::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--viz-success),transparent);opacity:0;transition:opacity .25s ease}
 .stat-kpi:hover::before{opacity:1}
-.stat-kpi:first-child .k::after,.stat-kpi:nth-child(4) .k::after{content:'';display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--viz-success);box-shadow:0 0 8px var(--viz-success);animation:cpPulse 2.4s infinite ease-in-out;margin-left:auto}
-@keyframes cpPulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.85)}}
+.stat-kpi-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--viz-success);box-shadow:0 0 8px var(--viz-success);opacity:.85;margin-left:auto;pointer-events:none}
+.stat-kpi:hover .stat-kpi-dot{opacity:1;box-shadow:0 0 10px var(--viz-success)}
 .stat-kpi .s{font-size:11px!important;color:var(--text-secondary)!important;margin-top:8px!important;line-height:1.4!important}
 
 .stat-grid2{display:grid;gap:16px;grid-template-columns:repeat(2,minmax(0,1fr));margin-bottom:16px!important}
@@ -3265,8 +3265,8 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
 .rank-val{font-size:12px!important;font-weight:600!important;font-family:ui-monospace,monospace!important;color:var(--text-secondary)!important}
 .rank-bar{grid-column:1/-1;height:5px!important;border-radius:999px!important;background:var(--bg-tertiary)!important;overflow:hidden!important}
 .rank-bar>i{position:relative;background:linear-gradient(90deg,var(--viz-success),color-mix(in srgb,var(--viz-success) 70%,#38bdf8))!important;box-shadow:0 0 10px color-mix(in srgb,var(--viz-success) 35%,transparent)!important;border-radius:999px!important}
-.rank-bar>i::after{content:'';position:absolute;top:0;bottom:0;left:0;right:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.35),transparent);transform:translateX(-100%);animation:barShimmer 3.2s infinite ease-in-out}
-@keyframes barShimmer{0%{transform:translateX(-100%)}45%,100%{transform:translateX(100%)}}
+.rank-bar>i::after{content:'';position:absolute;top:0;bottom:0;left:0;right:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.2),transparent);opacity:0;transition:opacity .2s ease}
+.rank-row:hover .rank-bar>i::after{opacity:1}
 
 .heat-wrap{overflow-x:auto;padding:8px 2px!important}
 .heat-grid{display:grid;grid-auto-flow:column;grid-template-rows:repeat(7,11px);gap:3px;min-width:max-content}
@@ -9474,7 +9474,7 @@ function renderStatKpis(d){
   if(statSig("kpis", sig) || !box.querySelector(".stat-kpi")){
     box.innerHTML = tiles.map(t =>
       '<div class="stat-kpi" title="' + esc(t.k) + '">'
-      + '<div class="k">' + esc(t.k) + '</div>'
+      + '<div class="k"><span>' + esc(t.k) + '</span>' + (t.id === 'kpiReq' || t.id === 'kpiDays' ? '<span class="stat-kpi-dot" aria-hidden="true"></span>' : '') + '</div>'
       + '<div class="v" id="' + t.id + '">—</div>'
       + '<div class="s">' + esc(t.s) + '</div></div>').join("");
   }
@@ -9504,7 +9504,7 @@ function renderRankList(id, rows, emptyText, sumElId){
     return '<div class="rank-row" data-tip="' + tip + '">'
       + '<span class="rank-name">' + esc(r.name) + '</span>'
       + '<span class="rank-val">' + fmt(r.tokens) + '</span>'
-      + '<span class="rank-bar"><i data-w="' + pct + '"></i></span></div>';
+      + '<span class="rank-bar"><i data-w="' + pct + '" style="width:' + (animate ? '0%' : pct + '%') + '"></i></span></div>';
   }).join("");
   box.querySelectorAll(".rank-bar > i").forEach((bar, i) => {
     const w = bar.dataset.w;
