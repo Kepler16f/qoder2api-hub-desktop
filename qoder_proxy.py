@@ -8930,7 +8930,11 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                 req = urllib.request.Request(chat_url,
                                              data=encoded.encode("utf-8"),
                                              method="POST", headers=headers)
-                resp = urllib.request.urlopen(req, timeout=600)
+                if qoder_accounts.is_configured_vpc_host(
+                        urllib.parse.urlsplit(chat_url).hostname):
+                    resp = qoder_accounts._opener_for_request().open(req, timeout=600)
+                else:
+                    resp = urllib.request.urlopen(req, timeout=600)
                 break
             except urllib.error.HTTPError as exc:
                 try:

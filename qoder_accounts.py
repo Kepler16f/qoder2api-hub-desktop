@@ -276,6 +276,7 @@ def parse_vpc_endpoint(value):
     except ValueError:
         raise ValueError("invalid VPC endpoint: malformed host or port")
     if (parsed.scheme not in ("http", "https") or not parsed.hostname
+            or ":" in parsed.netloc or "?" in raw
             or port is not None or parsed.username is not None
             or parsed.password is not None or parsed.query
             or parsed.fragment or "#" in raw
@@ -293,7 +294,8 @@ def parse_vpc_endpoint(value):
     elif "." in host:
         raise ValueError("invalid VPC endpoint: expected an instance name or a "
                          "domain under %s" % VPC_DOMAIN_SUFFIX)
-    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", instance):
+    # 最长服务后缀 -gateway 占 8 字节，推导后的 DNS label 不能超过 63。
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,53}[a-z0-9])?", instance):
         raise ValueError("invalid VPC endpoint: bad instance name %r" % instance)
     domain = instance + "." + VPC_DOMAIN_SUFFIX
     return {
@@ -1277,6 +1279,9 @@ def openapi_candidates(realm):
     """
     cfg = get_realm_config(realm)
     r = str(realm or "cn")
+    # 专属实例配置优先于遗留的 OPENAPI 覆盖；不得将企业凭据先送往公网。
+    if cfg.get("vpc_instance"):
+        return [str(cfg["openapi"]).rstrip("/")]
     out = []
     env = str(os.environ.get("QD_%s_OPENAPI" % r.upper()) or "").strip()
     if env:
@@ -1284,10 +1289,6 @@ def openapi_candidates(realm):
     base = str(cfg.get("openapi") or "").rstrip("/")
     if base:
         out.append(base)
-    # 企业 VPC：只能访问实例专属域，绝不回退到公网 openapi（那会把企业
-    # 凭证发给另一个入口，且通常直接 401/404）。
-    if cfg.get("vpc_instance"):
-        return out
     domain = str(cfg.get("domain") or "").strip()
     # 国际版活动平台另有一个可用入口 center.qoder.sh（0.4.3 客户端仍引用；实测
     # intl=200 / cn=401），放在官网域名之前作为回退。
@@ -1721,6 +1722,27 @@ def _proxy_map_from_env():
     return out
 
 
+class _VpcRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """VPC 请求只允许在本实例的 HTTPS 默认端口之间重定向。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        source = urllib.parse.urlsplit(req.full_url)
+        if is_configured_vpc_host(source.hostname):
+            target = urllib.parse.urlsplit(newurl)
+            try:
+                allowed = (target.scheme == "https"
+                           and target.port in (None, 443)
+                           and target.username is None and target.password is None
+                           and is_configured_vpc_host(target.hostname))
+            except ValueError:
+                allowed = False
+            if not allowed:
+                raise urllib.error.HTTPError(req.full_url, code,
+                                             "VPC redirect outside configured instance",
+                                             headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _opener_for_request():
     """每请求现建 opener：代理 = 当前环境变量（空 = 直连）。
 
@@ -1728,7 +1750,8 @@ def _opener_for_request():
     首次使用时缓存代理配置；本函数让每次请求看到的环境变化立即生效。
     """
     proxies = _proxy_map_from_env()
-    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies),
+                                       _VpcRedirectHandler())
 
 
 def upstream_clock_skew(timeout=4.0):
@@ -3347,6 +3370,8 @@ class Account(object):
         打另一区的 quota 会成功。只在 403 时探测一次，不发任何写操作。
         返回可读提示字符串；不属于该情形返回空串。
         """
+        if vpc_configured():
+            return ""  # VPC 与公网令牌不得通过跨区域诊断互相试探。
         other = "cn" if self.realm != "cn" else "intl"
         try:
             url = get_realm_config(other)["openapi"] + PATH_QUOTA
@@ -3379,7 +3404,9 @@ class Account(object):
         # 已知来源优先：命中过就第一个试，正常情况下 1 次请求就返回。
         known = load_credits_sources(accounts_dir or "").get(str(self.realm or "cn"))
         order = []
-        if isinstance(known, dict) and known.get("host") and known.get("path"):
+        if (isinstance(known, dict) and known.get("host") and known.get("path")
+                and (not cfg.get("vpc_instance")
+                     or str(known["host"]).rstrip("/") in hosts)):
             order.append((str(known["host"]).rstrip("/"), str(known["path"])))
         for host in hosts:
             for path in CREDITS_PATHS:
@@ -3491,6 +3518,9 @@ class Account(object):
         path = str(src.get("path") or "")
         if not host or not path:
             return None
+        cfg = get_realm_config(self.realm)
+        if cfg.get("vpc_instance") and host not in (cfg["openapi"], cfg["website"]):
+            return None  # 忽略公网或其它实例遗留的额度来源缓存。
         try:
             body = http_json(host + path, method="GET", headers=self.headers(),
                              timeout=20, retries=0)

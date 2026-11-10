@@ -149,7 +149,8 @@ export QD_CN_VPC_ENDPOINT=acme       # 也可以填 acme.vpc.qoder.com.cn
 | 推理网关 | `https://acme-gateway.vpc.qoder.com.cn` |
 
 - 只对国内版生效；国际版账号仍走公网 `api3.qoder.sh`
-- VPC 模式**不会回退**到公网 openapi / gateway，避免把企业凭证发到错误入口
+- VPC 模式**不会回退**到公网 openapi / gateway；优先于旧的 `QD_CN_OPENAPI` 覆盖，忽略公网 / 其它实例的额度来源缓存，并关闭跨区域令牌诊断，避免把企业凭证发到错误入口
+- 实例名最长 55 字符，保证追加 `-gateway` 后的 DNS 标签不超过 63 字符；仅允许重定向到本实例的 HTTPS 默认端口
 - 网关所在机器必须能访问企业 VPC（专线、VPN 或内网 DNS）。专属域解析到内网地址是预期行为，SSRF 防护只放行这三个推导出来的主机
 - 「添加账号（OAuth）」「导入 PAT」会走 VPC 的 OpenAPI；「扫描本机凭证」会同时检查 `~/.qoder-cn/.auth` 和 `~/.qoder-cn/.vpc/<实例名>/.auth`
 - 启动日志会打印 `vpc : acme (openapi=... gateway=...)`；如果当前出口仍是国际版，会额外打印 WARN
