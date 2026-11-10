@@ -252,15 +252,113 @@ def normalize_quota_payload(payload, realm=""):
     return out
 
 
+VPC_DOMAIN_SUFFIX = "vpc.qoder.com.cn"
+
+
+def parse_vpc_endpoint(value):
+    """把 QD_CN_VPC_ENDPOINT 解析成企业 VPC 的三个官方主机。
+
+    接受实例名（acme）或三个按服务拆分的域名（acme.vpc.qoder.com.cn /
+    acme-openapi.vpc.qoder.com.cn / acme-gateway.vpc.qoder.com.cn）。
+    空值返回 None；路径、端口、凭据、query、fragment 或空白一律拒绝，
+    避免一个值只改掉流程里的一部分端点。
+    """
+    raw = str(value or "")
+    if not raw.strip():
+        return None
+    if raw != raw.strip() or any(ch in raw for ch in "\r\n\t"):
+        raise ValueError("invalid VPC endpoint: surrounding whitespace or "
+                         "control characters")
+    target = raw if "://" in raw else "https://" + raw
+    try:
+        parsed = urllib.parse.urlsplit(target)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("invalid VPC endpoint: malformed host or port")
+    if (parsed.scheme not in ("http", "https") or not parsed.hostname
+            or ":" in parsed.netloc or "?" in raw
+            or port is not None or parsed.username is not None
+            or parsed.password is not None or parsed.query
+            or parsed.fragment or "#" in raw
+            or parsed.path not in ("", "/")):
+        raise ValueError("invalid VPC endpoint: expected an instance name or a "
+                         "domain under %s" % VPC_DOMAIN_SUFFIX)
+    host = parsed.hostname.lower()
+    instance = host
+    if host.endswith("." + VPC_DOMAIN_SUFFIX):
+        instance = host[:-len("." + VPC_DOMAIN_SUFFIX)]
+        if instance.endswith("-openapi"):
+            instance = instance[:-len("-openapi")]
+        elif instance.endswith("-gateway"):
+            instance = instance[:-len("-gateway")]
+    elif "." in host:
+        raise ValueError("invalid VPC endpoint: expected an instance name or a "
+                         "domain under %s" % VPC_DOMAIN_SUFFIX)
+    # 最长服务后缀 -gateway 占 8 字节，推导后的 DNS label 不能超过 63。
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,53}[a-z0-9])?", instance):
+        raise ValueError("invalid VPC endpoint: bad instance name %r" % instance)
+    domain = instance + "." + VPC_DOMAIN_SUFFIX
+    return {
+        "instance": instance,
+        "domain": domain,
+        "website": "https://" + domain,
+        "openapi": "https://" + instance + "-openapi." + VPC_DOMAIN_SUFFIX,
+        "gateway": "https://" + instance + "-gateway." + VPC_DOMAIN_SUFFIX,
+    }
+
+
+_VPC_CN = None
+VPC_CONFIG_ERROR = ""
+try:
+    _VPC_CN = parse_vpc_endpoint(os.environ.get("QD_CN_VPC_ENDPOINT"))
+except ValueError as exc:
+    VPC_CONFIG_ERROR = str(exc)
+
+_VPC_HOSTS = frozenset(
+    urllib.parse.urlsplit(_VPC_CN[key]).hostname.lower()
+    for key in ("website", "openapi", "gateway")
+    if _VPC_CN and urllib.parse.urlsplit(_VPC_CN[key]).hostname
+)
+
+
+def vpc_configured():
+    return _VPC_CN is not None
+
+
+def vpc_instance():
+    return (_VPC_CN or {}).get("instance", "")
+
+
+def vpc_config_error():
+    return VPC_CONFIG_ERROR
+
+
+def vpc_endpoint_hosts():
+    return _VPC_HOSTS
+
+
+def is_configured_vpc_host(host):
+    """仅对 QD_CN_VPC_ENDPOINT 推导出的三个主机放行解析级 SSRF 校验。
+
+    企业 VPC 域名通常解析到公司内网地址，通用规则会把它当内网目标拒绝；
+    但这是用户显式配置的固定主机，不是请求里可注入的 URL。
+    """
+    name = str(host or "").strip().strip("[]").lower()
+    return bool(name) and name in vpc_endpoint_hosts()
+
+
 REALM_CONFIGS = {
     "cn": {
         "name": "国内版 (China)",
-        "openapi": "https://openapi.qoder.com.cn",
-        "gateway": "https://gateway.qoder.com.cn",
-        "website": "https://qoder.com.cn",
+        "openapi": (_VPC_CN or {}).get("openapi")
+                   or "https://openapi.qoder.com.cn",
+        "gateway": (_VPC_CN or {}).get("gateway")
+                   or "https://gateway.qoder.com.cn",
+        "website": (_VPC_CN or {}).get("website") or "https://qoder.com.cn",
+        "domain": (_VPC_CN or {}).get("domain") or "qoder.com.cn",
+        "vpc_instance": (_VPC_CN or {}).get("instance", ""),
         "client_id": "1c5e33e1-364d-4ce6-b02c-acaa81274a5c",
         "redirect_uri": "qoder-work-cn://",
-        "domain": "qoder.com.cn",
         "ua": "QoderWork/1.1.75",
         # has_checkin 只是"历史上该区域曾开放 sash 签到"的提示位，**不再作为
         # 门控**：能力改为运行时探测（见 Account.checkin_capability）。官方把
@@ -1181,6 +1279,9 @@ def openapi_candidates(realm):
     """
     cfg = get_realm_config(realm)
     r = str(realm or "cn")
+    # 专属实例配置优先于遗留的 OPENAPI 覆盖；不得将企业凭据先送往公网。
+    if cfg.get("vpc_instance"):
+        return [str(cfg["openapi"]).rstrip("/")]
     out = []
     env = str(os.environ.get("QD_%s_OPENAPI" % r.upper()) or "").strip()
     if env:
@@ -1210,9 +1311,29 @@ def gateway_candidates(realm):
     """
     cfg = get_realm_config(realm)
     out = [cfg["gateway"]]
+    # 企业 VPC 只有实例专属推理域，公网 api1/api2/api3 不能作为故障回退。
+    if cfg.get("vpc_instance"):
+        return out
     for host in cfg.get("gateway_fallbacks") or ():
         if host and host not in out:
             out.append(host)
+    return out
+
+
+def cli_auth_dirs(realm):
+    """官方 CLI 的凭据目录：公网 ``.auth`` +（VPC 模式）实例专属 ``.auth``。
+
+    企业 VPC 账号可能由官方 CLI 登录在 ``~/.qoder-cn/.auth``，也可能按
+    实例隔离在 ``~/.qoder-cn/.vpc/<instance>/.auth``；扫描两者，导入时
+    的 realm 仍是 cn。
+    """
+    cfg = get_realm_config(realm)
+    root = os.path.join(os.path.expanduser("~"), cfg["home_dir"])
+    out = []
+    instance = str(cfg.get("vpc_instance") or "")
+    if instance:
+        out.append(os.path.join(root, ".vpc", instance, ".auth"))
+    out.append(os.path.join(root, ".auth"))
     return out
 
 
@@ -1470,6 +1591,19 @@ _FAKEIP_NETS = [
     ipaddress.ip_network("2001:2::/48"),
     ipaddress.ip_network("fdfe:dcba:9876::/48"),
 ]
+# macOS 的 getaddrinfo 会把 fake-IP 以 IPv4-translated 形式（::ffff:0:c612:2d）
+# 一并返回；只认纯 IPv4 会让 all(...) 失败，于是所有公网域名都被误判成内网。
+_FAKEIP_V4_TRANSLATED = ipaddress.ip_network("::ffff:0:0:0/96")
+
+
+def _is_fake_ip(ip):
+    candidates = [ip]
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            candidates.append(ip.ipv4_mapped)
+        elif ip in _FAKEIP_V4_TRANSLATED:
+            candidates.append(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
+    return any(addr in net for addr in candidates for net in _FAKEIP_NETS)
 
 
 def _host_boundary_violation(ip, allow_local):
@@ -1496,6 +1630,10 @@ def validate_public_http_url(url, allow_local=False):
     host = (parsed.hostname or "").strip().strip("[]").lower()
     if not host:
         raise ValueError("URL host is required")
+    # 企业 VPC 专属域通常解析到公司内网，不能按公网目标拒绝；只放行
+    # QD_CN_VPC_ENDPOINT 推导出的固定主机。
+    if is_configured_vpc_host(host):
+        return url
     if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
         if not allow_local:
             raise ValueError("requests to localhost are not allowed")
@@ -1521,7 +1659,7 @@ def validate_public_http_url(url, allow_local=False):
             addrs.append(ipaddress.ip_address(addr))
         except ValueError:
             raise ValueError("URL host resolved to a non-IP address: %r" % addr)
-    if addrs and all(any(ip in net for net in _FAKEIP_NETS) for ip in addrs):
+    if addrs and all(_is_fake_ip(ip) for ip in addrs):
         return url  # fake-IP DNS：真实 IP 不可见，名称级校验已通过
     for ip in addrs:
         if _host_boundary_violation(ip, allow_local):
@@ -1584,6 +1722,27 @@ def _proxy_map_from_env():
     return out
 
 
+class _VpcRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """VPC 请求只允许在本实例的 HTTPS 默认端口之间重定向。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        source = urllib.parse.urlsplit(req.full_url)
+        if is_configured_vpc_host(source.hostname):
+            target = urllib.parse.urlsplit(newurl)
+            try:
+                allowed = (target.scheme == "https"
+                           and target.port in (None, 443)
+                           and target.username is None and target.password is None
+                           and is_configured_vpc_host(target.hostname))
+            except ValueError:
+                allowed = False
+            if not allowed:
+                raise urllib.error.HTTPError(req.full_url, code,
+                                             "VPC redirect outside configured instance",
+                                             headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _opener_for_request():
     """每请求现建 opener：代理 = 当前环境变量（空 = 直连）。
 
@@ -1591,7 +1750,8 @@ def _opener_for_request():
     首次使用时缓存代理配置；本函数让每次请求看到的环境变化立即生效。
     """
     proxies = _proxy_map_from_env()
-    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies),
+                                       _VpcRedirectHandler())
 
 
 def upstream_clock_skew(timeout=4.0):
@@ -1602,7 +1762,8 @@ def upstream_clock_skew(timeout=4.0):
     """
     from email.utils import parsedate_to_datetime
     try:
-        req = urllib.request.Request("https://openapi.qoder.com.cn/", method="HEAD")
+        base = openapi_candidates("cn")[0]
+        req = urllib.request.Request(base.rstrip("/") + "/", method="HEAD")
         with _opener_for_request().open(req, timeout=timeout) as resp:
             date_hdr = resp.headers.get("Date")
         if not date_hdr:
@@ -3209,6 +3370,8 @@ class Account(object):
         打另一区的 quota 会成功。只在 403 时探测一次，不发任何写操作。
         返回可读提示字符串；不属于该情形返回空串。
         """
+        if vpc_configured():
+            return ""  # VPC 与公网令牌不得通过跨区域诊断互相试探。
         other = "cn" if self.realm != "cn" else "intl"
         try:
             url = get_realm_config(other)["openapi"] + PATH_QUOTA
@@ -3241,7 +3404,9 @@ class Account(object):
         # 已知来源优先：命中过就第一个试，正常情况下 1 次请求就返回。
         known = load_credits_sources(accounts_dir or "").get(str(self.realm or "cn"))
         order = []
-        if isinstance(known, dict) and known.get("host") and known.get("path"):
+        if (isinstance(known, dict) and known.get("host") and known.get("path")
+                and (not cfg.get("vpc_instance")
+                     or str(known["host"]).rstrip("/") in hosts)):
             order.append((str(known["host"]).rstrip("/"), str(known["path"])))
         for host in hosts:
             for path in CREDITS_PATHS:
@@ -3353,6 +3518,9 @@ class Account(object):
         path = str(src.get("path") or "")
         if not host or not path:
             return None
+        cfg = get_realm_config(self.realm)
+        if cfg.get("vpc_instance") and host not in (cfg["openapi"], cfg["website"]):
+            return None  # 忽略公网或其它实例遗留的额度来源缓存。
         try:
             body = http_json(host + path, method="GET", headers=self.headers(),
                              timeout=20, retries=0)
@@ -4495,16 +4663,15 @@ class AccountPool(object):
     @staticmethod
     def _local_machine_id(realm):
         """读取本机官方客户端的 machine_id（优先，保持设备一致），缺则生成。"""
-        cfg = get_realm_config(realm)
-        home = os.path.join(os.path.expanduser("~"), cfg["home_dir"], ".auth")
-        p = os.path.join(home, "machine_id")
-        try:
-            with open(p, encoding="utf-8") as fh:
-                mid = fh.read().strip()
-            if mid:
-                return mid
-        except Exception:
-            pass
+        for auth_dir in cli_auth_dirs(realm):
+            try:
+                with open(os.path.join(auth_dir, "machine_id"),
+                          encoding="utf-8") as fh:
+                    mid = fh.read().strip()
+                if mid:
+                    return mid
+            except Exception:
+                pass
         return str(uuid.uuid4())
 
     def start_login(self, realm="cn", platform="CLI"):
@@ -4820,9 +4987,10 @@ def scan_desktop_credentials():
             item["error"] = str(exc)
         found.append(item)
 
-        # 2) CLI 端 user / user.{profile}
-        auth_dir = os.path.join(os.path.expanduser("~"), cfg["home_dir"], ".auth")
-        if os.path.isdir(auth_dir):
+        # 2) CLI 端 user / user.{profile}（含 VPC 实例专属目录）
+        for auth_dir in cli_auth_dirs(realm):
+            if not os.path.isdir(auth_dir):
+                continue
             machine_key = ""
             try:
                 with open(os.path.join(auth_dir, "machine_id"),
@@ -4899,6 +5067,8 @@ def import_desktop_credential(path=None, realm=None):
 
     token = refresh = ""
     uid = nickname = ""
+    user_type = DEFAULT_USER_TYPE
+    org_id = org_name = ""
     exp = 0
     base = os.path.basename(path)
     if base == "auth.v1.dat":
@@ -4908,6 +5078,12 @@ def import_desktop_credential(path=None, realm=None):
         user = data.get("user") or {}
         uid = str(user.get("id") or "")
         nickname = str(user.get("name") or "")
+        user_type = (str(user.get("user_type") or user.get("userType") or "")
+                     or DEFAULT_USER_TYPE)
+        org_id = str(user.get("organization_id")
+                     or user.get("organizationId") or "")
+        org_name = str(user.get("organization_name")
+                       or user.get("organizationName") or "")
         try:
             import datetime
             exp = int(datetime.datetime.strptime(
@@ -4929,6 +5105,12 @@ def import_desktop_credential(path=None, realm=None):
         refresh = str(data.get("refresh_token") or "")
         uid = str(data.get("uid") or "")
         nickname = str(data.get("name") or "")
+        user_type = (str(data.get("user_type") or data.get("userType") or "")
+                     or DEFAULT_USER_TYPE)
+        org_id = str(data.get("organization_id")
+                     or data.get("organizationId") or "")
+        org_name = str(data.get("organization_name")
+                       or data.get("organizationName") or "")
         exp = normalize_epoch(data.get("expire_time"))
 
     if not token:
@@ -4946,6 +5128,9 @@ def import_desktop_credential(path=None, realm=None):
         "expiresAt": exp or (int(time.time()) + 30 * 86400),
         "source": "desktop-app",
         "enabled": True,
+        "userType": user_type,
+        "organizationId": org_id,
+        "organizationName": org_name,
     })
     return add_to_pool(account)
 
