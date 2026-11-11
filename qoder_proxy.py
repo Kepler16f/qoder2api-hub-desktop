@@ -71,7 +71,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.9.6"
+VERSION = "1.9.7"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -3153,7 +3153,7 @@ def read_dynamic_models(realm=None):
     # 签名以 qoder_encode("{}") 作为 body 参与 MD5；请求同样携带该 body。
     sign_body = qoder_encode(b"{}")
     payload = None
-    for host in gateway_candidates(r):
+    for host in gateway_candidates(r, qoder_accounts.account_realm_config(account)):
         raw_url = host + MODELS_PATH
         try:
             sess = SESSIONS.get(account)
@@ -3162,7 +3162,10 @@ def read_dynamic_models(realm=None):
             url = validate_public_http_url(raw_url)
             req = urllib.request.Request(url, data=sign_body.encode("utf-8"),
                                          method="GET", headers=headers)
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            opener = (qoder_accounts._opener_for_request().open
+                      if qoder_accounts.account_realm_config(account).get("vpc_instance")
+                      else urllib.request.urlopen)
+            with opener(req, timeout=15) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             break
         except Exception as exc:
@@ -8908,7 +8911,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
             raise PayloadTooLarge(len(encoded), MAX_UPSTREAM_BODY_BYTES)
         # 官方候选推理主机（国际版 api1/api2/api3）：传输层失败时切换域名，
         # 签名只覆盖 path，换主机不影响签名有效性。
-        hosts = gateway_candidates(account.realm)
+        hosts = gateway_candidates(account.realm, qoder_accounts.account_realm_config(account))
         host_i = 0
         raw_url = hosts[host_i] + CHAT_PATH
 
@@ -12838,7 +12841,9 @@ class Handler(BaseHTTPRequestHandler):
                 target_realm = "cn"
             try:
                 started = POOL.start_login(realm=target_realm,
-                                           platform=platform)
+                                           platform=platform, vpc=payload.get("vpc"))
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
             except Exception as exc:
                 return self._error(502, "could not start login: %s" % exc)
             log("oauth device login started (realm=%s, state=%s)"
@@ -12847,13 +12852,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/accounts/login/cancel":
             state = payload.get("state") or ""
             return self._json(200, {"cancelled": POOL.cancel_login(state)})
-        if path == "/accounts/import/pat":
+        if path in ("/accounts/import/pat", "/accounts/import-pat"):
             pat = payload.get("pat") or ""
             realm = payload.get("realm") or CURRENT_REALM
             if realm not in ("intl", "cn"):
                 realm = "cn"
             try:
-                account = POOL.import_pat(pat, realm=realm)
+                account = POOL.import_pat(pat, realm=realm, vpc=payload.get("vpc"))
             except Exception as exc:
                 return self._error(400, "PAT import failed: %s" % exc)
             log("imported PAT account %s (realm=%s)"
@@ -13008,13 +13013,22 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": False, "uid": account.uid, "status": 500,
                     "error": _friendly_net_error(
                         exc,
-                        qoder_accounts.get_realm_config(
-                            acc_realm(account))["gateway"]),
+                        qoder_accounts.account_realm_config(account)["gateway"]),
                     "elapsed_ms": wall_ms})
         if path == "/accounts/set":
             uid = payload.get("uid")
             if not uid:
                 return self._error(400, "uid required")
+            if "vpcEndpoint" in payload:
+                try:
+                    changed = POOL.set_vpc(uid, payload["vpcEndpoint"])
+                except ValueError as exc:
+                    return self._error(400, str(exc), "invalid_request_error")
+                if changed is None:
+                    return self._error(404, "no such account")
+                import qoder_tasks
+                qoder_tasks.invalidate_panel_cache()
+                return self._json(200, {"account": changed})
             updated = POOL.set_enabled(uid, bool(payload.get("enabled")))
             if updated is None:
                 return self._error(404, "no such account")
