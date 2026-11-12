@@ -3861,16 +3861,30 @@ def update_plan_info():
     cur = VERSION
     latest = ""
     err = ""
+    lookup_failed = False
     try:
         latest = qoder_updater.latest_release().get("version") or ""
     except Exception as exc:
         err = str(exc)[:160]
+        # GitHub 匿名限流 60 次/小时/IP：本函数每次都实时打 API，403 被吞掉后
+        # 曾被渲染成「当前已是最新版本」（2026-11-11 看板自相矛盾）。
+        # 查不到就回退到 /update/check 的缓存；仍拿不到才标记 lookup_failed。
+        try:
+            cached = check_for_update()
+        except Exception:
+            cached = None
+        if isinstance(cached, dict):
+            latest = str(cached.get("latest") or "").strip().lstrip("vV")
+            err = err or str(cached.get("error") or "")
+        if not latest:
+            lookup_failed = True
     has = bool(latest) and version_tuple(latest) > version_tuple(cur)
     return {
         "ok": True,
         "current": cur,
         "latest": latest,
         "has_update": has,
+        "lookup_failed": lookup_failed,
         "container": qoder_updater._in_container(),
         "disabled": UPDATE_DISABLED,
         "can_apply": bool(has) and not UPDATE_DISABLED,
@@ -11360,7 +11374,11 @@ class Handler(BaseHTTPRequestHandler):
                 _reasons.append("仅允许在本机打开面板执行"
                                 "（或设置 QD_UPDATE_ALLOW_REMOTE=1）")
             if not _info.get("has_update"):
-                _reasons.append("当前已是最新版本")
+                if _info.get("lookup_failed"):
+                    _reasons.append("无法访问 GitHub（限流或网络不可达），"
+                                    "稍后重试或检查代理")
+                else:
+                    _reasons.append("当前已是最新版本")
             _info["client_is_loopback"] = bool(_loopback)
             _info["can_apply"] = bool(_info.get("can_apply")) and not _reasons
             _info["apply_blocked_reasons"] = _reasons
