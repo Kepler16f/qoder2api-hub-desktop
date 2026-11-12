@@ -5,6 +5,7 @@
 import os
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _suite_head import *          # noqa: F401,F403
@@ -125,9 +126,18 @@ check("#51b 嵌套 detail 里的 retryAfterSeconds 能解析出来",
 check("#51b 信封层识别排队信号", P._envelope_queue_wait(_exc) == 30)
 # issue #57 后续：预算对齐官方（分钟级）——默认允许 6 轮排队重试
 # issue #71：默认轮次降到 3（≈90s），现场 6 轮会被拖到 3 分钟以上
-check("#51b 排队时允许多等几轮（默认 3 轮，第 4 次停止）",
-      [P.should_retry_envelope(_exc, 0, a) for a in range(5)]
-      == [True, True, True, False, False])
+# 2026-11-12：上游全局排队（retryAfterSeconds=60）时固定 3 轮会在放行前
+# 放弃（183s vs 上游 60s 放行）-> 改为**总预算**语义（600s），轮数由预算
+# 推导；QUEUE_MAX_ROUNDS 仍是硬上限，=0 时显式关闸（本轮不等排队）。
+_rounds51 = [P.should_retry_envelope(_exc, 0, a) for a in range(5)]
+check("#51b 排队时允许继续等轮（预算内不放行）",
+      _rounds51[:3] == [True, True, True], _rounds51)
+check("#51b 排队轮次由总预算推导（600s / 31s ≈ 19 轮，不再固定 3 轮）",
+      len([P.should_retry_envelope(_exc, 0, a) for a in range(30)]) >= 19)
+check("#51b 排队超总预算后停止（交回 429 + Retry-After）",
+      not P.should_retry_envelope(
+          _exc, 0, 1,
+          usage_ctx={"_queue_started_at": time.time() - P.QUEUE_WAIT_BUDGET_SECS}))
 check("#57 队列预算默认（600s / 3 轮 / 抖动 2s）",
       P.QUEUE_WAIT_BUDGET_SECS == 600 and P.QUEUE_MAX_ROUNDS == 3
       and P.QUEUE_WAIT_JITTER_SECS == 2.0)

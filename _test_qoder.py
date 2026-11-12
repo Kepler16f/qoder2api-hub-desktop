@@ -5562,6 +5562,54 @@ check("#49-5 output_config 非 dict/空 effort -> None（不猜测）",
       P.requested_effort({"output_config": "low"}) is None
       and P.requested_effort({"output_config": {}}) is None)
 
+# [50] 上游全局排队的等待预算与账号槽位（2026-11-12 现场修复）
+# —— 现场：上游所有模型/所有账号/cn+intl 全排（isQueued + retryAfterSeconds=60），
+# 网关信封层只等 3 轮 × 61s = 183s 就放弃；且排队等待期间**占着账号信号量**，
+# 4 个 cn 号的槽位被占满 -> 后续请求 "all N account(s) busy" -> 误报
+# "no usable account"（账号其实 6/6 健康）。修复三条：
+#   ① 排队等待按**总预算**（QUEUE_WAIT_BUDGET_SECS，默认 600s）持续等，
+#      不再固定 3 轮；② 排队等待期间释放账号槽位（排队是上游全局状态）；
+#   ③ 排队耗尽报 429 + Retry-After，不再抛 "no usable account"。
+_QD = ('{"code":"10605","message":"{\\"isQueued\\":true,'
+       '\\"retryAfterSeconds\\":60}"}')
+check("50-1 排队信封在预算内允许继续重试（不再被 3 轮上限卡死）",
+      P.should_retry_envelope(P.UpstreamStatus(403, _QD), False, 9,
+                              usage_ctx={"_queue_started_at": time.time() - 5}))
+check("50-2 排队信封超总预算后不再重试（交给 429 + Retry-After）",
+      not P.should_retry_envelope(
+          P.UpstreamStatus(403, _QD), False, 1,
+          usage_ctx={"_queue_started_at":
+                     time.time() - P.QUEUE_WAIT_BUDGET_SECS}))
+check("50-3 排队信封：单轮等待超上限仍不放行（防上游给 absurd 值）",
+      not P.should_retry_envelope(
+          P.UpstreamStatus(403, '{"code":"10605","isQueued":true,'
+                               '"retryAfterSeconds":99999}'),
+          False, 0, usage_ctx={}))
+check("50-4 排队时仍按 retryAfterSeconds 等待（61s 而非退避 1s）",
+      P._envelope_retry_wait(P.UpstreamStatus(403, _QD), 1) == 61,
+      P._envelope_retry_wait(P.UpstreamStatus(403, _QD), 1))
+check("50-5 排队信封耗尽 -> RateLimited（429 + Retry-After），不是 403",
+      isinstance(P._as_rate_limited_for_queue(P.UpstreamStatus(403, _QD)),
+                 P.RateLimited))
+check("50-6 非排队错误不受影响（仍原样返回）",
+      not isinstance(P._as_rate_limited_for_queue(
+          P.UpstreamStatus(403, '{"code":"110"}')), P.RateLimited))
+# 槽位释放：排队等待期间不能占着账号信号量，否则池子被占满 ->
+# "all N account(s) busy" -> 误报"无可用账号"（账号其实全健康）。
+_src50 = open(os.path.abspath(__file__), encoding="utf-8").read()
+_src50p = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "qoder_proxy.py"), encoding="utf-8").read()
+check("50-7 信封层排队等待前释放账号槽位（不占着 sem 等）",
+      _src50p.count("_envelope_queue_wait(exc) > 0 and cur is not upstream") >= 1)
+check("50-8 HTTP 层排队等待前释放账号槽位",
+      _src50p.count("_release_account_sem(_sem_held)") >= 2)
+check("50-9 排队信号记入 usage_ctx（末尾兜底可转 429 而非误报无可用账号）",
+      "_envelope_queue_detail" in _src50p)
+# 非流式聚合路径必须有 except RateLimited：排队耗尽时 RateLimited 落到
+# except Exception 会被包成 502（客户端拿不到 Retry-After，只能盲目重试）。
+check("50-10 非流式聚合路径接住 RateLimited -> 429 + Retry-After",
+      _src50p.count("except RateLimited as exc:") >= 5)
+
 print("SUMMARY: TOTAL %d checks, %d passed, %d failed, %d skipped" % (PASS + FAIL + SKIP, PASS, FAIL, SKIP))
 
 try:

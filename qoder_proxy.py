@@ -321,7 +321,7 @@ from pathlib import Path
 # 之外的全部 openapi 调用，_stub 注入点不变），_opener_for_request 保
 # UPSTREAM_OPENER 单例。上游同一区间发到 VERSION 1.9.6，本 fork 继续
 # 日期制版本号）。
-VERSION = "2026.11.11.1_upstream"
+VERSION = "2026.11.12.1_re"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -8851,7 +8851,8 @@ def _note_quota_cooldown(account, status, detail, where, model=None):
     return True
 
 
-def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None):
+def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None,
+                                    usage_ctx=None):
     """信封层非 200（如 403 队列满/Token被拒、429 等）冷却该账号并解绑会话，触发下次选号轮换。"""
     if isinstance(exc, InvalidToolArguments):
         # issue #37：坏参数是模型生成内容的问题，**不是账号不可用**——
@@ -8873,6 +8874,18 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
         log("account %s queued via envelope (HTTP %s) - not penalising the "
             "account (issue #71)" % (account.uid[:8], status_int),
             level="WARN", tag="chat")
+        # 2026-11-12：把排队信号**记进 usage_ctx**。此前它只被短路掉（不冷却
+        # 账号），但没有任何地方留存 -> open_upstream 末尾 last_error/last_429
+        # 都是 None -> 抛 RuntimeError("no usable account")，而账号其实全
+        # 健康（排队是上游区域级状态）。有了它，末尾兜底能正确转成
+        # 429 + Retry-After（客户端可退避重试），而不是误导性的"无可用账号"。
+        try:
+            _qctx = usage_ctx if isinstance(usage_ctx, dict) else None
+            if _qctx is not None:
+                _qctx["_envelope_queue_detail"] = detail
+                _qctx["_envelope_queue_wait"] = _queue_wait_seconds(detail)
+        except Exception:
+            pass
         return
     if session_key and POOL:
         try:
@@ -9264,9 +9277,30 @@ def should_retry_envelope(exc, emitted_bytes, attempt, usage_ctx=None):
         return attempt < min(1, TRANSIENT_MAX_RETRIES) and _take_image_retry(usage_ctx)
     _q = _envelope_queue_wait(exc)
     if _q > 0:
-        # queue: wait per retryAfterSeconds, allow more rounds than transient
-        return (_q <= QUEUE_WAIT_MAX_SECS
-                and attempt < max(QUEUE_MAX_ROUNDS, TRANSIENT_MAX_RETRIES))
+        # queue: wait per retryAfterSeconds, bounded by the **total wait
+        # budget** (not a fixed round count).
+        #
+        # 2026-11-12 取证：上游全局排队（所有模型/所有账号/cn+intl 全排，
+        # isQueued + retryAfterSeconds=60）。旧口径固定 QUEUE_MAX_ROUNDS=3
+        # 轮、每轮等 61s -> 183s 就放弃，而上游要 60s 才放行：网关在第 3 轮
+        # 放弃时上游恰好要放行，于是客户端拿到 429 又立刻重试，陷入
+        # "每 184s 失败一次"的死循环（实测 10:00-10:37 十次会话全灭）。
+        # 官方客户端同一场景按 retryAfterSeconds 轮询、最多等 60 分钟
+        # （QODER_MODEL_QUEUE_MAX_WAIT_MS=3600000）——网关是同步 HTTP，
+        # 这里按请求级总预算 QUEUE_WAIT_BUDGET_SECS（默认 600s）等待，
+        # 语义对齐且可用 QD_QUEUE_WAIT_BUDGET_SECS 调整。
+        if usage_ctx is not None:
+            _qstart = usage_ctx.get("_queue_started_at")
+            if _qstart is None:
+                _qstart = time.time()
+                usage_ctx["_queue_started_at"] = _qstart
+            waited = time.time() - float(_qstart)
+            if waited + _q > QUEUE_WAIT_BUDGET_SECS:
+                return False        # 总预算耗尽 -> 交回 429 + Retry-After
+        # QUEUE_MAX_ROUNDS=0 = 显式关闸（本轮完全不等待排队；测试/紧急场景）
+        if QUEUE_MAX_ROUNDS == 0:
+            return False
+        return _q <= QUEUE_WAIT_MAX_SECS
     if attempt >= TRANSIENT_MAX_RETRIES:
         return False
     status_int = _to_int_status(getattr(exc, "status", 502))
@@ -9298,13 +9332,21 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
     cur = resp
     try:
         # issue #51 补充：排队可能要多等几轮（仅排队时 should_retry 才允许）
-        for attempt in range(TRANSIENT_MAX_RETRIES + 1 + QUEUE_MAX_ROUNDS):
+        # 轮数上限按"排队总预算 / 单轮等待"推导（2026-11-12：固定 3 轮会
+        # 在上游放行前放弃——见 should_retry_envelope 里的说明）。留足余量
+        # （单轮按 1s 计）以防 retryAfterSeconds 很小导致轮数不够。
+        _q_budget_rounds = int(QUEUE_WAIT_BUDGET_SECS / max(1, QUEUE_WAIT_MAX_SECS))
+        _max_rounds = (TRANSIENT_MAX_RETRIES + 1 + QUEUE_MAX_ROUNDS
+                       + max(QUEUE_MAX_ROUNDS, _q_budget_rounds) * 4)
+        for attempt in range(_max_rounds):
             try:
                 obj = aggregate_stream(cur, model, None, holder=holder,
                                        allowed_names=_tool_names_from_payload(payload))
                 return obj, account
             except UpstreamStatus as exc:
-                _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
+                _handle_envelope_account_cooldown(account, exc, model=model,
+                                                session_key=session_key,
+                                                usage_ctx=usage_ctx)
                 if not should_retry_envelope(exc, False, attempt, usage_ctx=usage_ctx):
                     # issue #71：排队耗尽 -> 429 + Retry-After（不是 403）
                     raise _as_rate_limited_for_queue(exc, model)
@@ -9314,6 +9356,17 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
                        _queue_budget()), level="WARN", tag="chat")
                 # 10605 信封排队按 retryAfterSeconds+1 等（_envelope_retry_wait），
                 # 其余错误维持按次数退避；计数以排队预算封顶（#71，勿现 try 4/3）
+                # 2026-11-12：**等之前先关掉旧连接**释放账号槽位——否则等待的
+                # 61s 里旧号槽位一直被 cur 持有，重开又要新号槽位，池子会被
+                # 排队中的请求迅速占满（"all N account(s) busy" -> 误报无可用
+                # 账号）。排队是上游区域级状态，不该独占本号并发额度。
+                _is_queue_wait = _envelope_queue_wait(exc) > 0
+                if _is_queue_wait and cur is not resp:
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
+                    cur = resp
                 time.sleep(_envelope_retry_wait(exc, attempt + 1))
                 if _is_image_conversion_timeout(exc.detail):
                     reopen_options["usage_ctx"] = usage_ctx
@@ -9961,10 +10014,21 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                 # 交给客户端）。仅在预算与单轮上限内等待；超出即按原错误走
                 # 既有分类（fail-open 语义不变）。
                 qwait = _queue_wait_seconds(detail)
-                _can_wait = (qwait > 0 and queue_tries < QUEUE_MAX_ROUNDS
+                # 2026-11-12：排队等待的轮次上限改为**总预算**语义（按上游
+                # retryAfterSeconds 持续等到放行），不再固定 3 轮——上游说 60s
+                # 才放行时，固定 3 轮(183s)会在放行前放弃。
+                # QUEUE_MAX_ROUNDS 仍是硬上限（0 = 不等待排队，测试与紧急
+                # 场景靠它关闸）；正常取 max(它, 预算推导值)。
+                _q_max_rounds = max(
+                    QUEUE_MAX_ROUNDS,
+                    int(QUEUE_WAIT_BUDGET_SECS / max(1, qwait + 1)))
+                _can_wait = (qwait > 0 and queue_tries < _q_max_rounds
                              and qwait <= QUEUE_WAIT_MAX_SECS
                              and (time.time() - queue_start) + qwait
                              <= QUEUE_WAIT_BUDGET_SECS)
+                # QUEUE_MAX_ROUNDS=0 = 显式关闸（本轮不等排队）
+                if QUEUE_MAX_ROUNDS == 0:
+                    _can_wait = False
                 # issue #87：visible 模式由调用方（流式 handler）提供 on_queue，
                 # 它在**流内**发心跳+排队提示；fast 模式直接抛给 handler 返回 503。
                 if _can_wait and on_queue is not None:
@@ -9972,9 +10036,16 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                     log("upstream queued on '%s' model '%s' - waiting %ds "
                         "(round %d/%d, visible)"
                         % (account.uid[:8], model, qwait, queue_tries,
-                           QUEUE_MAX_ROUNDS), level="WARN", tag="chat")
+                           _q_max_rounds), level="WARN", tag="chat")
+                    # 排队期间**释放账号槽位**（2026-11-12）：占着信号量等 60s
+                    # 会把整池堵死——4 个号各睡 60s，后续请求扫不到任何可用
+                    # 槽位 -> "all N account(s) busy" -> 误报"无可用账号"。
+                    # 排队是上游全局状态，不该独占本号并发额度。
+                    if _sem_held:
+                        _release_account_sem(_sem_held)
+                        _sem_held = None
                     try:
-                        on_queue(qwait, detail, queue_tries, QUEUE_MAX_ROUNDS)
+                        on_queue(qwait, detail, queue_tries, _q_max_rounds)
                     except Exception:
                         pass
                     time.sleep(qwait + 1 + random.uniform(0, QUEUE_WAIT_JITTER_SECS))
@@ -9993,7 +10064,11 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                     log("upstream queued on '%s' model '%s' - waiting %ds "
                         "(round %d/%d)"
                         % (account.uid[:8], model, qwait, queue_tries,
-                           QUEUE_MAX_ROUNDS), level="WARN", tag="chat")
+                           _q_max_rounds), level="WARN", tag="chat")
+                    # 同上：排队等待不占用账号槽位
+                    if _sem_held:
+                        _release_account_sem(_sem_held)
+                        _sem_held = None
                     # 抖动 0~2s：多客户端同时被唤醒会一起打同一队列
                     time.sleep(qwait + 1 + random.uniform(0, QUEUE_WAIT_JITTER_SECS))
                     continue
@@ -10359,10 +10434,32 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
             raise RateLimited(last_429, last_429_detail,
                               wait=last_queue_wait
                               or retry_after_seconds(model, realm))
+        # 2026-11-12：信封层排队（上游 HTTP 200 建流后投 403/10605）走的是
+        # last_error 分支，last_429 为空 -> 直接把 403 抛给客户端；更糟的
+        # 是账号池耗尽后落到下面的 RuntimeError("no usable account")，而
+        # 账号其实全部健康（6/6 ready、无冷却）——这是**误导性报错**，用户
+        # 会以为 Key 失效。排队一律转 429 + Retry-After（与 #71 语义一致：
+        # 客户端可自行重试，等上游放行）。
+        _last_q = _queue_wait_seconds(getattr(last_error, "detail", "") or "")
+        if _last_q > 0:
+            raise RateLimited(last_error, getattr(last_error, "detail", "") or "",
+                              wait=_last_q)
         raise last_error
     throttled, wait = realm_model_throttled(realm, model)
     if throttled:
         raise RateLimited(None, "usage exceeds frequency limit", wait=wait)
+    # 2026-11-12：信封层排队的信号记在 usage_ctx 里（见
+    # _handle_envelope_account_cooldown）——上游 HTTP 200 建流后投 403/10605
+    # 时，HTTP 层从未见过排队，last_error/last_429 都是 None，于是这里曾
+    # 抛 RuntimeError("no usable account")，而账号其实全部健康（排队是
+    # 上游**区域级**状态，queueType=p4）。有排队信号就转 429 + Retry-After
+    # （客户端可退避重试），别让用户以为 Key 失效。
+    if isinstance(usage_ctx, dict):
+        _qdet = usage_ctx.get("_envelope_queue_detail")
+        if _qdet:
+            raise RateLimited(None, _qdet,
+                              wait=int(usage_ctx.get("_envelope_queue_wait") or 60))
+    # 账号池确实没有可用号（禁用/冷却/过期）——文案要说清楚是账号问题。
     raise RuntimeError(
         "no usable account for realm '%s': all are disabled, cooling down, or expired"
         % realm)
@@ -14615,7 +14712,8 @@ class Handler(BaseHTTPRequestHandler):
                 except UpstreamStatus as exc:
                     # Anthropic 侧不重开（见 docstring）：直接给终态 error 事件。
                     _handle_envelope_account_cooldown(account, exc, model=model,
-                                                      session_key=session_key)
+                                                      session_key=session_key,
+                                                      usage_ctx=usage_ctx)
                     wall = int((time.time() - t_start) * 1000)
                     record_error(model, exc.status, exc.detail,
                                  elapsed_ms=wall, stream=True,
@@ -14645,6 +14743,15 @@ class Handler(BaseHTTPRequestHandler):
                 chat_obj, account = aggregate_with_envelope_retry(
                     upstream, chat_req, session_key, req_realm, model,
                     holder, account, usage_ctx=usage_ctx)
+            except RateLimited as exc:
+                # 2026-11-12：同 chat 非流式路径——排队耗尽转 429 + Retry-After
+                # （此前落到 except Exception -> 502，客户端拿不到退避提示）。
+                record_error(model, 429, exc.detail[:200],
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             stream=want_stream,
+                             account=account.uid if account else None,
+                             key_id=self._key_id_for_usage())
+                return self._rate_limited(exc)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
                              elapsed_ms=int((time.time() - t_start) * 1000),
@@ -15020,7 +15127,9 @@ class Handler(BaseHTTPRequestHandler):
                             pump_exc = exc
                             break
                         except UpstreamStatus as exc:
-                            _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
+                            _handle_envelope_account_cooldown(account, exc, model=model,
+                                                session_key=session_key,
+                                                usage_ctx=usage_ctx)
                             # 控制帧（response.created 等）先于数据，不能算
                             # “已输出”；以上游数据行计数判断能否重开。
                             if consumed.get("n", 0) == 0 and should_retry_envelope(
@@ -15032,6 +15141,15 @@ class Handler(BaseHTTPRequestHandler):
                                        min(attempts + 1, _queue_budget()),
                                        _queue_budget()),
                                     level="WARN", tag="chat")
+                                # 2026-11-12：排队等待前先关旧连接释放账号槽位
+                                # （等待 61s 期间占着槽位会把池子占满 ->
+                                # "all N account(s) busy" -> 误报无可用账号）。
+                                if _envelope_queue_wait(exc) > 0 and cur is not upstream:
+                                    try:
+                                        cur.close()
+                                    except Exception:
+                                        pass
+                                    cur = upstream
                                 time.sleep(_envelope_retry_wait(exc, attempts))
                                 if _is_image_conversion_timeout(exc.detail):
                                     cur.close()  # Release team concurrency before reopening.
@@ -15160,6 +15278,15 @@ class Handler(BaseHTTPRequestHandler):
                 chat_obj, account = aggregate_with_envelope_retry(
                     upstream, chat_req, session_key, req_realm, model,
                     holder, account, usage_ctx=usage_ctx)
+            except RateLimited as exc:
+                # 2026-11-12：同 chat 非流式路径——排队耗尽转 429 + Retry-After
+                # （此前落到 except Exception -> 502，客户端拿不到退避提示）。
+                record_error(model, 429, exc.detail[:200],
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             stream=want_stream,
+                             account=account.uid if account else None,
+                             key_id=self._key_id_for_usage())
+                return self._rate_limited(exc)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
                              elapsed_ms=int((time.time() - t_start) * 1000),
@@ -15652,7 +15779,9 @@ class Handler(BaseHTTPRequestHandler):
                             pump_exc = exc
                             break
                         except UpstreamStatus as exc:
-                            _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
+                            _handle_envelope_account_cooldown(account, exc, model=model,
+                                                session_key=session_key,
+                                                usage_ctx=usage_ctx)
                             if should_retry_envelope(exc, emitted, attempts, usage_ctx=usage_ctx):
                                 attempts += 1
                                 log("chat in-stream envelope status %s on "
@@ -15661,6 +15790,14 @@ class Handler(BaseHTTPRequestHandler):
                                        min(attempts + 1, _queue_budget()),
                                        _queue_budget()),
                                     level="WARN", tag="chat")
+                                # 2026-11-12：排队等待前先关旧连接释放账号槽位
+                                # （同 responses 路径：等待期间占槽会把池子占满）。
+                                if _envelope_queue_wait(exc) > 0 and cur is not upstream:
+                                    try:
+                                        cur.close()
+                                    except Exception:
+                                        pass
+                                    cur = upstream
                                 time.sleep(_envelope_retry_wait(exc, attempts))
                                 if _is_image_conversion_timeout(exc.detail):
                                     cur.close()  # Release team concurrency before reopening.
@@ -15774,6 +15911,18 @@ class Handler(BaseHTTPRequestHandler):
                 result, account = aggregate_with_envelope_retry(
                     upstream, payload, session_key, req_realm, model,
                     holder, account, usage_ctx=usage_ctx)
+            except RateLimited as exc:
+                # 2026-11-12：非流式聚合路径此前**没有** except RateLimited
+                # ——排队耗尽时抛的 RateLimited 落到下面的 except Exception，
+                # 被包成 502 "upstream stream error: upstream rate limit"，
+                # 客户端拿不到 Retry-After（只能盲目重试）。这里补上：
+                # 429 + Retry-After + 中文原因（与流式路径一致）。
+                record_error(model, 429, exc.detail[:200],
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             stream=want_stream,
+                             account=account.uid if account else None,
+                             key_id=self._key_id_for_usage())
+                return self._rate_limited(exc)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
                              elapsed_ms=int((time.time() - t_start) * 1000),
