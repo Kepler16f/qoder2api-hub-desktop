@@ -369,25 +369,6 @@ class _ExclusiveHTTPServer(ThreadingHTTPServer):
             super().server_bind()
 
 
-class _CompatHTTPServer(ThreadingHTTPServer):
-    """兼容模式（SO_REUSEADDR）：只给「端口只剩 TIME_WAIT 残留」用。
-
-    调用点必须先确认端口上没有进程在 accept（见 _port_accepts），否则就是
-    又开了一个双开入口。
-    """
-    allow_reuse_address = True
-
-
-def _port_accepts(host, port, timeout=0.6):
-    """端口上是否真有监听者在 accept。TIME_WAIT 的残留连接不算。"""
-    target = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
-    try:
-        with socket.create_connection((target, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
-
-
 CHAT_PATH = ("/algo/api/v2/service/pro/sse/agent_chat_generation"
              "?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1")
 MODELS_PATH = "/algo/api/v2/model/list?Encode=1"
@@ -14770,19 +14751,9 @@ def main():
                 print("  看板: http://127.0.0.1:%d/" % args.port)
                 print()
                 return
-            # 独占绑定失败、端口上又没人 accept：只剩 TIME_WAIT 残留（Windows
-            # 重启时常见），降级到兼容模式重绑一次。只要有人 accept 就绝不降级，
-            # 否则等于把双开的大门重新打开。
-            if _kind2 != "foreign" and not _port_accepts(args.host, args.port):
-                try:
-                    server = _CompatHTTPServer((args.host, args.port), Handler)
-                except OSError:
-                    pass
-                else:
-                    print("  [WARN] %d 端口仅剩 TIME_WAIT 残留，已用兼容模式绑定"
-                          % args.port)
-                    sys.stdout.flush()
-                    break
+            # A failed TCP probe cannot prove TIME_WAIT: a listener may be
+            # bound but not accepting, filtered, or start after the probe.
+            # Keep exclusive binding on every retry; never fall back to reuse.
             if _attempt < 2:
                 print("  [WARN] bind %s:%d 失败（%s）——端口可能仍在释放，"
                       "重试 %d/3 ..." % (args.host, args.port, exc, _attempt + 1))
