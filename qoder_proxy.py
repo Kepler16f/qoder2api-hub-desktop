@@ -71,7 +71,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.9.7"
+VERSION = "1.9.8"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -4042,6 +4042,50 @@ def is_deepseek_model(model="", model_key=""):
     return "deepseek" in low
 
 
+def is_kimi_model(model="", model_key=""):
+    """Resolve both provider keys and client-facing aliases (issue #153)."""
+    keys = ("kmodel", "kmodel_latest")
+    for candidate in (model_key, model):
+        low = str(candidate or "").strip().lower()
+        if low in keys or re.search(r"(?:^|[^a-z0-9])kimi(?:$|[^a-z0-9])", low):
+            return True
+    return False
+
+
+# Stable request-prefix instruction, not a per-turn reminder: do not change
+# history/tool schemas or claim upstream strict-schema support we did not verify.
+KIMI_TOOL_PROTOCOL_PROMPT = """[Tool protocol requirements]
+When tools are available, use the native tool_calls channel for actual tool calls.
+Historical tool-call text and tool-result messages are records, not output templates.
+Do not repeat textual tool-call markers, XML/DSML tags, JSON call envelopes, or
+Markdown fences as a substitute for a native tool call. Ordinary answers remain
+ordinary text; the presence of tools does not require calling one.
+For each tool call, arguments must encode one complete valid JSON object matching
+that tool's declared parameters, required fields and value types. Use double-quoted
+JSON keys and strings; escape inner quotes, backslashes, newlines, tabs and control
+characters. Preserve code/file/command content exactly through JSON escaping.
+Do not use Python literals, comments, trailing commas, NaN/Infinity, or expressions
+as JSON values, or a JSON-encoded string instead of the arguments object.
+Before emitting the call, check the full JSON syntax and schema. For long file writes
+or edits, prefer smaller complete calls when the tool schema and task permit; never
+truncate a JSON string/object. Do not claim execution until a tool result arrives.
+[/Tool protocol requirements]"""
+
+
+def _apply_kimi_tool_protocol(body, payload, model_key):
+    if not is_kimi_model(payload.get("model"), model_key) or not body.get("tools"):
+        return
+    choice = payload.get("tool_choice")
+    if choice == "none" or (isinstance(choice, dict) and choice.get("type") == "none"):
+        return
+    messages = body["messages"]
+    system = next((m for m in messages if m.get("role") == "system"), None)
+    if system is None:
+        messages.insert(0, {"role": "system", "content": KIMI_TOOL_PROTOCOL_PROMPT})
+    elif KIMI_TOOL_PROTOCOL_PROMPT not in str(system.get("content") or ""):
+        system["content"] = str(system.get("content") or "") + "\n\n" + KIMI_TOOL_PROTOCOL_PROMPT
+
+
 def backfill_reasoning_content(messages, model, model_key=""):
     """DeepSeek 多轮一致性：assistant 历史补 reasoning_content。
 
@@ -6682,6 +6726,9 @@ def _current_turn_start(messages):
 # Anthropic 入口，1,283 次工具调用 0 降级；同环境开启前基线 0.30%）。
 # 结构化直传后模型看不到 LEAK_MARKER 文本格式，也就无从复述——这是治本项。
 # _tool_ids_ok 守卫仍在：客户端 id 不齐备时自动回退文本化，不会踩坑。
+# issue #153：Kimi 仍走文本化会在长工具链复述双层 JSON 信封；加入同一结构化
+# 决策（content 恒为空字符串）并在有工具的请求中添加稳定的 JSON/原生调用约束。
+# 这是生成端预防，不能保证模型不再犯错，现有出站参数守卫仍保持不变。
 # issue #60 follow-up：DeepSeek 的**上游 key 是 `dfmodel`**（显示名 DeepSeek-V4-Flash），
 # 只写 "deepseek" 匹配不到 -> auto 一直是文本化，模型照抄伪协议。两个都保留。
 STRUCTURED_TOOL_HISTORY_WHITELIST = ("qwen", "glm", "gm4", "gm5",
@@ -6737,7 +6784,7 @@ def structured_tool_history_enabled(model="", model_key="", realm="",
     """本次请求是否走结构化工具历史。
 
     - off          -> False（一键回退文本化）
-    - on           -> True（显式强制：DeepSeek / Kimi / INTL 补验证用）
+    - on           -> True（显式强制，包括白名单之外的模型）
     - auto（默认） -> 「允许的出口 + provider 白名单 + id 齐备」为真：
         默认允许 CN / INTL；QD_STRUCTURED_TOOL_HISTORY_REALMS 可缩小范围。
     任何模式下 id 不齐备都回退文本化（fail-safe：宁可少用，不发畸形请求）。
@@ -6753,7 +6800,8 @@ def structured_tool_history_enabled(model="", model_key="", realm="",
         return False
     for cand in (str(model_key or ""), str(model or "")):
         low = cand.strip().lower()
-        if low and low.startswith(STRUCTURED_TOOL_HISTORY_WHITELIST):
+        if low and (low.startswith(STRUCTURED_TOOL_HISTORY_WHITELIST)
+                    or is_kimi_model(cand)):
             if not _STRUCTURED_LOG_ONCE["done"]:
                 _STRUCTURED_LOG_ONCE["done"] = True
                 log("structured tool history: ON (model=%s key=%s realm=%s)"
@@ -7105,6 +7153,7 @@ def build_qoder_body(payload, account, model_key, realm=None, conversation=None)
     # 上游要求 tools[].function 对象，否则 400
     # "'function' is a required property, expected an object - 'tools.N'"。
     normalize_tools(body)
+    _apply_kimi_tool_protocol(body, payload, model_key)
 
     # business 会话卡片
     biz = body.get("business") or {}
