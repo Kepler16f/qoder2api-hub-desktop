@@ -351,6 +351,24 @@ def port_owner_hint(port):
     return cmds
 
 
+class _ExclusiveHTTPServer(ThreadingHTTPServer):
+    """端口独占绑定（Windows 双开防护）。
+
+    POSIX 的 SO_REUSEADDR 只允许复用 TIME_WAIT，重启瞬间不会误伤，保持开启；
+    Windows 的 SO_REUSEADDR 连「正在被监听的端口」也允许抢绑 —— 升级重启时
+    新旧两个实例都能 bind 成功，连接被静默分流，旧实例继续应答 /health，新版本
+    永远不生效（1.9.7 实测：看板一直提示「有新版本」）。Windows 改用
+    SO_EXCLUSIVEADDRUSE，抢绑直接 WSAEADDRINUSE。
+    """
+    allow_reuse_address = not IS_WINDOWS
+
+    if IS_WINDOWS:  # pragma: no cover - 平台分支
+        def server_bind(self):
+            self.socket.setsockopt(socket.SOL_SOCKET,
+                                   socket.SO_EXCLUSIVEADDRUSE, 1)
+            super().server_bind()
+
+
 CHAT_PATH = ("/algo/api/v2/service/pro/sse/agent_chat_generation"
              "?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1")
 MODELS_PATH = "/algo/api/v2/model/list?Encode=1"
@@ -14741,7 +14759,7 @@ def main():
     server = None
     for _attempt in range(3):
         try:
-            server = ThreadingHTTPServer((args.host, args.port), Handler)
+            server = _ExclusiveHTTPServer((args.host, args.port), Handler)
             break
         except OSError as exc:
             _kind2 = classify_existing_instance(_probe_health(1.0))
@@ -14751,6 +14769,9 @@ def main():
                 print("  看板: http://127.0.0.1:%d/" % args.port)
                 print()
                 return
+            # A failed TCP probe cannot prove TIME_WAIT: a listener may be
+            # bound but not accepting, filtered, or start after the probe.
+            # Keep exclusive binding on every retry; never fall back to reuse.
             if _attempt < 2:
                 print("  [WARN] bind %s:%d 失败（%s）——端口可能仍在释放，"
                       "重试 %d/3 ..." % (args.host, args.port, exc, _attempt + 1))
