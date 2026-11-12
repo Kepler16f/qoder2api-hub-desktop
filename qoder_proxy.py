@@ -351,6 +351,43 @@ def port_owner_hint(port):
     return cmds
 
 
+class _ExclusiveHTTPServer(ThreadingHTTPServer):
+    """端口独占绑定（Windows 双开防护）。
+
+    POSIX 的 SO_REUSEADDR 只允许复用 TIME_WAIT，重启瞬间不会误伤，保持开启；
+    Windows 的 SO_REUSEADDR 连「正在被监听的端口」也允许抢绑 —— 升级重启时
+    新旧两个实例都能 bind 成功，连接被静默分流，旧实例继续应答 /health，新版本
+    永远不生效（1.9.7 实测：看板一直提示「有新版本」）。Windows 改用
+    SO_EXCLUSIVEADDRUSE，抢绑直接 WSAEADDRINUSE。
+    """
+    allow_reuse_address = not IS_WINDOWS
+
+    if IS_WINDOWS:  # pragma: no cover - 平台分支
+        def server_bind(self):
+            self.socket.setsockopt(socket.SOL_SOCKET,
+                                   socket.SO_EXCLUSIVEADDRUSE, 1)
+            super().server_bind()
+
+
+class _CompatHTTPServer(ThreadingHTTPServer):
+    """兼容模式（SO_REUSEADDR）：只给「端口只剩 TIME_WAIT 残留」用。
+
+    调用点必须先确认端口上没有进程在 accept（见 _port_accepts），否则就是
+    又开了一个双开入口。
+    """
+    allow_reuse_address = True
+
+
+def _port_accepts(host, port, timeout=0.6):
+    """端口上是否真有监听者在 accept。TIME_WAIT 的残留连接不算。"""
+    target = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+    try:
+        with socket.create_connection((target, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 CHAT_PATH = ("/algo/api/v2/service/pro/sse/agent_chat_generation"
              "?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1")
 MODELS_PATH = "/algo/api/v2/model/list?Encode=1"
@@ -14723,7 +14760,7 @@ def main():
     server = None
     for _attempt in range(3):
         try:
-            server = ThreadingHTTPServer((args.host, args.port), Handler)
+            server = _ExclusiveHTTPServer((args.host, args.port), Handler)
             break
         except OSError as exc:
             _kind2 = classify_existing_instance(_probe_health(1.0))
@@ -14733,6 +14770,19 @@ def main():
                 print("  看板: http://127.0.0.1:%d/" % args.port)
                 print()
                 return
+            # 独占绑定失败、端口上又没人 accept：只剩 TIME_WAIT 残留（Windows
+            # 重启时常见），降级到兼容模式重绑一次。只要有人 accept 就绝不降级，
+            # 否则等于把双开的大门重新打开。
+            if _kind2 != "foreign" and not _port_accepts(args.host, args.port):
+                try:
+                    server = _CompatHTTPServer((args.host, args.port), Handler)
+                except OSError:
+                    pass
+                else:
+                    print("  [WARN] %d 端口仅剩 TIME_WAIT 残留，已用兼容模式绑定"
+                          % args.port)
+                    sys.stdout.flush()
+                    break
             if _attempt < 2:
                 print("  [WARN] bind %s:%d 失败（%s）——端口可能仍在释放，"
                       "重试 %d/3 ..." % (args.host, args.port, exc, _attempt + 1))
