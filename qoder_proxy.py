@@ -321,7 +321,18 @@ from pathlib import Path
 # 之外的全部 openapi 调用，_stub 注入点不变），_opener_for_request 保
 # UPSTREAM_OPENER 单例。上游同一区间发到 VERSION 1.9.6，本 fork 继续
 # 日期制版本号）。
-VERSION = "2026.11.12.1_re"
+# 11-13：.1_upstream = 并入上游 v1.9.7-v1.9.8（#153 Kimi 工具协议：展示名与
+# 内部 key 统一识别、纳入 CN/INTL 默认结构化工具历史、有工具时追加稳定的原生
+# 工具通道与 JSON 约束提示、不改 schema/推理强度/采样参数、坏参数仍协议校验
+# 不猜测补齐；PR #155 Windows 改用 SO_EXCLUSIVEADDRUSE 独占绑定，堵住升级后
+# 静默双开（SO_REUSEADDR 允许二进程同 listen，连接分流到旧实例、/health 永
+# 回旧版本），POSIX 保留地址复用、维护者移除不安全降级回退；PR #154 更新检查
+# 查不到 GitHub 不再谎报「已是最新版本」——该块属一键更新红线区，整块剔除。
+# fork 缝合：模型发现的 VPC opener 分流保留但仍走统一 UPSTREAM_OPENER；
+# 账号测试失败回包 = 上游 VPC 感知的 account_realm_config + fork 的
+# quota 不叠冷却 / detail / hint / 日志增强。
+# 上游同一区间发到 VERSION 1.9.8，本 fork 继续日期制版本号）。
+VERSION = "2026.11.13.1_upstream"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -599,6 +610,24 @@ def port_owner_hint(port):
         ["ss -ltnp | grep :%d" % port,
          "lsof -iTCP:%d -sTCP:LISTEN" % port]
     return cmds
+
+
+class _ExclusiveHTTPServer(ThreadingHTTPServer):
+    """端口独占绑定（Windows 双开防护）。
+
+    POSIX 的 SO_REUSEADDR 只允许复用 TIME_WAIT，重启瞬间不会误伤，保持开启；
+    Windows 的 SO_REUSEADDR 连「正在被监听的端口」也允许抢绑 —— 升级重启时
+    新旧两个实例都能 bind 成功，连接被静默分流，旧实例继续应答 /health，新版本
+    永远不生效（1.9.7 实测：看板一直提示「有新版本」）。Windows 改用
+    SO_EXCLUSIVEADDRUSE，抢绑直接 WSAEADDRINUSE。
+    """
+    allow_reuse_address = not IS_WINDOWS
+
+    if IS_WINDOWS:  # pragma: no cover - 平台分支
+        def server_bind(self):
+            self.socket.setsockopt(socket.SOL_SOCKET,
+                                   socket.SO_EXCLUSIVEADDRUSE, 1)
+            super().server_bind()
 
 
 CHAT_PATH = ("/algo/api/v2/service/pro/sse/agent_chat_generation"
@@ -3733,7 +3762,7 @@ def read_dynamic_models(realm=None):
     # 签名以 qoder_encode("{}") 作为 body 参与 MD5；请求同样携带该 body。
     sign_body = qoder_encode(b"{}")
     payload = None
-    for host in gateway_candidates(r):
+    for host in gateway_candidates(r, qoder_accounts.account_realm_config(account)):
         raw_url = host + MODELS_PATH
         try:
             sess = SESSIONS.get(account)
@@ -3742,6 +3771,8 @@ def read_dynamic_models(realm=None):
             url = validate_public_http_url(raw_url)
             req = urllib.request.Request(url, data=sign_body.encode("utf-8"),
                                          method="GET", headers=headers)
+            # fork：统一走 UPSTREAM_OPENER（其 open() 内已按 VPC 主机附加
+            # _VpcRedirectHandler 做重定向隔离校验）——不引入上游的分支 opener。
             with UPSTREAM_OPENER.open(req, timeout=15) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             break
@@ -4580,6 +4611,50 @@ def is_deepseek_model(model="", model_key=""):
         return True
     # 展示 id「dfmodel (DeepSeek-Flash)」/ 别名 deepseek-v4-flash 等
     return "deepseek" in low
+
+
+def is_kimi_model(model="", model_key=""):
+    """Resolve both provider keys and client-facing aliases (issue #153)."""
+    keys = ("kmodel", "kmodel_latest")
+    for candidate in (model_key, model):
+        low = str(candidate or "").strip().lower()
+        if low in keys or re.search(r"(?:^|[^a-z0-9])kimi(?:$|[^a-z0-9])", low):
+            return True
+    return False
+
+
+# Stable request-prefix instruction, not a per-turn reminder: do not change
+# history/tool schemas or claim upstream strict-schema support we did not verify.
+KIMI_TOOL_PROTOCOL_PROMPT = """[Tool protocol requirements]
+When tools are available, use the native tool_calls channel for actual tool calls.
+Historical tool-call text and tool-result messages are records, not output templates.
+Do not repeat textual tool-call markers, XML/DSML tags, JSON call envelopes, or
+Markdown fences as a substitute for a native tool call. Ordinary answers remain
+ordinary text; the presence of tools does not require calling one.
+For each tool call, arguments must encode one complete valid JSON object matching
+that tool's declared parameters, required fields and value types. Use double-quoted
+JSON keys and strings; escape inner quotes, backslashes, newlines, tabs and control
+characters. Preserve code/file/command content exactly through JSON escaping.
+Do not use Python literals, comments, trailing commas, NaN/Infinity, or expressions
+as JSON values, or a JSON-encoded string instead of the arguments object.
+Before emitting the call, check the full JSON syntax and schema. For long file writes
+or edits, prefer smaller complete calls when the tool schema and task permit; never
+truncate a JSON string/object. Do not claim execution until a tool result arrives.
+[/Tool protocol requirements]"""
+
+
+def _apply_kimi_tool_protocol(body, payload, model_key):
+    if not is_kimi_model(payload.get("model"), model_key) or not body.get("tools"):
+        return
+    choice = payload.get("tool_choice")
+    if choice == "none" or (isinstance(choice, dict) and choice.get("type") == "none"):
+        return
+    messages = body["messages"]
+    system = next((m for m in messages if m.get("role") == "system"), None)
+    if system is None:
+        messages.insert(0, {"role": "system", "content": KIMI_TOOL_PROTOCOL_PROMPT})
+    elif KIMI_TOOL_PROTOCOL_PROMPT not in str(system.get("content") or ""):
+        system["content"] = str(system.get("content") or "") + "\n\n" + KIMI_TOOL_PROTOCOL_PROMPT
 
 
 def backfill_reasoning_content(messages, model, model_key=""):
@@ -7222,6 +7297,9 @@ def _current_turn_start(messages):
 # Anthropic 入口，1,283 次工具调用 0 降级；同环境开启前基线 0.30%）。
 # 结构化直传后模型看不到 LEAK_MARKER 文本格式，也就无从复述——这是治本项。
 # _tool_ids_ok 守卫仍在：客户端 id 不齐备时自动回退文本化，不会踩坑。
+# issue #153：Kimi 仍走文本化会在长工具链复述双层 JSON 信封；加入同一结构化
+# 决策（content 恒为空字符串）并在有工具的请求中添加稳定的 JSON/原生调用约束。
+# 这是生成端预防，不能保证模型不再犯错，现有出站参数守卫仍保持不变。
 # issue #60 follow-up：DeepSeek 的**上游 key 是 `dfmodel`**（显示名 DeepSeek-V4-Flash），
 # 只写 "deepseek" 匹配不到 -> auto 一直是文本化，模型照抄伪协议。两个都保留。
 STRUCTURED_TOOL_HISTORY_WHITELIST = ("qwen", "glm", "gm4", "gm5",
@@ -7277,7 +7355,7 @@ def structured_tool_history_enabled(model="", model_key="", realm="",
     """本次请求是否走结构化工具历史。
 
     - off          -> False（一键回退文本化）
-    - on           -> True（显式强制：DeepSeek / Kimi / INTL 补验证用）
+    - on           -> True（显式强制，包括白名单之外的模型）
     - auto（默认） -> 「允许的出口 + provider 白名单 + id 齐备」为真：
         默认允许 CN / INTL；QD_STRUCTURED_TOOL_HISTORY_REALMS 可缩小范围。
     任何模式下 id 不齐备都回退文本化（fail-safe：宁可少用，不发畸形请求）。
@@ -7293,7 +7371,8 @@ def structured_tool_history_enabled(model="", model_key="", realm="",
         return False
     for cand in (str(model_key or ""), str(model or "")):
         low = cand.strip().lower()
-        if low and low.startswith(STRUCTURED_TOOL_HISTORY_WHITELIST):
+        if low and (low.startswith(STRUCTURED_TOOL_HISTORY_WHITELIST)
+                    or is_kimi_model(cand)):
             if not _STRUCTURED_LOG_ONCE["done"]:
                 _STRUCTURED_LOG_ONCE["done"] = True
                 log("structured tool history: ON (model=%s key=%s realm=%s)"
@@ -7858,6 +7937,7 @@ def build_qoder_body(payload, account, model_key, realm=None,
     # 上游要求 tools[].function 对象，否则 400
     # "'function' is a required property, expected an object - 'tools.N'"。
     normalize_tools(body)
+    _apply_kimi_tool_protocol(body, payload, model_key)
 
     # business 会话卡片
     biz = body.get("business") or {}
@@ -9974,7 +10054,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
             raise PayloadTooLarge(len(encoded), MAX_UPSTREAM_BODY_BYTES)
         # 官方候选推理主机（国际版 api1/api2/api3）：传输层失败时切换域名，
         # 签名只覆盖 path，换主机不影响签名有效性。
-        hosts = gateway_candidates(account.realm)
+        hosts = gateway_candidates(account.realm, qoder_accounts.account_realm_config(account))
         host_i = 0
         raw_url = hosts[host_i] + CHAT_PATH
 
@@ -14218,7 +14298,9 @@ class Handler(BaseHTTPRequestHandler):
                 target_realm = "cn"
             try:
                 started = POOL.start_login(realm=target_realm,
-                                           platform=platform)
+                                           platform=platform, vpc=payload.get("vpc"))
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
             except Exception as exc:
                 return self._error(502, "could not start login: %s" % exc)
             log("oauth device login started (realm=%s, state=%s)"
@@ -14227,13 +14309,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/accounts/login/cancel":
             state = payload.get("state") or ""
             return self._json(200, {"cancelled": POOL.cancel_login(state)})
-        if path == "/accounts/import/pat":
+        if path in ("/accounts/import/pat", "/accounts/import-pat"):
             pat = payload.get("pat") or ""
             realm = payload.get("realm") or CURRENT_REALM
             if realm not in ("intl", "cn"):
                 realm = "cn"
             try:
-                account = POOL.import_pat(pat, realm=realm)
+                account = POOL.import_pat(pat, realm=realm, vpc=payload.get("vpc"))
             except Exception as exc:
                 return self._error(400, "PAT import failed: %s" % exc)
             log("imported PAT account %s (realm=%s)"
@@ -14452,26 +14534,35 @@ class Handler(BaseHTTPRequestHandler):
                     # 点名目标地址并给三步排查
                     shown = _friendly_net_error(
                         exc,
-                        qoder_accounts.get_realm_config(
-                            acc_realm(account))["gateway"])
-            # issue #134：quota 类错误不叠冷却（test_quota_hit 已在上方判定）
-            if not test_quota_hit:
-                account.note_error(shown[:120], cooldown=60)
-            _save_test(False, shown[:160])
-            log("account test: uid=%s model=%s wall=%dms upstream=%s %s"
-                % (account.uid[:8], test_model, wall_ms,
-                   getattr(exc, "status", "?"), (_hint or shown)[:120]),
-                level="WARN", tag="accounts")
-            return self._json(200, {"ok": False, "uid": account.uid,
-                                    "status": status,
-                                    "error": shown[:400],
-                                    "detail": test_detail,
-                                    "hint": test_hint,
-                                    "elapsed_ms": wall_ms})
+                            qoder_accounts.account_realm_config(account)["gateway"])
+                # issue #134：quota 类错误不叠冷却（test_quota_hit 已在上方判定）
+                if not test_quota_hit:
+                    account.note_error(shown[:120], cooldown=60)
+                _save_test(False, shown[:160])
+                log("account test: uid=%s model=%s wall=%dms upstream=%s %s"
+                    % (account.uid[:8], test_model, wall_ms,
+                       getattr(exc, "status", "?"), (_hint or shown)[:120]),
+                    level="WARN", tag="accounts")
+                return self._json(200, {"ok": False, "uid": account.uid,
+                                        "status": status,
+                                        "error": shown[:400],
+                                        "detail": test_detail,
+                                        "hint": test_hint,
+                                        "elapsed_ms": wall_ms})
         if path == "/accounts/set":
             uid = payload.get("uid")
             if not uid:
                 return self._error(400, "uid required")
+            if "vpcEndpoint" in payload:
+                try:
+                    changed = POOL.set_vpc(uid, payload["vpcEndpoint"])
+                except ValueError as exc:
+                    return self._error(400, str(exc), "invalid_request_error")
+                if changed is None:
+                    return self._error(404, "no such account")
+                import qoder_tasks
+                qoder_tasks.invalidate_panel_cache()
+                return self._json(200, {"account": changed})
             updated = POOL.set_enabled(uid, bool(payload.get("enabled")))
             if updated is None:
                 return self._error(404, "no such account")
@@ -16343,7 +16434,7 @@ def main(argv=None):
     server = None
     for _attempt in range(3):
         try:
-            server = ThreadingHTTPServer((args.host, args.port), Handler)
+            server = _ExclusiveHTTPServer((args.host, args.port), Handler)
             break
         except OSError as exc:
             _kind2 = classify_existing_instance(_probe_health(1.0))
@@ -16353,6 +16444,9 @@ def main(argv=None):
                 print("  看板: http://127.0.0.1:%d/" % args.port)
                 print()
                 return
+            # A failed TCP probe cannot prove TIME_WAIT: a listener may be
+            # bound but not accepting, filtered, or start after the probe.
+            # Keep exclusive binding on every retry; never fall back to reuse.
             if _attempt < 2:
                 print("  [WARN] bind %s:%d 失败（%s）——端口可能仍在释放，"
                       "重试 %d/3 ..." % (args.host, args.port, exc, _attempt + 1))

@@ -49,8 +49,10 @@ with tempfile.TemporaryDirectory() as d:
   exported=R.read_chat_models(path)
  check('snapshot refresh shares exact extraction rule',exported==rows)
  fake=types.SimpleNamespace(headers=lambda *a,**k:{})
-  # fork：出站走 UPSTREAM_OPENER，patch P.urllib.request.urlopen 拦不到（第 5 次同型）
- with mock.patch.object(P,'POOL',types.SimpleNamespace(pick=lambda **k:object())),mock.patch.object(P.SESSIONS,'get',return_value=fake),mock.patch.object(P,'gateway_candidates',return_value=['https://example.invalid']),mock.patch.object(P,'validate_public_http_url',side_effect=lambda x:x),mock.patch.object(A.UpstreamOpener,'_stub',return_value=io.BytesIO(plain)):
+ # fork：出站走 UPSTREAM_OPENER，patch P.urllib.request.urlopen 拦不到（第 5 次同型）
+ # —— 但 POOL 桩取上游的真实 Account（上游的模型发现要读账号级 realm 配置，
+ # 纯 object() 桩会缺 vpcEndpoint 属性）。
+ with mock.patch.object(P,'POOL',types.SimpleNamespace(pick=lambda **k:A.Account({"uid":"catalog-fixture","realm":"cn","vpcEndpoint":"","accessToken":"fixture"}))),mock.patch.object(P.SESSIONS,'get',return_value=fake),mock.patch.object(P,'gateway_candidates',return_value=['https://example.invalid']),mock.patch.object(P,'validate_public_http_url',side_effect=lambda x:x),mock.patch.object(A.UpstreamOpener,'_stub',return_value=io.BytesIO(plain)):
   live=P.read_dynamic_models('cn')
  check('online discovery includes app-only QoDuck',[m for m,_ in live]==['shared','lmodel'])
  check('live metadata retains false and zero values',live[0][1]['enable'] is False and live[1][1]['price_factor']==0)

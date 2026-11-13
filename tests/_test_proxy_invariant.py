@@ -64,7 +64,10 @@ check("qoder_accounts.py 直连 urlopen 基线 == 0（出站统一走 _opener_fo
       n_direct == 0, n_direct)
 src_p = open(os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8").read()
 n_direct_p = src_p.count("urllib.request.urlopen(")
-check("qoder_proxy.py 直连 urlopen 基线 == 1（fork：仅本地端口探测）",
+# fork：模型发现（含上游新增的 VPC 分支）也走统一 UPSTREAM_OPENER——其 open()
+# 内按 VPC 主机附加 _VpcRedirectHandler 做重定向隔离校验，不引入上游的
+# 「按账号分流、其中一支用 urlopen」形态，故直连 urlopen 仍是 1 处（本地端口探测）。
+check("qoder_proxy.py 直连 urlopen 基线 == 1（fork：仅本地端口探测；模型发现走统一 opener）",
       n_direct_p == 1, n_direct_p)
 
 print("")
