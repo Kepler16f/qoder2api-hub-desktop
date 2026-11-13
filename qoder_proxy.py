@@ -332,7 +332,12 @@ from pathlib import Path
 # 账号测试失败回包 = 上游 VPC 感知的 account_realm_config + fork 的
 # quota 不叠冷却 / detail / hint / 日志增强。
 # 上游同一区间发到 VERSION 1.9.8，本 fork 继续日期制版本号）。
-VERSION = "2026.11.13.1_upstream"
+# 11-13：.2_re = 修合并回归：main() 里上游的 ap.parse_args() 与 fork 的
+# ap.parse_args(argv) 并成两行，第二行忽略传入 argv 改读 sys.argv——
+# 桌面壳内嵌启动网关时 sys.argv 带 --smoke-test/--smoke-gui，argparse 直接
+# exit 2，网关线程当场死（冒烟只剩 health=FAIL、CI 必红），内嵌传的 --port
+# 也被默认值 8790 覆盖。现只留一次 ap.parse_args(argv)。
+VERSION = "2026.11.13.2_re"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -16133,8 +16138,11 @@ def main(argv=None):
     ap.add_argument("--pid-file", default=None,
                     help="write the server PID to this file (stop.bat uses it; "
                          "removed on exit)")
+    # 只解析一次，且必须用传入的 argv：桌面壳等内嵌调用方传自己的参数表
+    # （--port / --accounts-dir / --usage-dir），若再补一次 ap.parse_args()
+    # 读 sys.argv，会把内嵌调用的参数整段丢掉（--smoke-test 之类未知参数直接
+    # 触发 argparse exit 2，网关线程当场死，冒烟只剩 health=FAIL）。
     args = ap.parse_args(argv)
-    args = ap.parse_args()
     if qoder_accounts.vpc_config_error():
         sys.stderr.write(
             "[ERROR] invalid QD_CN_VPC_ENDPOINT: %s\n"
