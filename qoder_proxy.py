@@ -36,6 +36,7 @@ import os
 MAX_PAYLOAD_BYTES = int(os.environ.get("QD_MAX_PAYLOAD_BYTES", 50 * 1024 * 1024))  # 50MB limit
 import ipaddress
 import socket
+import signal
 import ssl
 import sys
 import threading
@@ -337,7 +338,16 @@ from pathlib import Path
 # 桌面壳内嵌启动网关时 sys.argv 带 --smoke-test/--smoke-gui，argparse 直接
 # exit 2，网关线程当场死（冒烟只剩 health=FAIL、CI 必红），内嵌传的 --port
 # 也被默认值 8790 覆盖。现只留一次 ap.parse_args(argv)。
-VERSION = "2026.11.13.2_re"
+# 11-16：.1_upstream = 并入上游 v1.9.9（fa44d07 / PR #157：上游不同 tool id
+# 复用同一 wire index 时按 id 规范化独立槽位，插在流式守卫与非流式聚合入口，
+# 帧未被改时保持原字节、无名/截断参数仍明确失败；d0f4837 / issue #156：容器
+# PID 1 的 SIGTERM 优雅退出——serve_http_server 仅主线程注册 TERM→SystemExit(0)
+# 解卷 serve 循环，绝不在 signal handler 里调同线程会死锁的 HTTPServer.shutdown()，
+# 清理期重复 TERM 忽略、Ctrl+C 行为不变；另修 macOS 监听测试 SO_ACCEPTCONN
+# 兼容）。fork 缝合：SIGTERM 运行器包进 rebind 循环——桌面壳内嵌启动仍走
+# SERVER 跨线程 shutdown()，行为不变。（合并在 11-15 做，提交跨零点落在 11-16，
+# 版本日期按提交当天走）
+VERSION = "2026.11.16.1_upstream"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -633,6 +643,40 @@ class _ExclusiveHTTPServer(ThreadingHTTPServer):
             self.socket.setsockopt(socket.SOL_SOCKET,
                                    socket.SO_EXCLUSIVEADDRUSE, 1)
             super().server_bind()
+
+
+def serve_http_server(server):
+    """Handle PID 1 SIGTERM without calling shutdown on the serving thread.
+
+    SystemExit unwinds serve_forever into server_close and normal atexit cleanup.
+    HTTPServer.shutdown() must not be used in this handler: it waits for the same
+    thread's serve_forever loop and deadlocks. Repeated TERM during close is ignored.
+    """
+    previous = None
+    installed = False
+    stopping = False
+
+    def terminate(signum, frame):
+        nonlocal stopping
+        if not stopping:
+            stopping = True
+            raise SystemExit(0)
+
+    try:
+        if threading.current_thread() is threading.main_thread():
+            previous = signal.signal(signal.SIGTERM, terminate)
+            installed = True
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            log("bye")
+    finally:
+        stopping = True
+        try:
+            server.server_close()
+        finally:
+            if installed:
+                signal.signal(signal.SIGTERM, previous)
 
 
 CHAT_PATH = ("/algo/api/v2/service/pro/sse/agent_chat_generation"
@@ -6120,6 +6164,62 @@ def _frame_without_content(payload):
     return out
 
 
+def _sse_normalize_tool_call_indices(frames):
+    states = {}
+    for raw in frames:
+        text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+        data = strip_data_prefix(text)
+        try:
+            payload = json.loads(data) if data and data != "[DONE]" else None
+        except (TypeError, ValueError):
+            payload = None
+        if not isinstance(payload, dict) or not isinstance(payload.get("choices"), list):
+            yield raw
+            continue
+        changed = False
+        for choice_position, choice in enumerate(payload["choices"]):
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta")
+            calls = delta.get("tool_calls") if isinstance(delta, dict) else None
+            if not isinstance(calls, list):
+                continue
+            choice_index = choice.get("index")
+            if not isinstance(choice_index, int) or isinstance(choice_index, bool):
+                choice_index = choice_position
+            state = states.setdefault(choice_index, {"ids": {}, "active": {}, "slots": {}})
+            for call_position, call in enumerate(calls):
+                if not isinstance(call, dict):
+                    continue
+                wire_index = call.get("index")
+                if not isinstance(wire_index, int) or isinstance(wire_index, bool) or wire_index < 0:
+                    wire_index = call_position
+                call_id = call.get("id")
+                call_id = call_id if isinstance(call_id, str) and call_id.strip() else ""
+                slot = state["ids"].get(call_id) if call_id else None
+                if slot is None:
+                    slot = state["active"].get(wire_index)
+                    if slot is not None and call_id and slot["id"] and slot["id"] != call_id:
+                        slot = None
+                if slot is None:
+                    normalized_index = wire_index
+                    if normalized_index in state["slots"]:
+                        normalized_index = max(state["slots"], default=-1) + 1
+                    slot = {"index": normalized_index, "id": call_id}
+                    state["slots"][normalized_index] = slot
+                if call_id:
+                    slot["id"] = call_id
+                    state["ids"][call_id] = slot
+                state["active"][wire_index] = slot
+                if call.get("index") != slot["index"] or isinstance(call.get("index"), bool):
+                    call["index"] = slot["index"]
+                    changed = True
+        if changed:
+            yield ("data: " + json.dumps(payload, ensure_ascii=False) + "\n\n").encode("utf-8")
+        else:
+            yield raw
+
+
 def _sse_fill_tool_call_ids(frames):
     """流式出口保证：tool_call 增量的 id 必须非空（issue #47）。
 
@@ -7120,6 +7220,7 @@ def recover_leaked_tool_calls(frames, allowed_names=None, audit=None):
     各阶段都是生成器，顺序即数据流方向；用具名中间变量而非层层嵌套 ——
     出口是包装器这一事实要能被静态断言钉住（见 _test_stream_tool_ids 第 7 节）。
     """
+    frames = _sse_normalize_tool_call_indices(frames)
     leaked = _recover_leaked_tool_calls_inner(frames, allowed_names)
     dsml = _sse_recover_dsml(leaked, allowed_names)
     tagged = _sse_recover_tool_tags(dsml, allowed_names)
@@ -10769,7 +10870,7 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
     first_chunk_at = None
     created = None
 
-    for line in iter_inner_sse(resp, holder=holder):
+    for line in _sse_normalize_tool_call_indices(iter_inner_sse(resp, holder=holder)):
         data = strip_data_prefix(line.decode("utf-8", "replace"))
         if not data or data == "[DONE]":
             continue
@@ -16504,18 +16605,23 @@ def main(argv=None):
     # 进程生命周期内保持 handler 引用：SetConsoleCtrlHandler 存的是裸指针，
     # 回调被 GC 会在关窗时崩溃。
     _ctrl_handler = install_console_close_handler()
+    # fork 缝合：保留 rebind 循环与内嵌 SERVER 停机入口，把上游 v1.9.9 的
+    # serve_http_server（#156：SIGTERM → SystemExit(0) 解卷 serve 循环，绝不在
+    # signal handler 里调 HTTPServer.shutdown()——同线程等自己必死锁）当作每次
+    # 服务会话的运行器：仅主线程注册 handler（桌面壳把 main() 跑在子线程，
+    # 行为不变），每个会话结束其 finally 关旧监听并恢复 handler，重绑在循环尾部换新。
     try:
         SERVER = server   # 桌面壳等内嵌调用方经此优雅停机（shutdown() 须跨线程调）
         while True:
-            server.serve_forever()
+            serve_http_server(server)
             target = take_rebind_target()
             if target is None:
-                break   # 真停机（桌面壳 stop / Ctrl+C / 关窗）
+                break   # 真停机（桌面壳 stop / SIGTERM / Ctrl+C / 关窗）
             host, port = target
             log("rebinding  : %s:%d (lan mode %s)"
                 % (host, port, "on" if host == "0.0.0.0" else "off"))
-            # socket 生命周期只有一个主人：先彻底关旧监听再绑新的，
-            # 否则 Windows 的 SO_REUSEADDR 会让两个 socket 同抢一个端口。
+            # socket 生命周期只有一个主人：serve_http_server 的 finally 已关旧
+            # 监听，这里兜底再关一次（幂等），然后绑新的。
             try:
                 server.server_close()
             except Exception:
