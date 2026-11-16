@@ -1,7 +1,7 @@
 # Qoder2API-Hub Desktop — Qoder 双区多账号网关 · 开箱即用桌面客户端
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-1.0.14_R-2496ED?style=flat-square" alt="Version 1.0.14_R">
+  <img src="https://img.shields.io/badge/Release-1.0.15_R-2496ED?style=flat-square" alt="Version 1.0.15_R">
   <img src="https://img.shields.io/badge/Desktop-Win_x64_·_Win_ARM64_·_macOS_·_Linux-8A2BE2?style=flat-square" alt="Desktop Platforms">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
@@ -232,6 +232,11 @@ curl http://127.0.0.1:8790/v1/chat/completions \
 >   天然不撞。历史号对应：`2026.10.07` ≈ 2026.10.7.1_upstream（上游 v1.2.18）、
 >   `2026.10.08` ≈ 2026.10.8.1_re（上下文压缩）；更早的「网关 1.2.18/1.2.19/
 >   1.2.20」是 fork 旧连号（1.2.18 与上游撞车才改制），仅为历史记录。
+
+### v1.0.15_R — 桌面版：随网关 2026.11.16.1_upstream 发布
+
+随上一条目发布的桌面版——**并行工具调用 index 复用修复**（PR #157：上游把不同 tool id 复用同一 wire index=0 时，流式守卫与非流式聚合会互相覆盖，独立的并行调用丢失、参数串位；现按 call id 规范化独立槽位，插桩在流式守卫与非流式聚合两处入口，帧未被改时保持原字节、无名/截断参数仍明确失败）、**容器 PID 1 的 SIGTERM 优雅退出**（#156：仅主线程注册 TERM → SystemExit(0) 解卷 serve 循环，绝不在信号处理器里调同线程会死锁的 `HTTPServer.shutdown()`，清理期重复 TERM 忽略、Ctrl+C 行为不变；桌面版内嵌启动语义不变，仍走跨线程 `shutdown()` 优雅停机）。一键更新维持剔除（桌面更新走安装包）。
+发布说明见 [Releases](https://github.com/Kepler16f/qoder2api-hub-desktop/releases/tag/v1.0.15_R)。
 
 ### v1.0.14_R — 桌面版：随网关 2026.11.11.1_upstream–2026.11.13.2_re 发布
 
